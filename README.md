@@ -20,6 +20,8 @@ measured in real agentic coding sessions, not a synthetic benchmark.
 | **Prefill** | **~1,370 tokens/s** over a real 490k-token conversation |
 | **Agent tasks** | **19 / 19** on terminal-bench-mini's core suite |
 
+How it got this fast - in plain words first, then in depth: **[docs/how-it-got-fast.md](docs/how-it-got-fast.md)**
+
 ## What it is
 
 strixite is an LLM inference engine I wrote from scratch in HIP for exactly one chip and one model:
