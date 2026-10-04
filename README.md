@@ -71,7 +71,8 @@ git clone https://github.com/shawnshekari/strixite && cd strixite
 cmake --preset strix && cmake --build --preset strix
 ```
 
-**4. Download the weights** (~115 GiB) and check them:
+**4. Download the weights** (~115 GiB) and check them - or, if you already have the original Qwen3.8-Flash-Next
+checkpoint, [make them yourself in ~15 minutes](docs/tools.md#already-have-the-original-model-make-the-weights-yourself):
 
 ```sh
 hf download wemoh/Qwen3.8-Flash-Next-strixw --local-dir ~/models/strix-infer
