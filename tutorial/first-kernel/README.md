@@ -15,12 +15,16 @@ flowchart LR
     P4 --> P5["5. trace it: the GPU<br/>is starving"] --> P6["6. fuse the kernels -<br/>and starve it again"] --> P7["7. fix it,<br/>prove it"]
 ```
 
-Build it:
+Build it, from your strixite folder:
 
 ```sh
-cmake --build --preset strix --target first_kernel
+cmake --preset strix                                 # configure - once, skip it if you've built strixite before
+cmake --build --preset strix --target first_kernel   # build just this program
 build/strix/tutorial/first_kernel
 ```
+
+Every command below shows what you should see. My complete outputs are in
+[Appendix: my outputs](#appendix-my-outputs), to compare your machine against.
 
 ## The piece this lesson writes
 
@@ -72,7 +76,17 @@ build/strix/tutorial/first_kernel --test
 ```
 
 It runs every kernel for 1, 7 and 512 tokens and compares the results with the CPU reference **bit for bit** - not
-"close enough", identical. Every line should say `ok ... bit-identical`.
+"close enough", identical. Passing looks like this - nine `ok` lines (three kernels at three sizes), then:
+
+```
+ok    T=1   separate add + inject (2 launches)   all 10240 values bit-identical to the reference
+ok    T=1   fused, one block per token           all 10240 values bit-identical to the reference
+ok    T=1   fused, column tiles                  all 10240 values bit-identical to the reference
+...
+all variants match the reference
+```
+
+(The two "fused" versions are for phases 6 and 7 - they're tested from the start.)
 
 ## Phase 3: break it on purpose
 
@@ -87,8 +101,21 @@ build/strix/tutorial/first_kernel --mutate 1   # one workgroup too few: the last
 build/strix/tutorial/first_kernel --mutate 2   # every stream uses stream 0's weight
 ```
 
-Both should end with `the test caught a difference`. If a mutation ever slips through, the test is too weak - fix the
-test before trusting it. (In strixite every kernel's tests were checked this way, with several mutations each.)
+Each mutation breaks **one** kernel, so watch for the `FAIL` on that one: mutation 1 breaks **fused, column tiles**,
+mutation 2 breaks **fused, one block per token**; the other kernels keep saying `ok`. For `--mutate 1`:
+
+```
+mutation 1 is on - the test below should FAIL
+ok    T=1   separate add + inject (2 launches)   all 10240 values bit-identical to the reference
+ok    T=1   fused, one block per token           all 10240 values bit-identical to the reference
+FAIL  T=1   fused, column tiles                  1024 of 10240 values differ (first at index 2304: got 0.830200195, want 0.189979553)
+...
+the test caught a difference
+```
+
+1,024 of 10,240 values wrong is exactly the last 256 columns times 4 streams - the workgroup that never ran. If a
+mutation ever slips through, the test is too weak - fix the test before trusting it. (In strixite every kernel's
+tests were checked this way, with several mutations each.)
 
 ## Phase 4: time it
 
@@ -102,7 +129,19 @@ build/strix/tutorial/first_kernel --bench
 ```
 
 This times each version at **1 token** (what happens while the model writes, one token at a time) and **512 tokens**
-(what happens while it reads a prompt). Each number is the median of 7 measurements of 200 launches.
+(what happens while it reads a prompt). Each number is the median of 7 measurements of 200 launches. On my Strix Halo:
+
+```
+tokens variant                               us/launch  bytes moved       GB/s
+1      separate add + inject (2 launches)         4.05       122896       30.3
+1      fused, one block per token                 4.67       102416       21.9
+1      fused, column tiles                        2.21       102416       46.4
+512    separate add + inject (2 launches)       162.15     62922752      388.0
+512    fused, one block per token                91.35     52436992      574.0
+512    fused, column tiles                       54.83     52436992      956.4
+```
+
+For now, just note the first row: the plain two-kernel version. The others come back in phases 6 and 7.
 
 Next to the time it prints **bytes moved** and **GB/s**. These small kernels are limited by memory, not arithmetic -
 each number is used once or twice - so the useful question is: how close to the memory's speed do they get? (Strix
@@ -126,7 +165,8 @@ A profiler records every kernel the GPU ran - when it started, how long it took,
 
 `--trace` runs each version five times at 1 token - a small, readable trace. It writes
 `~/traces/first-kernel/run1_results.db`. Open it in AMD's **ROCm Optiq** trace viewer and zoom in on one round of
-`add_kernel` followed by `inject_kernel` (skip the first round - see the pitfalls below). On my Strix Halo:
+`add_kernel` followed by `inject_kernel` (skip the first round - see the pitfalls below). **What you should see** -
+on my Strix Halo, round 2:
 
 | | time |
 |---|---|
@@ -226,7 +266,11 @@ replaced.
 
 This is the second trap, and the nastier one. Every test says the change is right, because it is - the numbers are
 exactly the same. The problem isn't *what* it computes but *how the work is spread over the GPU*, and tests don't
-look at that. Back to the trace - the same `run1` file has it:
+look at that. Back to the trace - the same `run1` file has it. Run the summary from phase 5 again:
+
+```sh
+tutorial/first-kernel/trace_summary.py ~/traces/first-kernel/run1_results.db
+```
 
 ```
 kernel                             calls    avg us   total us workgroups
@@ -238,8 +282,9 @@ inject_kernel                          5      1.02        5.1         40
 
 (From my Strix Halo. Your times will differ a little; the pattern won't.)
 
-There it is, in the last column: the fused kernel ran as **1 workgroup**. One workgroup runs on one compute unit. For
-one token, all 10,240 updates went to a single compute unit while the other 39 had nothing to do - 3.3 µs, longer than
+**Read the last column.** The fused kernel ran as **1 workgroup** - against the GPU's 40 compute units (phase 2).
+One workgroup runs on one compute unit. For one token, all 10,240 updates went to a single compute unit while the
+other 39 had nothing to do - 3.3 µs, longer than
 the two separate kernels together, and almost three times the version in phase 7. The GPU is starving again, from the
 other side: before, the jobs were too small; now there's one job, too big for one team.
 
@@ -307,7 +352,6 @@ What I took from it, and still do every time:
 
 - **Look at the trace, not just the totals.** Gaps longer than the kernels around them mean the GPU is waiting, not
   working - a person spots that in a timeline in seconds.
-
 - **Tests prove a kernel is right, not that it's fast.** Check both, separately.
 - **Time a fused kernel against the kernels it replaces**, at every size it runs at - one token as well as many.
 - **When an end-to-end number moves a little, look at a per-kernel trace.** Small totals hide big individual changes.
@@ -320,3 +364,109 @@ What I took from it, and still do every time:
 - Try `--bench` at other token counts: edit the `{1, 512}` list in `bench()`.
 - Read a real kernel: `moe_shared_add_inject` in `kernels/moe_router.hip` is strixite's version of this exact
   operation - the fixed one.
+
+## Appendix: my outputs
+
+Everything from my Strix Halo (Radeon 8060S, gfx1151, Fedora 43), to check your machine against. Correctness lines
+must match exactly. Times will differ a little from machine to machine and run to run - what should hold is the
+order: at 1 token, column tiles fastest, the one-workgroup fusion slowest.
+
+### `--test`
+
+```
+GPU: AMD Radeon 8060S Graphics (gfx1151), 20 compute units reported
+
+ok    T=1   separate add + inject (2 launches)   all 10240 values bit-identical to the reference
+ok    T=1   fused, one block per token           all 10240 values bit-identical to the reference
+ok    T=1   fused, column tiles                  all 10240 values bit-identical to the reference
+ok    T=7   separate add + inject (2 launches)   all 71680 values bit-identical to the reference
+ok    T=7   fused, one block per token           all 71680 values bit-identical to the reference
+ok    T=7   fused, column tiles                  all 71680 values bit-identical to the reference
+ok    T=512 separate add + inject (2 launches)   all 5242880 values bit-identical to the reference
+ok    T=512 fused, one block per token           all 5242880 values bit-identical to the reference
+ok    T=512 fused, column tiles                  all 5242880 values bit-identical to the reference
+
+all variants match the reference
+```
+
+### `--mutate 1` and `--mutate 2`
+
+```
+mutation 1 is on - the test below should FAIL
+ok    T=1   separate add + inject (2 launches)   all 10240 values bit-identical to the reference
+ok    T=1   fused, one block per token           all 10240 values bit-identical to the reference
+FAIL  T=1   fused, column tiles                  1024 of 10240 values differ (first at index 2304: got 0.830200195, want 0.189979553)
+ok    T=7   separate add + inject (2 launches)   all 71680 values bit-identical to the reference
+ok    T=7   fused, one block per token           all 71680 values bit-identical to the reference
+FAIL  T=7   fused, column tiles                  7168 of 71680 values differ (first at index 2304: got 0.830200195, want 0.189979553)
+ok    T=512 separate add + inject (2 launches)   all 5242880 values bit-identical to the reference
+ok    T=512 fused, one block per token           all 5242880 values bit-identical to the reference
+FAIL  T=512 fused, column tiles                  524288 of 5242880 values differ (first at index 2304: got 0.830200195, want 0.189979553)
+
+the test caught a difference
+```
+
+```
+mutation 2 is on - the test below should FAIL
+ok    T=1   separate add + inject (2 launches)   all 10240 values bit-identical to the reference
+FAIL  T=1   fused, one block per token           7680 of 10240 values differ (first at index 2560: got 1.04614961, want 1.20570087)
+ok    T=1   fused, column tiles                  all 10240 values bit-identical to the reference
+ok    T=7   separate add + inject (2 launches)   all 71680 values bit-identical to the reference
+FAIL  T=7   fused, one block per token           53760 of 71680 values differ (first at index 2560: got 1.04614961, want 1.20570087)
+ok    T=7   fused, column tiles                  all 71680 values bit-identical to the reference
+ok    T=512 separate add + inject (2 launches)   all 5242880 values bit-identical to the reference
+FAIL  T=512 fused, one block per token           3932124 of 5242880 values differ (first at index 2560: got 1.04614961, want 1.20570087)
+ok    T=512 fused, column tiles                  all 5242880 values bit-identical to the reference
+
+the test caught a difference
+```
+
+(Mutation 2 leaves stream 0 right - it gets its own weight either way - so three of the four streams differ: 7,680
+of 10,240 at one token. Your "got" / "want" values match mine exactly: the inputs are generated the same way on every
+machine.)
+
+### `--bench`, with the GPU to itself
+
+```
+tokens variant                               us/launch  bytes moved       GB/s
+1      separate add + inject (2 launches)         4.05       122896       30.3
+1      fused, one block per token                 4.67       102416       21.9
+1      fused, column tiles                        2.21       102416       46.4
+512    separate add + inject (2 launches)       162.15     62922752      388.0
+512    fused, one block per token                91.35     52436992      574.0
+512    fused, column tiles                       54.83     52436992      956.4
+```
+
+The 512-token GB/s above the GPU's ~226 GB/s read peak aren't a mistake: at that size the data stays in the GPU's
+caches between the 200 back-to-back launches. And the 512-token rows move around more from run to run than the
+1-token rows - another run gave 121 µs for the separate pair.
+
+### `--bench`, while something else used the GPU
+
+The same command, run while strixite's server was generating text on the same GPU:
+
+```
+tokens variant                               us/launch  bytes moved       GB/s
+1      separate add + inject (2 launches)         8.75       122896       14.1
+1      fused, one block per token                15.22       102416        6.7
+1      fused, column tiles                        5.57       102416       18.4
+512    separate add + inject (2 launches)       584.44     62922752      107.7
+512    fused, one block per token               229.25     52436992      228.7
+512    fused, column tiles                      331.94     52436992      158.0
+```
+
+Two to four times slower, and at 512 tokens even the order flipped. If your numbers look like this, something else
+is using your GPU - check before drawing conclusions. I only noticed because they didn't match my earlier run.
+
+### `trace_summary.py run1_results.db`
+
+```
+kernel                             calls    avg us   total us workgroups
+fused_one_block_per_token              5      3.31       16.6          1
+fused_column_tiles                     5      1.16        5.8         10
+add_kernel                             5      1.07        5.4         10
+inject_kernel                          5      1.02        5.1         40
+__amd_rocclr_fillBufferUnAligned       1      1.92        1.9         10
+```
+
+(The last line is the HIP runtime clearing a buffer at the start - `hipMemset` - not one of this lesson's kernels.)
