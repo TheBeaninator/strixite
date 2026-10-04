@@ -146,7 +146,7 @@ For now, just note the first row: the plain two-kernel version. The others come 
 Next to the time it prints **bytes moved** and **GB/s**. These small kernels are limited by memory, not arithmetic -
 each number is used once or twice - so the useful question is: how close to the memory's speed do they get? Strix
 Halo's GPU reads at ~226 GB/s at best (why some 512-token numbers come out higher: see the
-[appendix](#bench-with-the-gpu-to-itself)).
+[appendix](#--bench-with-the-gpu-to-itself)).
 
 ## Phase 5: trace it - the GPU is starving
 
