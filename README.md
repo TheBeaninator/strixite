@@ -95,6 +95,12 @@ Point any OpenAI-compatible client at `http://<your-machine>:5300/v1`, model `qw
 Every setting, with the reason behind its value, is in `deploy/strix-server.conf`; `strix_server --help` lists them
 all. `deploy/strix-server.service` runs it as a systemd user unit (adjust the paths to your checkout).
 
+## Build your own
+
+strixite started as "how hard can it be?" It turned out an engine that holds its own against a closed-source one -
+faster at decode, on its home turf - is within reach of one person, with a good model, a good coding assistant, and a
+lot of patience. I hope it encourages you to grab your favorite LLM and framework and build something from scratch.
+
 ## Platform
 
 strixite runs on **Linux with an AMD Strix Halo (gfx1151) and 128 GB of memory**, tested on Fedora 43. It's built
