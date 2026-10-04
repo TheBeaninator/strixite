@@ -20,7 +20,10 @@ measured in real agentic coding sessions, not a synthetic benchmark.
 | **Prefill** | **~1,370 tokens/s** over a real 490k-token conversation |
 | **Agent tasks** | **19 / 19** on terminal-bench-mini's core suite |
 
-How it got this fast - in plain words first, then in depth: **[docs/how-it-got-fast.md](docs/how-it-got-fast.md)**
+> [!TIP]
+> **Curious how a mini PC runs a 180B-parameter model this fast?** No background needed:
+> [How strixite got fast](docs/how-it-got-fast.md) explains it in five simple ideas - smaller handwriting, guessing
+> ahead, and not reading the same book twice - then goes as deep as you want to follow.
 
 ## What it is
 
