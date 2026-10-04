@@ -164,7 +164,38 @@ A profiler records every kernel the GPU ran - when it started, how long it took,
 ```
 
 `--trace` runs each version five times at 1 token - a small, readable trace. It writes
-`~/traces/first-kernel/run1_results.db`. Open it in AMD's **ROCm Optiq** trace viewer and zoom in on one round of
+`~/traces/first-kernel/run1_results.db`.
+
+### Getting ROCm Optiq
+
+> **In plain words:** the trace file is just data. To *see* it as a timeline you need a viewer, and AMD's free one is
+> called ROCm Optiq. It doesn't need a GPU or ROCm - you can record the trace on your Strix Halo and look at it on
+> any other computer.
+
+ROCm Optiq is open source, at [github.com/ROCm/roc-optiq](https://github.com/ROCm/roc-optiq). Download the package for
+your system from its [Releases page](https://github.com/ROCm/roc-optiq/releases) and install it:
+
+| system | package | install |
+|---|---|---|
+| Ubuntu 22.04 / 24.04 | `roc-optiq-*.deb` | `sudo apt install ./roc-optiq-*.deb` |
+| CentOS Stream 9, RHEL, Rocky | `roc-optiq-*.rpm` | `sudo dnf install ./roc-optiq-*.rpm` |
+| Windows 11 | installer `.exe` | run it |
+| macOS 14 / 15 | `roc-optiq.app` (zipped) | drag it to Applications |
+
+(Those are the systems it lists. I run it on Ubuntu 24.04 with version 1.0.0.2; on Fedora, try the `.rpm`.) The
+Linux packages install it under `/opt/roc-optiq`, and the program is called **`roc-optiq`** - not `optiq`:
+
+```sh
+roc-optiq ~/traces/first-kernel/run1_results.db
+```
+
+Only the machine that *records* the trace needs ROCm (7.1 or newer) - that's the `rocprofv3` command above, which
+comes with the toolchain strixite already builds with. To look at it somewhere else, just copy the
+`run1_results.db` file over.
+
+### What to look for
+
+Open `run1_results.db` in ROCm Optiq and zoom in on one round of
 `add_kernel` followed by `inject_kernel` (skip the first round - see the pitfalls below). **What you should see** -
 on my Strix Halo, round 2:
 
