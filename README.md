@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/strixite-banner.jpg" alt="strixite - LLM inference, from scratch, for AMD Strix Halo" width="100%"></p>
+
 # strixite
 
 An LLM inference engine I wrote from scratch in HIP for one chip - AMD's **Strix Halo** (Ryzen AI MAX+ 395 /
