@@ -261,3 +261,8 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/tests/CMakeLists.txt")
     enable_testing()
     add_subdirectory(tests)
 endif()
+
+# The tutorials live in the public repo only; built when present.
+if(EXISTS "${CMAKE_SOURCE_DIR}/tutorial/CMakeLists.txt")
+    add_subdirectory(tutorial)
+endif()

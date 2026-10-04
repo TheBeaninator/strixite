@@ -107,6 +107,10 @@ strixite started as "how hard can it be?" It turned out an engine that holds its
 faster at decode, on its home turf - is within reach of one person, with a good model, a good coding assistant, and a
 lot of patience. I hope it encourages you to grab your favorite LLM and framework and build something from scratch.
 
+**New to GPU programming?** Start with [Your first kernel](tutorial/first-kernel/README.md): one small, real piece of
+the model, written the way every kernel here was - test first, break it on purpose, time it - then a fusion that
+passed every test and still starved the GPU, found with a profiler trace. Every step starts in plain words.
+
 ## Platform
 
 strixite runs on **Linux with an AMD Strix Halo (gfx1151) and 128 GB of memory**, tested on Fedora 43. It's built
