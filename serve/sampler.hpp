@@ -1,0 +1,73 @@
+#pragma once
+
+// Next-token sampling on the host from one row of FP32 logits, in the
+// order transformers' generate applies its warpers: temperature, then top-k, then top-p (nucleus), then a draw
+// from the renormalized distribution. temperature 0 = greedy (argmax, lowest id on a tie). Only ids below
+// `n_valid` can come out: the LM head is padded past the tokenizer's vocabulary (248320 rows, 248077 tokens), and a
+// padding row must never be sampled.
+
+#include <cstdint>
+#include <random>
+#include <vector>
+
+namespace strix {
+
+struct SamplingParams {
+    double temperature = 1.0;  // >= 0
+    int64_t top_k = 20;        // 0 = off
+    double top_p = 0.95;       // (0, 1]
+    uint64_t seed = 0;
+};
+
+// The largest logit (lowest id on a tie) and the runner-up's value (-inf if n == 1; equal to the best on a tie) over
+// x[0, n), and whether any of it is NaN. Skips 64-logit blocks with nothing above the runner-up, branch-free.
+struct Top2 {
+    int32_t best = 0;
+    float best_v = 0, second_v = 0;
+    bool nan = false;
+};
+Top2 top2(const float *x, int64_t n);
+
+// A forward's logits as the sampler takes them: `rows` rows of full logits (`row` floats each), or each row's top
+// `cands` candidates - value descending, the lower id first on a tie (kernels/logits_topk) - with a per-row NaN flag.
+struct LogitRows {
+    int64_t rows = 0, row = 0;        // full rows: row = floats per row
+    std::vector<float> full;          // [rows, row]; empty for candidates
+    int64_t cands = 0;                // candidates per row; 0 = full rows
+    std::vector<float> cand_v;        // [rows, cands]
+    std::vector<int32_t> cand_id;     // [rows, cands]
+    std::vector<uint8_t> nan;         // [rows]
+    bool empty() const { return rows == 0; }
+    static LogitRows from_full(std::vector<float> logits, int64_t row);  // logits.size() a multiple of row
+    LogitRows row_of(int64_t r) const;                                  // one row, either kind
+};
+
+class Sampler {
+public:
+    static constexpr int64_t kCandidates = 20;  // what sample_candidates needs a row (kernels::kLogitCands)
+
+    Sampler(const SamplingParams &p, int64_t n_valid);  // throws on out-of-range params
+    int32_t sample(const std::vector<float> &logits, float *out_margin = nullptr);
+    int32_t sample(const float *logits, size_t size, float *out_margin = nullptr);
+    // Row r of either kind.
+    int32_t sample(const LogitRows &logits, int64_t r, float *out_margin = nullptr);
+    // Whether a row's top kCandidates are enough for these params: greedy, or top_k in 1..kCandidates.
+    bool takes_candidates() const;
+    // sample() from a row's top candidates (v / id, m of them, sorted as in LogitRows; m >= kCandidates or every
+    // valid id) and whether the row had a NaN: the same result, margin, errors and random draws as sample() on the
+    // whole row. Requires takes_candidates().
+    int32_t sample_candidates(const float *v, const int32_t *id, int64_t m, bool nan, float *out_margin = nullptr);
+
+private:
+    SamplingParams p_;
+    int64_t n_valid_;
+    std::mt19937_64 rng_;
+    std::vector<std::pair<float, int32_t>> cand_;
+    std::vector<double> probs_;
+    static constexpr int64_t kSmallK = 64;  // top-k up to this: the one-pass sorted list
+    int32_t sample_all(const float *logits, float *out_margin);  // top_k off
+    int32_t sample_large_k(const float *logits, int64_t k, float *out_margin);
+    int32_t draw_from_candidates(int64_t k);
+};
+
+}  // namespace strix

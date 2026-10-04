@@ -4,7 +4,6 @@
   <a href="LICENSE"><img alt="License: AGPL-3.0" src="https://img.shields.io/badge/license-AGPL--3.0-6f42c1"></a>
   <img alt="Platform: Linux, AMD Strix Halo (gfx1151)" src="https://img.shields.io/badge/platform-Linux%20%C2%B7%20Strix%20Halo%20gfx1151-1abc9c">
   <a href="https://huggingface.co/wemoh/Qwen3.8-Flash-Next-strixw"><img alt="Weights on Hugging Face" src="https://img.shields.io/badge/weights-Hugging%20Face-ffcc4d"></a>
-  <img alt="Source: coming soon" src="https://img.shields.io/badge/source-coming%20soon-lightgrey">
 </p>
 
 <h2 align="center">Nearly 50 tokens/s at half a million tokens of context.<br>On one mini PC.</h2>
@@ -39,13 +38,62 @@ reference derived from the model's spec.
 - **Prompt cache in RAM and on disk** - long agent conversations resume instead of being re-read every turn
 - **512k context** with YaRN, and attention that stays fast at depth
 
-## Get it
+## Quick start
 
-> [!NOTE]
-> **Source code: coming soon™.** I'm getting it ready to share; until then this repository is a placeholder.
+You need an AMD Strix Halo machine with 128 GB of memory running Linux, and a fast NVMe drive with ~120 GB free for
+the weights, plus room for the prompt cache (capped at 128 GiB, and it never leaves less than 32 GiB free).
 
-The weights are already up: **[wemoh/Qwen3.8-Flash-Next-strixw](https://huggingface.co/wemoh/Qwen3.8-Flash-Next-strixw)**
-on Hugging Face (~115 GiB, no conversion step).
+**1. Let the GPU use the memory.** Strix Halo's GPU allocates from system memory (GTT). The default limit is far
+below what the model needs, so raise it with kernel parameters - these are mine, with the BIOS's dedicated VRAM set
+to its minimum (512 MB):
+
+```
+amdgpu.gttsize=126976 ttm.pages_limit=32505856 amd_iommu=off
+```
+
+Add them to your bootloader's kernel command line (on Fedora: `sudo grubby --update-kernel=ALL --args="..."`) and
+reboot. `cat /sys/class/drm/card*/device/mem_info_gtt_total` should then report ~124 GiB.
+
+**2. Install the toolchain.** strixite builds with AMD's TheRock ROCm nightly for gfx1151, tested with
+`therock-dist-linux-gfx1151-10.1.0a20260822` (HIP 7.16) extracted to `~/tools/therock-tarball/install`. You also need
+CMake 3.28+, Ninja and a GCC C++ standard library (I use Linuxbrew's gcc-15 on Fedora 43, which the build finds
+on its own; Fedora's `gcc-c++` package should work as well).
+
+**3. Build.**
+
+```sh
+git clone https://github.com/shawnshekari/strixite && cd strixite
+cmake --preset strix && cmake --build --preset strix
+```
+
+**4. Download the weights** (~115 GiB) and check them:
+
+```sh
+hf download wemoh/Qwen3.8-Flash-Next-strixw --local-dir ~/models/strix-infer
+(cd ~/models/strix-infer && sha256sum -c sha256.txt)
+```
+
+**5. Run the server.** It loads in ~30 s and serves an OpenAI-compatible API on port 5300:
+
+```sh
+build/strix/strix_server --config deploy/strix-server.conf
+```
+
+**6. Try it:**
+
+```sh
+curl -s localhost:5300/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Hello!"}]}'
+```
+
+Point any OpenAI-compatible client at `http://<your-machine>:5300/v1`, model `qwen3.8-flash-next`.
+
+> [!IMPORTANT]
+> The server has no authentication and listens on all interfaces (`host = 0.0.0.0` in `deploy/strix-server.conf`).
+> Run it on a trusted network, or set `host = 127.0.0.1`.
+
+Every setting, with the reason behind its value, is in `deploy/strix-server.conf`; `strix_server --help` lists them
+all. `deploy/strix-server.service` runs it as a systemd user unit (adjust the paths to your checkout).
 
 ## Platform
 

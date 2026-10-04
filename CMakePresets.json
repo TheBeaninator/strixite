@@ -1,0 +1,104 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 28,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "strix",
+      "displayName": "Strix Halo (gfx1151), Release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/strix",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "STRIX_ROCM_ROOT": "$env{HOME}/tools/therock-tarball/install",
+        "CMAKE_CXX_COMPILER": "$env{HOME}/tools/therock-tarball/install/lib/llvm/bin/clang++"
+      }
+    },
+    {
+      "name": "strix-debug",
+      "displayName": "Strix Halo (gfx1151), RelWithDebInfo",
+      "inherits": "strix",
+      "binaryDir": "${sourceDir}/build/strix-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+    {
+      "name": "xtx-dev",
+      "displayName": "Local dev loop on gfx1100 - correctness only, never ships",
+      "inherits": "strix",
+      "binaryDir": "${sourceDir}/build/xtx-dev",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "STRIX_GPU_ARCH": "gfx1100"
+      }
+    },
+    {
+      "name": "strix-roctx",
+      "inherits": "strix",
+      "displayName": "strix + ROCTX ranges (profiling only)",
+      "binaryDir": "${sourceDir}/build/strix-roctx",
+      "cacheVariables": {
+        "STRIX_ROCTX": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "strix",
+      "configurePreset": "strix"
+    },
+    {
+      "name": "strix-debug",
+      "configurePreset": "strix-debug"
+    },
+    {
+      "name": "xtx-dev",
+      "configurePreset": "xtx-dev"
+    },
+    {
+      "name": "strix-roctx",
+      "configurePreset": "strix-roctx"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "strix",
+      "configurePreset": "strix",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "jobs": 8
+      }
+    },
+    {
+      "name": "xtx-dev",
+      "configurePreset": "xtx-dev",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "strix-fast",
+      "inherits": "strix",
+      "filter": {
+        "exclude": {
+          "label": "slow"
+        }
+      }
+    },
+    {
+      "name": "xtx-dev-fast",
+      "inherits": "xtx-dev",
+      "filter": {
+        "exclude": {
+          "label": "slow"
+        }
+      }
+    }
+  ]
+}

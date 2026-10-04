@@ -1,0 +1,34 @@
+# strix-server as a systemd *user* unit, serving the build in the checkout at ~/src/strix-infer.
+# Install (the file stays versioned in the checkout):
+#   systemctl --user link ~/src/strix-infer/deploy/strix-server.service
+#   systemctl --user daemon-reload
+#   systemctl --user start strix-server.service     # enable it to start at boot (needs `loginctl enable-linger`)
+# Logs: journalctl --user -u strix-server.service
+# Serves the build in the checkout: rebuild (cmake --build --preset strix --target strix_server), then restart.
+[Unit]
+Description=strix-infer server (Qwen3.8-Flash-Next, OpenAI-compatible, :5300)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/src/strix-infer
+# Settings: deploy/strix-server.conf (each served value with its reason; precedence default < file < flag). Editing
+# it needs only a restart; editing this unit needs `systemctl --user daemon-reload` first.
+# The served weights stay a flag: STRIX_WEIGHTS, the shipping layout unless a drop-in overrides it (e.g.
+# strix-server.service.d/weights.conf to compare layouts).
+Environment=STRIX_WEIGHTS=%h/models/strix-infer/converted/Qwen3.8-Flash-Next.U-gdn_in-g128/weights.strixw
+# STRIX_EXTRA_ARGS: flags for an A/B run (e.g. "--think-nudge off"), set by a job through a drop-in
+# (strix-server.service.d/extra.conf) and removed afterwards; empty in service. Unbraced $VAR: split into words, no
+# argument at all when empty.
+Environment=STRIX_EXTRA_ARGS=
+# STRIX_LOCAL_ARGS: this machine's standing additions (e.g. "--capture-dir ..."), set by a local drop-in; empty here.
+Environment=STRIX_LOCAL_ARGS=
+ExecStart=%h/src/strix-infer/build/strix/strix_server --config %h/src/strix-infer/deploy/strix-server.conf --weights ${STRIX_WEIGHTS} $STRIX_LOCAL_ARGS $STRIX_EXTRA_ARGS
+# SIGTERM stops the HTTP server, then the prompt cache writes its RAM-only entries to disk (up to 40 s); the model's
+# ~30 s load is on start, not stop.
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=default.target
