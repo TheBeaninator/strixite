@@ -391,10 +391,52 @@ What I took from it, and still do every time:
 
 ## Where to go next
 
-- Change `kThreads` (the workgroup size) to 64 or 1024 and see what happens to the times and the workgroup counts.
-- Try `--bench` at other token counts: edit the `{1, 512}` list in `bench()`.
-- Read a real kernel: `moe_shared_add_inject` in `kernels/moe_router.hip` is strixite's version of this exact
-  operation - the fixed one.
+Three experiments to try on your own, each a small change to `first_kernel.hip`. For each one, **write down what you
+expect before you run it** - being wrong is where the learning is.
+
+### Change the team size
+
+> **What and why, in plain words:** every team (workgroup) so far had 256 workers. Bigger teams mean fewer of them;
+> smaller teams mean more. Neither is automatically better - more teams spread across more workstations, but every
+> team costs a little to organize. Changing the team size and watching what happens builds a feel for that trade-off,
+> which every kernel you write will face.
+
+Change `kThreads` near the top of the program, rebuild (`cmake --build --preset strix --target first_kernel`), and
+run `--test`, `--bench` and a trace. Try 64, 128 and 512. Watch two things: how the 1-token times move, and how the
+workgroup counts in `trace_summary.py` change - with 64 threads, the column-tiled kernel runs as 40 workgroups, one
+per compute unit.
+
+Try 1024 too: it won't compile. 2,560 columns don't divide evenly into teams of 1,024, and the column-tiled kernel
+assumes they do - so the program refuses to build (`static_assert`) rather than silently skipping the last columns.
+That's the same idea as the error checks in phase 3, moved from run time to build time.
+
+### Find where the slow fusion stops being slow
+
+> **What and why, in plain words:** the one-workgroup fusion was only slow because one token gave it one team. More
+> tokens means more teams, so at some point there are enough to keep the whole GPU busy and the problem disappears.
+> Finding that point shows that "is this kernel slow?" always comes with "at what size?" - and the model runs at
+> many sizes.
+
+The `bench()` function times only 1 and 512 tokens - edit its `{1, 512}` list to, say, `{1, 2, 4, 8, 16, 32, 64, 128}`
+and rebuild. Before running, predict: the GPU has 40 compute units (phase 2), so around how many tokens should
+`fused_one_block_per_token` catch up with the column-tiled version? Then check. If it doesn't match your guess, the
+trace will tell you why.
+
+### Read the real thing
+
+> **What and why, in plain words:** this lesson's kernel is the real one with the details stripped away. Reading the
+> version strixite actually runs - with every detail back in - shows what "production" adds to a simple idea, and
+> that the core of it is still the few lines you wrote here.
+
+Open `kernels/moe_router.hip` in strixite and find `moe_shared_add_inject_kernel`. Recognize the grid first - the
+comment above it tells this lesson's story in two lines - then look at what the real one adds:
+
+- **A gate.** The shared expert's output isn't just added: it's scaled by a learned gate first, `sigmoid(gate_logit)`.
+- **BF16 storage.** The real model stores its numbers in 16 bits, not 32; `store()` rounds each result once, the same
+  way everywhere, so the fused kernel stays bit-identical to the pair it replaced.
+- **An error check a kernel can make.** A kernel can't stop the program with an error message, so when the gate is
+  not a valid number it records which row went wrong in a small error buffer, and the code that launched it checks
+  that afterwards and fails the request. It never quietly carries on with a bad number.
 
 ## Appendix: my outputs
 
