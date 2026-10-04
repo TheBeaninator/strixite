@@ -252,7 +252,10 @@ them are `fused_column_tiles`, the fixed version from phase 7, doing exactly the
 time. Click a bar in Optiq to see its launch shape: the slow one is 256 threads in a workgroup of 256 - a single
 workgroup.
 
-Optiq's **Measure** tool puts numbers on it (drag from the start of one bar to the end of another):
+Optiq's **Measure** tool puts numbers on it: click **Measure**, then click the first kernel; choose in the measure
+options whether to measure to the *start* or the *end* of the next one (start-to-start shows when work begins,
+start-to-end the whole span including any gap); then click the second kernel and the measurement appears. To time a
+single kernel, pick the same bar twice, measuring to its end.
 
 ![Three Optiq measurements: the separate add and inject kernels including the gap between them, 4.28 µs; the fused one-workgroup kernel, 3.24 µs; the fused column-tiled kernel, 1.24 µs](optiq-measured.png)
 
