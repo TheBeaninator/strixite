@@ -16,10 +16,10 @@ measured in real agentic coding sessions, not a synthetic benchmark.
 
 |  | on one AMD Strix Halo, 128 GB |
 |---|---|
-| ⚡ **Decode, real agent use** | **~47-50 tokens/s, flat from 0 to 492k context** |
-| 🧠 **Context** | **512k tokens** |
-| 📥 **Prefill** | **~1,370 tokens/s** over a real 490k-token conversation |
-| 🎯 **Agent tasks** | **19 / 19** on terminal-bench-mini's core suite |
+| **Decode, real agent use** | **~47-50 tokens/s, flat from 0 to 492k context** |
+| **Context** | **512k tokens** |
+| **Prefill** | **~1,370 tokens/s** over a real 490k-token conversation |
+| **Agent tasks** | **19 / 19** on terminal-bench-mini's core suite |
 
 ## What it is
 
