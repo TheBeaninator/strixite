@@ -16,16 +16,35 @@
 #include "runtime/qweight.hpp"
 
 #include <cstdint>
+#include <functional>
+#include <map>
 #include <memory>
+#include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace strix {
+
+// Tensor parallelism (strixite-tp2): which part of a tensor one rank loads. rows: [begin, end) ranges of the tensor's
+// first dimension, concatenated in order (empty: every row); [k0, k1): a row-major Q4 / Q8 tensor's K (the input
+// dimension) on whole quantization groups (k1 == 0: every column). A tensor the plan returns nullopt for is loaded
+// whole; skip drops it (e.g. the MTP head on a rank that never drafts).
+struct StrixwSlice {
+    bool skip = false;
+    std::vector<std::pair<int64_t, int64_t>> rows;
+    int64_t k0 = 0, k1 = 0;
+};
+using StrixwSlicePlan = std::function<std::optional<StrixwSlice>(const StrixwTensor &)>;
 
 class StrixwDevice {
 public:
     // Loads path. Throws on any header/index problem (StrixwFile validates) or I/O / HIP failure. Component
     // hashes aren't re-checked (inspect_strixw --verify does that); the header and index hashes are.
     explicit StrixwDevice(const std::string &path, int read_threads = 8);
+    // A rank's share (tensor parallelism): every tensor sliced per plan into one device allocation; tensor() then
+    // reports the sliced shapes. Reads each component once (whole), slices on the host, uploads the slice.
+    StrixwDevice(const std::string &path, const StrixwSlicePlan &plan, int read_threads = 8);
 
     const StrixwFile &file() const { return *file_; }
     double load_seconds() const { return load_seconds_; }
@@ -50,6 +69,10 @@ public:
 private:
     std::unique_ptr<StrixwFile> file_;
     DeviceBuffer<uint8_t> data_;
+    // Split load: the tensors as loaded (sliced shapes) and each component's device offset into data_.
+    bool split_ = false;
+    std::map<std::string, StrixwTensor> local_;
+    std::map<std::pair<std::string, int>, uint64_t> dev_off_;
     double load_seconds_ = 0;
 };
 

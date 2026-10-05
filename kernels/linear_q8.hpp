@@ -10,6 +10,12 @@
 namespace strix::kernels {
 // Requires: q 16-byte aligned (so K % 16 == 0 rows stay aligned: implied by K % G == 0); x 16-byte aligned;
 // y must not overlap x. out_act == act, or BF16 x -> F32 y (the accumulator stored unrounded).
+// Noise-floor knob (strixite-tp2 ST-0a): multiply the decode linears' split-K factor (waves per output row, capped
+// at a block's 8 waves) by s - the same products summed in a different order, nothing else. 1 = as tuned (default).
+// Read at launch; Q4 and Q8 row-major linears and the Q4 experts.
+void set_split_k_scale(int s);
+int split_k_scale();
+
 void linear_q8(const void *x, const Q8DeviceView &w, void *y, int64_t M, Act act, hipStream_t stream);
 void linear_q8(const void *x, const Q8DeviceView &w, void *y, int64_t M, Act act, Act out_act, hipStream_t stream);
 }  // namespace strix::kernels

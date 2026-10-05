@@ -257,10 +257,23 @@ add_executable(bench_replay tools/bench_replay.cpp)
 target_link_libraries(bench_replay PRIVATE strix_serve_model)
 endif()
 
+# strixite-tp2 ST-1 / ST-N1: the decode / prefill exchange microbenchmark over RDMA (rail 0, stock rdma-core mlx5).
+find_library(STRIX_IBVERBS_LIB ibverbs)
+if(STRIX_IBVERBS_LIB)
+add_executable(tp_exchange_bench)
+strix_hip_sources(tp_exchange_bench tools/tp_exchange_bench.cpp)
+target_link_libraries(tp_exchange_bench PRIVATE strix_rocm ${STRIX_IBVERBS_LIB} Threads::Threads)
+endif()
+
 if(EXISTS "${CMAKE_SOURCE_DIR}/tests/CMakeLists.txt")
     enable_testing()
     add_subdirectory(tests)
 endif()
+
+# strixite-tp2 (ST-0a / ST-0b): single-stream decode timing at depth, MTP replay, golden logits + noise floor, needles;
+# --tp-world / --tp-rank load one rank's share with every exchange stubbed (tools/strix_bench.cpp).
+add_executable(strix_bench tools/strix_bench.cpp)
+target_link_libraries(strix_bench PRIVATE strix_serve_model)
 
 # The tutorials live in the public repo only; built when present.
 if(EXISTS "${CMAKE_SOURCE_DIR}/tutorial/CMakeLists.txt")

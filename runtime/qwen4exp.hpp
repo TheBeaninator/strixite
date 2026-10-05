@@ -66,10 +66,21 @@ struct Qwen4ExpDims {
     // Positions: the checkpoint is trained for 262,144 (config max_position_embeddings, rope_type default). YaRN
     // (kernels/rope.hpp rope_yarn) stretches that by yarn_factor (1 = plain RoPE, as trained); rope_scale is its
     // attention factor on cos/sin (1 without YaRN). Set by Qwen4ExpModel from its yarn_factor argument.
+    // Tensor parallelism (strixite-tp2, plan v3): this rank's share of a world of tp_world ranks. Split: GDN key /
+    // value heads (gk, gv and the widths derived from them), attention query heads (hq) and KV heads (hkv: 2 / N,
+    // at least 1 - duplicated on the ranks that share one at N = 4), the experts' and the shared expert's
+    // intermediate (inter), the LM head's vocabulary rows (lm_rows). Replicated: embedding, HC mixes, norms, router,
+    // PLE, the QSA indexer. tp_world = 1: the whole model (every dimension as above).
+    int tp_world = 1, tp_rank = 0;
+    int64_t lm_rows = 248320;
     int64_t trained_positions = 262144;
     float yarn_factor = 1.0f, rope_scale = 1.0f;
     int64_t max_positions() const { return (int64_t)((double)trained_positions * (double)yarn_factor); }
     int64_t dense_key_limit() const { return qsa_budget + 3; }  // up to here the indexer keeps every key
+};
+
+struct TpConfig {
+    int world = 1, rank = 0;
 };
 
 class Qwen4ExpModel {
@@ -84,7 +95,7 @@ public:
     // MTP) then rotates with the YaRN table, so caches made under another factor don't match.
     Qwen4ExpModel(const std::string &weights, const std::string &ngram, kernels::Act act,
                   bool allow_truncated = false, int64_t ngram_cache_rows = NgramTableRows::kDefaultCacheRows,
-                  float yarn_factor = 1.0f);
+                  float yarn_factor = 1.0f, TpConfig tp = {});
     const Qwen4ExpDims &dims() const { return dims_; }
     kernels::Act act() const { return act_; }
     const StrixwDevice &weights() const { return *w_; }
@@ -315,6 +326,18 @@ public:
     void set_mtp_vocab(int64_t n);
     int64_t mtp_vocab() const { return mtp_vocab_; }
 
+    // Tensor parallelism (dims().tp_world > 1): the all-reduce of a partial sum at a row-parallel output - kind 0 the
+    // mixer's (o_proj / GDN out_proj), 1 the MoE's (routed + gated shared expert), 2 the LM head's candidates (buf
+    // null: the vocabulary halves' top candidates merged). elems: BF16 / F32 activations [T, d] in buf, summed in place
+    // over the ranks, on stream. Unset: every exchange is a no-op (the stubbed exchanges of ST-0b; counted).
+    using Exchange = std::function<void(void *buf, int64_t elems, int kind, hipStream_t stream)>;
+    void set_exchange(Exchange fn) { exchange_ = std::move(fn); }
+    int64_t exchanges() const { return exchanges_; }
+    // Bench knob (tools/strix_bench): with MTP on, skip the MTP layer's catch-up in forward() (its K / V rows for the
+    // forwarded positions) - a plain AR forward's cost. The MTP state is then stale past the position it was paused
+    // at: restore a snapshot from before before drafting again.
+    void set_mtp_catchup(bool on) { mtp_catchup_ = on; }
+
 private:
     const Qwen4ExpModel &m_;
     int64_t capacity_, max_tokens_, pos_ = 0, cap_blocks_ = 0;
@@ -340,7 +363,9 @@ private:
     // mtp_prev_ [H*d] the trunk's streams after position pos_ - 1 (zeros at 0), row 0's input for the next MTP
     // rows; workspaces [max_tokens, ...]: the embedding and its norm [d], the normed streams [H*d], fc_embedding's
     // output [d], the combined streams [H*d]; mtp_ones_ [max_tokens, H] = 1 (the per-stream broadcast add).
-    bool mtp_ = false;
+    bool mtp_ = false, mtp_catchup_ = true;
+    Exchange exchange_;
+    int64_t exchanges_ = 0;
     int mtp_tail_cur_ = 0;
     int64_t mtp_vocab_ = 0;  // set to the vocabulary by the constructor
     DeviceBuffer<uint8_t> mtp_emb_, mtp_norm_emb_, mtp_norm_hid_, mtp_proj_emb_, mtp_x_, mtp_prev_;
