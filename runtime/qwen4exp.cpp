@@ -91,13 +91,13 @@ std::optional<StrixwSlice> tp_slice(const StrixwTensor &t, const Qwen4ExpDims &F
     } else if (ends_with(n, "linear_attn.out_proj.weight")) {
         s.k0 = r * gv * hd, s.k1 = (r + 1) * gv * hd;
     } else if (ends_with(n, "self_attn.qkv")) {  // [q|gate per head | k | v | indexer q heads | indexer k]
-        const int64_t qw = F.hq * 2 * hd, kv = F.hkv * hd;
-        s.rows = {{r * hq * 2 * hd, (r + 1) * hq * 2 * hd},
-                  {qw + kvh * hd, qw + (kvh + hkv) * hd},
-                  {qw + kv + kvh * hd, qw + kv + (kvh + hkv) * hd},
+        const int64_t ah = F.hd, qw = F.hq * 2 * ah, kv = F.hkv * ah;  // attention heads are F.hd wide (GDN: kHD)
+        s.rows = {{r * hq * 2 * ah, (r + 1) * hq * 2 * ah},
+                  {qw + kvh * ah, qw + (kvh + hkv) * ah},
+                  {qw + kv + kvh * ah, qw + kv + (kvh + hkv) * ah},
                   {qw + 2 * kv, F.astride}};
     } else if (ends_with(n, "self_attn.o_proj.weight")) {
-        s.k0 = r * hq * hd, s.k1 = (r + 1) * hq * hd;
+        s.k0 = r * hq * F.hd, s.k1 = (r + 1) * hq * F.hd;
     } else if (ends_with(n, "mlp.experts_gate_up")) {  // per expert [gate I | up I]
         const int64_t E = t.shape.at(0) / (2 * F.inter);
         for (int64_t e = 0; e < E; ++e) {
