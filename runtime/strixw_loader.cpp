@@ -50,6 +50,39 @@ void pread_parallel(int fd, void *dst, size_t n, uint64_t off, int threads, cons
         STRIX_CHECK(e.empty(), "StrixwDevice: reading '", path, "' at ", off, " (", n, " bytes) failed: ", e);
 }
 
+// Byte ranges {file offset, length, offset in dst} into dst: pieces of <= 4 MiB handed to `threads` readers in turn
+// (a rank's row slices of a tensor: e.g. 1,026 runs of 320 expert rows each - only the bytes it keeps are read).
+struct ReadRange {
+    uint64_t off, len, dst;
+};
+void pread_ranges(int fd, uint8_t *dst, const std::vector<ReadRange> &ranges, int threads, const std::string &path) {
+    constexpr uint64_t kPiece = 4ull << 20;
+    std::vector<ReadRange> pieces;
+    for (const ReadRange &r : ranges)
+        for (uint64_t a = 0; a < r.len; a += kPiece) pieces.push_back({r.off + a, std::min(kPiece, r.len - a), r.dst + a});
+    std::atomic<size_t> next{0};
+    std::vector<std::thread> pool;
+    std::vector<std::string> errs((size_t)threads);
+    for (int t = 0; t < threads; ++t)
+        pool.emplace_back([&, t] {
+            for (size_t i; (i = next.fetch_add(1)) < pieces.size();) {
+                const ReadRange &r = pieces[i];
+                uint64_t a = 0;
+                while (a < r.len) {
+                    const ssize_t n = ::pread(fd, dst + r.dst + a, r.len - a, (off_t)(r.off + a));
+                    if (n < 0 && errno == EINTR) continue;
+                    if (n <= 0) {
+                        errs[(size_t)t] = n < 0 ? std::strerror(errno) : "unexpected end of file";
+                        return;
+                    }
+                    a += (uint64_t)n;
+                }
+            }
+        });
+    for (std::thread &th : pool) th.join();
+    for (const std::string &e : errs) STRIX_CHECK(e.empty(), "StrixwDevice: reading '", path, "' failed: ", e);
+}
+
 }  // namespace
 
 StrixwDevice::StrixwDevice(const std::string &path, int read_threads) {
@@ -96,6 +129,7 @@ StrixwDevice::StrixwDevice(const std::string &path, int read_threads) {
     (void)hipStreamDestroy(stream);
     (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);  // the device copy is the one kept
     ::close(fd);
+    bytes_read_ = n;
     load_seconds_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
@@ -195,13 +229,27 @@ StrixwDevice::StrixwDevice(const std::string &path, const StrixwSlicePlan &plan,
             const int64_t N = t.shape[0];
             for (const StrixwComponent &c : t.components) {
                 const uint64_t dst = dev_off_.at({t.name, (int)c.role});
+                const uint64_t row_bytes = c.bytes / (uint64_t)N;
+                if (!j.whole && j.sl.k1 == 0) {  // whole rows: read only this rank's row ranges
+                    std::vector<ReadRange> rr;
+                    uint64_t at = 0;
+                    for (auto [a, b] : j.sl.rows) {
+                        rr.push_back({c.offset + (uint64_t)a * row_bytes, (uint64_t)(b - a) * row_bytes, at});
+                        at += (uint64_t)(b - a) * row_bytes;
+                    }
+                    out.resize(at);
+                    pread_ranges(fd, out.data(), rr, read_threads, path);
+                    bytes_read_ += at;
+                    upload(out.data(), at, dst);
+                    continue;
+                }
                 src.resize(c.bytes);
                 pread_parallel(fd, src.data(), c.bytes, c.offset, read_threads, path);
+                bytes_read_ += c.bytes;
                 if (j.whole) {
                     upload(src.data(), c.bytes, dst);
                     continue;
                 }
-                const uint64_t row_bytes = c.bytes / (uint64_t)N;
                 uint64_t b0 = 0, b1 = row_bytes;
                 if (j.sl.k1 > 0) {
                     const auto [num, den] = bytes_per_k(t, c.role);

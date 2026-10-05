@@ -230,6 +230,7 @@ public:
     Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, int64_t max_tokens,
                     PrefillMath prefill_math = PrefillMath::WmmaBf16, bool mtp = false);
     PrefillMath prefill_math() const { return prefill_math_; }
+    const Qwen4ExpModel &model() const { return m_; }
     ~Qwen4ExpSession();
     Qwen4ExpSession(const Qwen4ExpSession &) = delete;
     Qwen4ExpSession &operator=(const Qwen4ExpSession &) = delete;
@@ -356,12 +357,21 @@ public:
     int64_t mtp_vocab() const { return mtp_vocab_; }
 
     // Tensor parallelism (dims().tp_world > 1): the all-reduce of a partial sum at a row-parallel output - kind 0 the
-    // mixer's (o_proj / GDN out_proj), 1 the MoE's (routed + gated shared expert), 2 the LM head's candidates (buf
-    // null: the vocabulary halves' top candidates merged). elems: BF16 / F32 activations [T, d] in buf, summed in place
-    // over the ranks, on stream. Unset: every exchange is a no-op (the stubbed exchanges of ST-0b; counted).
-    using Exchange = std::function<void(void *buf, int64_t elems, int kind, hipStream_t stream)>;
+    // mixer's (o_proj / GDN out_proj), 1 the MoE's (routed + gated shared expert): elems activations [T, d] in buf,
+    // summed in place over the ranks - and kind 2 the LM head's candidates (only when the forward wants candidates):
+    // buf = this rank's logits_topk output (elems rows of kLogitCands LogitCand with ids local to its vocabulary share,
+    // then the rows' NaN words), to be replaced by the merge over the ranks (global ids; runtime/tp_comm.hpp
+    // tp_merge_candidates). On stream. Unset: every exchange is a no-op (the stubbed exchanges of ST-0b; counted).
+    // want_candidates(n_valid) takes the whole vocabulary's n_valid on every rank.
+    // Kind 3 (set_tp_f32_mixer): buf holds the mixer's FP32 partials [T, d]; their sum, rounded once, goes to out
+    // (activations; the other kinds pass out = nullptr and work in place).
+    using Exchange = std::function<void(void *buf, int64_t elems, int kind, hipStream_t stream, void *out)>;
     void set_exchange(Exchange fn) { exchange_ = std::move(fn); }
     int64_t exchanges() const { return exchanges_; }
+    // Experiment knob (ST-2): the mixer's row-parallel partials (o_proj / out_proj) exchanged in FP32 (the linears'
+    // unrounded accumulators) and rounded once after the sum - the whole model's arithmetic up to summation order -
+    // instead of BF16 partials. The MoE partials stay BF16 (their kernels write the activation dtype). Default off.
+    void set_tp_f32_mixer(bool on);
     // Bench knob (tools/strix_bench): with MTP on, skip the MTP layer's catch-up in forward() (its K / V rows for the
     // forwarded positions) - a plain AR forward's cost. The MTP state is then stale past the position it was paused
     // at: restore a snapshot from before before drafting again.
@@ -395,6 +405,8 @@ private:
     bool mtp_ = false, mtp_catchup_ = true;
     Exchange exchange_;
     int64_t exchanges_ = 0;
+    bool tp_f32_mixer_ = false;
+    DeviceBuffer<float> y32_;  // set_tp_f32_mixer: the mixer's FP32 partials [max_tokens, d]
     int mtp_tail_cur_ = 0;
     int64_t mtp_vocab_ = 0;  // set to the vocabulary by the constructor
     DeviceBuffer<uint8_t> mtp_emb_, mtp_norm_emb_, mtp_norm_hid_, mtp_proj_emb_, mtp_x_, mtp_prev_;

@@ -334,6 +334,14 @@ if(STRIX_IBVERBS_LIB)
 add_executable(tp_exchange_bench)
 strix_hip_sources(tp_exchange_bench tools/tp_exchange_bench.cpp)
 target_link_libraries(tp_exchange_bench PRIVATE strix_rocm ${STRIX_IBVERBS_LIB} Threads::Threads)
+
+# strixite-tp2 ST-2: the TP-N communicator (runtime/tp_comm) and rank 0's driver / the executors (runtime/tp_mirror);
+# tools/tp_ar checks and times the TP forward against the whole model.
+add_library(strix_tp STATIC runtime/tp_mirror.cpp)
+strix_hip_sources(strix_tp runtime/tp_comm.hip)
+target_link_libraries(strix_tp PUBLIC strix_model ${STRIX_IBVERBS_LIB} Threads::Threads)
+add_executable(tp_ar tools/tp_ar.cpp)
+target_link_libraries(tp_ar PRIVATE strix_tp strix_serve_model)
 endif()
 
 if(EXISTS "${CMAKE_SOURCE_DIR}/tests/CMakeLists.txt")

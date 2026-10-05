@@ -925,16 +925,27 @@ std::vector<float> Qwen4ExpSession::read_back(size_t n_floats, const char *what,
     return std::vector<float>(l, l + n_floats);
 }
 
+void Qwen4ExpSession::set_tp_f32_mixer(bool on) {
+    STRIX_CHECK(!on || m_.act() == Act::BF16, "Qwen4ExpSession::set_tp_f32_mixer: needs BF16 activations");
+    if (on && y32_.size() == 0) y32_ = DeviceBuffer<float>((size_t)(max_tokens_ * m_.dims().d), "mixer FP32 partials");
+    tp_f32_mixer_ = on;
+}
+
 void Qwen4ExpSession::want_candidates(int64_t n_valid, const uint32_t *masks, int64_t mask_rows, int64_t mask_words) {
     const char *fn = "Qwen4ExpSession::want_candidates";
-    const int64_t vocab = m_.dims().vocab, rows = m_.dims().lm_rows;
-    STRIX_CHECK(n_valid >= 1 && n_valid <= rows, fn, ": n_valid = ", n_valid, ", expected 1..", rows);
+    const Qwen4ExpDims &D = m_.dims();
+    const int64_t vocab = D.vocab;
+    STRIX_CHECK(n_valid >= 1 && n_valid <= vocab, fn, ": n_valid = ", n_valid, ", expected 1..", vocab);
+    // Tensor parallelism: n_valid counts the whole vocabulary; this rank scores its rows [rank * lm_rows, ..) of it.
+    const int64_t local = std::min(D.lm_rows, n_valid - (int64_t)D.tp_rank * D.lm_rows);
+    STRIX_CHECK(local >= 1, fn, ": n_valid = ", n_valid, " leaves rank ", D.tp_rank, " (rows from ", D.tp_rank * D.lm_rows,
+                ") no valid id");
     if (masks == nullptr) {
         STRIX_CHECK(mask_rows == 0 && mask_words == 0, fn, ": mask_rows = ", mask_rows, ", mask_words = ", mask_words,
                     " without masks (pass 0 for both)");
     } else {
         // A rank holds lm_rows of the vocabulary under TP; the masks index all of it (structured output: world 1).
-        STRIX_CHECK(m_.dims().tp_world == 1, fn, ": structured-output masks under tensor parallelism are not supported");
+        STRIX_CHECK(D.tp_world == 1, fn, ": structured-output masks under tensor parallelism are not supported");
         STRIX_CHECK(mask_rows >= 1 && mask_rows <= kMaxLogits, fn, ": mask_rows = ", mask_rows, ", expected 1..",
                     kMaxLogits);
         STRIX_CHECK(mask_words >= (vocab + 31) / 32, fn, ": mask_words = ", mask_words, " covers ", mask_words * 32,
@@ -956,7 +967,7 @@ void Qwen4ExpSession::want_candidates(int64_t n_valid, const uint32_t *masks, in
     }
     mask_rows_ = masks == nullptr ? 0 : mask_rows;
     mask_words_ = masks == nullptr ? 0 : mask_words;
-    cand_n_valid_ = n_valid;
+    cand_n_valid_ = local;
 }
 
 std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int64_t n_logits, const Qwen4ExpProbe &probe) {
@@ -986,11 +997,12 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
                 n_logits, ", expected 0..", std::min(T, kMaxLogits));
     const int64_t cand_n_valid = cand_n_valid_;  // want_candidates() covers this one forward, whatever happens
     const bool tp = D.tp_world > 1;
-    auto tp_exchange = [&](void *buf, int64_t elems, int kind) {
+    auto tp_exchange = [&](void *buf, int64_t elems, int kind, void *out = nullptr) {
         if (!tp) return;
         ++exchanges_;
-        if (exchange_) exchange_(buf, elems, kind, stream_);
+        if (exchange_) exchange_(buf, elems, kind, stream_, out);
     };
+    const bool f32_mixer = tp && tp_f32_mixer_;
     const int64_t mask_rows = mask_rows_, mask_words = mask_words_;
     cand_n_valid_ = 0, mask_rows_ = 0, mask_words_ = 0;
     STRIX_CHECK(mask_rows == 0 || (cand_n_valid > 0 && mask_rows == n_logits), "Qwen4ExpSession::forward: ",
@@ -1145,7 +1157,8 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
             kernels::rmsnorm_gated(core_.get(), gp + (size_t)D.conv_c * e, l.gdn_norm, gnorm_.get(), T * D.gv, kHD, D.eps,
                                    kernels::GateAct::Sigmoid, act, stream_, D.gv, D.gstride);
             show(L + "gdn_core", gnorm_.get(), D.gz, pt);
-            lin(gnorm_.get(), l.out_proj, y_.get(), T, act);
+            if (f32_mixer) lin(gnorm_.get(), l.out_proj, y32_.get(), T, Act::F32);
+            else lin(gnorm_.get(), l.out_proj, y_.get(), T, act);
         } else {
             uint8_t *kc = k_cache_[(size_t)i].get(), *vc = v_cache_[(size_t)i].get();
             lin(u_.get(), l.qkv, proj_.get(), T, act);
@@ -1206,9 +1219,12 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
                                                 attn_ws_bytes_, attn_err_.get(), act, stream_);
             }
             show(L + "attn_core", core_.get(), D.hq * D.hd, pt);
-            lin(core_.get(), l.o_proj, y_.get(), T, act);
+            if (f32_mixer) lin(core_.get(), l.o_proj, y32_.get(), T, Act::F32);
+            else lin(core_.get(), l.o_proj, y_.get(), T, act);
         }
-        tp_exchange(y_.get(), T * D.d, 0);  // the row-parallel o_proj / out_proj partials
+        // the row-parallel o_proj / out_proj partials
+        if (f32_mixer) tp_exchange(y32_.get(), T * D.d, 3, y_.get());
+        else tp_exchange(y_.get(), T * D.d, 0);
         show(L + "mixer", y_.get(), D.d, pt);
         inv_ready = inject_y();
 
@@ -1302,7 +1318,9 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
     // MTP: the layer's K / V (and indexer keys) for these positions, each from its token and the trunk's streams
     // after the position before - what a later draft attends to. The rest of the
     // layer only matters for a draft's own row, so it's skipped here.
-    if (n_logits > 0) tp_exchange(nullptr, n_logits, 2);  // the vocabulary halves' candidates merged
+    // Tensor parallelism: the vocabulary shares' candidates gathered and merged on every rank (cand_dev_ in place, global
+    // ids). Full logits rows (no candidates) stay this rank's share [n_logits, lm_rows]: the caller gathers them.
+    if (cands) tp_exchange(cand_dev_.get(), n_logits, 2);
     if (mtp_ && mtp_catchup_) {
         const Qwen4ExpModel::Layer &ml = m_.mtp().layer;
         mtp_input(T, mtp_prev_.get());

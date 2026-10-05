@@ -43,12 +43,14 @@ public:
     // hashes aren't re-checked (inspect_strixw --verify does that); the header and index hashes are.
     explicit StrixwDevice(const std::string &path, int read_threads = 8);
     // A rank's share (tensor parallelism): every tensor sliced per plan into one device allocation; tensor() then
-    // reports the sliced shapes. Reads each component once (whole), slices on the host, uploads the slice.
+    // reports the sliced shapes. Row slices read only their rows (ST-2: over a network filesystem,
+    // so bytes read are the load time); column (K) slices read the component whole and slice on the host.
     StrixwDevice(const std::string &path, const StrixwSlicePlan &plan, int read_threads = 8);
 
     const StrixwFile &file() const { return *file_; }
     double load_seconds() const { return load_seconds_; }
     uint64_t data_bytes() const { return data_.size(); }
+    uint64_t bytes_read() const { return bytes_read_; }  // from the file, by the load
 
     // Device pointers, checked: the tensor must exist with the expected encoding and shape.
     const StrixwTensor &tensor(const std::string &name, StrixwEncoding enc, const std::vector<int64_t> &shape) const;
@@ -74,6 +76,7 @@ private:
     std::map<std::string, StrixwTensor> local_;
     std::map<std::pair<std::string, int>, uint64_t> dev_off_;
     double load_seconds_ = 0;
+    uint64_t bytes_read_ = 0;
 };
 
 }  // namespace strix
