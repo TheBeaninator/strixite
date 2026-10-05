@@ -536,6 +536,9 @@ int main(int argc, char **argv) {
                     const auto plan = plan_writes(S, chunk, Q);
                     const uint64_t X = (W + F) * E, base = seq;
                     const bool linl = load.find("inline") != std::string::npos, lstr = load.find("stream") != std::string::npos;
+                    // "+noex": the same forward without the exchanges (partials filled, never published, no wait / sum) -
+                    // the baseline for the per-exchange GPU-stream cost (fwd_ms with minus without, / exchanges).
+                    const bool noex = load.find("noex") != std::string::npos;
                     HIPC(hipMemset(err_d, 0, 4));
                     barrier();
                     std::atomic<bool> comm_fail{false};
@@ -545,6 +548,7 @@ int main(int argc, char **argv) {
                         DIE("completion on unknown QP %u", qpn);
                     };
                     std::thread comm([&]() {
+                        if (noex) return;  // nothing is published: no WRITEs, no immediates
                         // post exchange e's WRITEs once the GPU published it; harvest immediates throughout
                         uint64_t next = base;
                         ibv_wc wc[64];
@@ -628,6 +632,11 @@ int main(int argc, char **argv) {
                                                    lbuf_bytes / 16, sink);
                                 loff = (loff + load_bytes / 16) % (lbuf_bytes / 16);
                             }
+                            if (noex) {
+                                hipLaunchKernelGGL(k_fill, dim3(1), dim3(1024), 0, cs, (uint16_t *)(send_d + (e % kWindows) * slot),
+                                                   elems, rank, e);
+                                continue;
+                            }
                             if (elems <= 65536) {  // decode sizes: one block fills and publishes (one launch)
                                 hipLaunchKernelGGL(k_produce, dim3(1), dim3(1024), 0, cs, (uint16_t *)(send_d + (e % kWindows) * slot),
                                                    elems, rank, e, flags_d, t_prod, li);
@@ -651,7 +660,7 @@ int main(int argc, char **argv) {
                     comm.join();
                     if (comm_fail) DIE("communicator failed (config S=%llu chunk=%llu inline=%llu load=%s)",
                                        (unsigned long long)S, (unsigned long long)chunk, (unsigned long long)inl, load.c_str());
-                    seq += X;
+                    if (!noex) seq += X;  // a no-exchange run consumes no sequence numbers
                     std::vector<uint64_t> tp(X), td(X);
                     unsigned errs = 0;
                     HIPC(hipMemcpy(tp.data(), t_prod, X * 8, hipMemcpyDeviceToHost));
