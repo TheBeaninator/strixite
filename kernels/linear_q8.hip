@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "kernels/linear_q8.hpp"
 
 #include "common/hip_check.hpp"
@@ -156,12 +157,14 @@ __global__ void __launch_bounds__(kThreads) linear_q8_kernel(const TX *x, const 
 // bench/results.jsonl): K <= 2560 is best at KS 1 (3-8% over KS 2 on the small, latency-bound matrices - the
 // shared expert, [512-1280, 2560] - and equal on the large ones); K = 6144 at KS 4 (KS 1 is 30% slower), which the
 // ~2048 code bytes per wave rule gives.
-int split_k(int64_t K) {
+int split_k_tuned(int64_t K) {
     if (K <= 2560) return 1;
     int ks = 1;
     while (ks < 8 && K / (1024 * (ks * 2)) >= 1) ks *= 2;
     return ks;
 }
+
+int split_k(int64_t K) { return std::min(8, split_k_tuned(K) * split_k_scale()); }
 
 template <typename TX, typename TY, int MR>
 void launch_mr(const TX *x, const Q8DeviceView &w, TY *y, int64_t M, int KS, hipStream_t stream) {
@@ -190,6 +193,15 @@ void launch(const TX *x, const Q8DeviceView &w, TY *y, int64_t M, hipStream_t st
 }
 
 }  // namespace
+
+namespace {
+int g_split_k_scale = 1;
+}  // namespace
+void set_split_k_scale(int s) {
+    STRIX_CHECK(s == 1 || s == 2 || s == 4 || s == 8, "set_split_k_scale: ", s, " (1, 2, 4 or 8)");
+    g_split_k_scale = s;
+}
+int split_k_scale() { return g_split_k_scale; }
 
 void linear_q8(const void *x, const Q8DeviceView &w, void *y, int64_t M, Act act, hipStream_t stream) {
     linear_q8(x, w, y, M, act, act, stream);

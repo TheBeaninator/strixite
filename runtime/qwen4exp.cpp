@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <optional>
 
 namespace strix {
 
@@ -53,15 +54,94 @@ Qwen4ExpModel::Hc load_hc(const StrixwDevice &w, const std::string &p, const Qwe
 
 }  // namespace
 
+namespace {
+
+bool ends_with(const std::string &s, const std::string &e) {
+    return s.size() >= e.size() && s.compare(s.size() - e.size(), e.size(), e) == 0;
+}
+
+// Rank r of N's share of each tensor (StrixwSlice): F the whole model's dims. See Qwen4ExpDims::tp_world.
+std::optional<StrixwSlice> tp_slice(const StrixwTensor &t, const Qwen4ExpDims &F, int N, int r) {
+    const std::string &n = t.name;
+    if (n.rfind("mtp.", 0) == 0) return StrixwSlice{true, {}, 0, 0};  // MTP drafts run on rank 0 only (whole head): ST-3
+    if (n.rfind(kLm + "layers.", 0) != 0) {
+        if (n == "lm_head.weight") {
+            const int64_t V = F.vocab / N;
+            return StrixwSlice{false, {{r * V, (r + 1) * V}}, 0, 0};
+        }
+        return std::nullopt;
+    }
+    const int64_t hd = kHD, gk = F.gk / N, gv = F.gv / N, hq = F.hq / N, hkv = std::max<int64_t>(1, F.hkv / N);
+    const int64_t kvh = (r * hq) / (F.hq / F.hkv), I = F.inter / N;
+    const int64_t qk = F.gk * hd, vw = F.gv * hd;  // whole q (= k) and v (= z) widths of the GDN projection
+    StrixwSlice s;
+    if (ends_with(n, "linear_attn.in_proj")) {  // [q | k | v | z | b | a], heads contiguous
+        s.rows = {{r * gk * hd, (r + 1) * gk * hd},
+                  {qk + r * gk * hd, qk + (r + 1) * gk * hd},
+                  {2 * qk + r * gv * hd, 2 * qk + (r + 1) * gv * hd},
+                  {2 * qk + vw + r * gv * hd, 2 * qk + vw + (r + 1) * gv * hd},
+                  {2 * qk + 2 * vw + r * gv, 2 * qk + 2 * vw + (r + 1) * gv},
+                  {2 * qk + 2 * vw + F.gv + r * gv, 2 * qk + 2 * vw + F.gv + (r + 1) * gv}};
+    } else if (ends_with(n, "linear_attn.conv1d.weight")) {  // the q | k | v channels
+        s.rows = {{r * gk * hd, (r + 1) * gk * hd},
+                  {qk + r * gk * hd, qk + (r + 1) * gk * hd},
+                  {2 * qk + r * gv * hd, 2 * qk + (r + 1) * gv * hd}};
+    } else if (ends_with(n, "linear_attn.A_log") || ends_with(n, "linear_attn.dt_bias")) {
+        s.rows = {{r * gv, (r + 1) * gv}};
+    } else if (ends_with(n, "linear_attn.out_proj.weight")) {
+        s.k0 = r * gv * hd, s.k1 = (r + 1) * gv * hd;
+    } else if (ends_with(n, "self_attn.qkv")) {  // [q|gate per head | k | v | indexer q heads | indexer k]
+        const int64_t qw = F.hq * 2 * hd, kv = F.hkv * hd;
+        s.rows = {{r * hq * 2 * hd, (r + 1) * hq * 2 * hd},
+                  {qw + kvh * hd, qw + (kvh + hkv) * hd},
+                  {qw + kv + kvh * hd, qw + kv + (kvh + hkv) * hd},
+                  {qw + 2 * kv, F.astride}};
+    } else if (ends_with(n, "self_attn.o_proj.weight")) {
+        s.k0 = r * hq * hd, s.k1 = (r + 1) * hq * hd;
+    } else if (ends_with(n, "mlp.experts_gate_up")) {  // per expert [gate I | up I]
+        const int64_t E = t.shape.at(0) / (2 * F.inter);
+        for (int64_t e = 0; e < E; ++e) {
+            const int64_t b = e * 2 * F.inter;
+            s.rows.push_back({b + r * I, b + (r + 1) * I});
+            s.rows.push_back({b + F.inter + r * I, b + F.inter + (r + 1) * I});
+        }
+    } else if (ends_with(n, "mlp.shared_expert.gate_up")) {
+        s.rows = {{r * I, (r + 1) * I}, {F.inter + r * I, F.inter + (r + 1) * I}};
+    } else if (ends_with(n, "mlp.experts_down") || ends_with(n, "mlp.shared_expert.down_proj.weight")) {
+        s.k0 = r * I, s.k1 = (r + 1) * I;
+    } else {
+        return std::nullopt;
+    }
+    return s;
+}
+
+}  // namespace
+
 Qwen4ExpModel::Qwen4ExpModel(const std::string &weights, const std::string &ngram, Act act,
-                             bool allow_truncated, int64_t ngram_cache_rows, float yarn_factor)
+                             bool allow_truncated, int64_t ngram_cache_rows, float yarn_factor, TpConfig tp)
     : act_(act) {
     STRIX_CHECK(act == Act::F32 || act == Act::BF16, "Qwen4ExpModel: unsupported activation dtype ", (int)act);
     STRIX_CHECK(std::isfinite(yarn_factor) && yarn_factor >= 1.0f && yarn_factor <= 8.0f, "Qwen4ExpModel: yarn_factor = ",
                 yarn_factor, ", expected 1 (RoPE as trained) .. 8");
-    w_ = std::make_unique<StrixwDevice>(weights);
-    const StrixwFile &f = w_->file();
     Qwen4ExpDims &D = dims_;
+    STRIX_CHECK((tp.world == 1 && tp.rank == 0) || ((tp.world == 2 || tp.world == 4) && tp.rank >= 0 && tp.rank < tp.world),
+                "Qwen4ExpModel: tensor parallelism world ", tp.world, " rank ", tp.rank, " (world 1, 2 or 4)");
+    if (tp.world > 1) {
+        const Qwen4ExpDims F = D;  // the whole model's
+        const int N = tp.world;
+        STRIX_CHECK(F.gk % N == 0 && F.gv % N == 0 && F.hq % N == 0 && F.inter % N == 0 && F.vocab % N == 0,
+                    "Qwen4ExpModel: dims don't split ", N, " ways");
+        D.tp_world = N, D.tp_rank = tp.rank;
+        D.gk = F.gk / N, D.gv = F.gv / N, D.hq = F.hq / N, D.hkv = std::max<int64_t>(1, F.hkv / N);
+        D.inter = F.inter / N, D.lm_rows = F.vocab / N;
+        D.conv_c = 2 * D.gk * kHD + D.gv * kHD, D.gz = D.gv * kHD, D.gstride = D.conv_c + D.gz + 2 * D.gv;
+        D.idx_col = D.hq * 2 * D.hd + 2 * D.hkv * D.hd, D.astride = D.idx_col + D.idx_h * D.idx_d + D.idx_d;
+        const int rank = tp.rank;
+        w_ = std::make_unique<StrixwDevice>(weights, [F, N, rank](const StrixwTensor &t) { return tp_slice(t, F, N, rank); });
+    } else {
+        w_ = std::make_unique<StrixwDevice>(weights);
+    }
+    const StrixwFile &f = w_->file();
     while (f.find(kLm + "layers." + std::to_string(D.layers) + ".attn_hyper_connection.mix_down")) ++D.layers;
     STRIX_CHECK(D.layers >= 1, "Qwen4ExpModel: no decoder layers in '", weights, "'");
     std::string prefix;  // "0,1,..,k-1": what a truncated conversion's layers metadata reads
@@ -86,7 +166,7 @@ Qwen4ExpModel::Qwen4ExpModel(const std::string &weights, const std::string &ngra
     } else {
         embed_ = w_->bf16(kLm + "embed_tokens.weight", {D.vocab, D.d});
     }
-    lm_head_ = w_->qw("lm_head.weight", {D.vocab, D.d});
+    lm_head_ = w_->qw("lm_head.weight", {D.lm_rows, D.d});
     final_ = load_hc(*w_, kLm + "hyper_connection_mixer.", D, false);
     D.yarn_factor = yarn_factor;
     if (yarn_factor > 1.0f) {
@@ -161,7 +241,7 @@ Qwen4ExpModel::Qwen4ExpModel(const std::string &weights, const std::string &ngra
         }
         layers_.push_back(l);
     }
-    has_mtp_ = f.find("mtp.fc_embedding.weight") != nullptr;
+    has_mtp_ = D.tp_world == 1 && f.find("mtp.fc_embedding.weight") != nullptr;
     if (has_mtp_) {
         mtp_.fc_embedding = w_->qw("mtp.fc_embedding.weight", {D.d, D.d});
         mtp_.fc_hidden = w_->qw("mtp.fc_hidden.weight", {D.d, D.d});
@@ -847,12 +927,14 @@ std::vector<float> Qwen4ExpSession::read_back(size_t n_floats, const char *what,
 
 void Qwen4ExpSession::want_candidates(int64_t n_valid, const uint32_t *masks, int64_t mask_rows, int64_t mask_words) {
     const char *fn = "Qwen4ExpSession::want_candidates";
-    const int64_t vocab = m_.dims().vocab;
-    STRIX_CHECK(n_valid >= 1 && n_valid <= vocab, fn, ": n_valid = ", n_valid, ", expected 1..", vocab);
+    const int64_t vocab = m_.dims().vocab, rows = m_.dims().lm_rows;
+    STRIX_CHECK(n_valid >= 1 && n_valid <= rows, fn, ": n_valid = ", n_valid, ", expected 1..", rows);
     if (masks == nullptr) {
         STRIX_CHECK(mask_rows == 0 && mask_words == 0, fn, ": mask_rows = ", mask_rows, ", mask_words = ", mask_words,
                     " without masks (pass 0 for both)");
     } else {
+        // A rank holds lm_rows of the vocabulary under TP; the masks index all of it (structured output: world 1).
+        STRIX_CHECK(m_.dims().tp_world == 1, fn, ": structured-output masks under tensor parallelism are not supported");
         STRIX_CHECK(mask_rows >= 1 && mask_rows <= kMaxLogits, fn, ": mask_rows = ", mask_rows, ", expected 1..",
                     kMaxLogits);
         STRIX_CHECK(mask_words >= (vocab + 31) / 32, fn, ": mask_words = ", mask_words, " covers ", mask_words * 32,
@@ -903,6 +985,12 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
     STRIX_CHECK(n_logits >= 0 && n_logits <= std::min(T, kMaxLogits), "Qwen4ExpSession::forward: n_logits = ",
                 n_logits, ", expected 0..", std::min(T, kMaxLogits));
     const int64_t cand_n_valid = cand_n_valid_;  // want_candidates() covers this one forward, whatever happens
+    const bool tp = D.tp_world > 1;
+    auto tp_exchange = [&](void *buf, int64_t elems, int kind) {
+        if (!tp) return;
+        ++exchanges_;
+        if (exchange_) exchange_(buf, elems, kind, stream_);
+    };
     const int64_t mask_rows = mask_rows_, mask_words = mask_words_;
     cand_n_valid_ = 0, mask_rows_ = 0, mask_words_ = 0;
     STRIX_CHECK(mask_rows == 0 || (cand_n_valid > 0 && mask_rows == n_logits), "Qwen4ExpSession::forward: ",
@@ -1120,6 +1208,7 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
             show(L + "attn_core", core_.get(), D.hq * D.hd, pt);
             lin(core_.get(), l.o_proj, y_.get(), T, act);
         }
+        tp_exchange(y_.get(), T * D.d, 0);  // the row-parallel o_proj / out_proj partials
         show(L + "mixer", y_.get(), D.d, pt);
         inv_ready = inject_y();
 
@@ -1170,7 +1259,7 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
             show(L + "shared_h", hh_.get(), D.inter, pt);
             lin(hh_.get(), l.shared_down, sh_y_.get(), T, act);
         }
-        if (sep && !fuse_inv) {  // decode / verify: the gated add and the injection in one launch (bit-identical)
+        if (sep && !fuse_inv && !tp) {  // decode / verify: the gated add and the injection in one launch (bit-identical)
             kernels::moe_shared_add_inject(y_.get(), sh_y_.get(), router_logits_.get() + D.experts, D.experts + 1, T,
                                            D.d, (uint32_t)D.experts, x_.get(), w_in_.get(), D.H, act,
                                            router_err_.get(), stream_);
@@ -1180,6 +1269,7 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
             if (sep)
                 kernels::moe_shared_add(y_.get(), sh_y_.get(), router_logits_.get() + D.experts, D.experts + 1, T,
                                         D.d, (uint32_t)D.experts, act, router_err_.get(), stream_);
+            tp_exchange(y_.get(), T * D.d, 1);  // the experts' down partials (+ the gated shared expert's)
             show(L + "moe", y_.get(), D.d, pt);
             inv_ready = inject_y();
         }
@@ -1203,7 +1293,7 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
             STRIX_HIP_CHECK(hipEventRecord(mask_uploaded_, stream_), "Qwen4ExpSession::forward: mask upload event");
             mask_upload_recorded_ = true;
         }
-        kernels::logits_topk(logits_.get(), n_logits, D.vocab, cand_n_valid, cd,
+        kernels::logits_topk(logits_.get(), n_logits, D.lm_rows, cand_n_valid, cd,
                              reinterpret_cast<uint32_t *>(cd + n_logits * kernels::kLogitCands), cand_ws_.get(),
                              cand_ws_bytes_, stream_, mask_rows > 0 ? mask_dev_.get() : nullptr,
                              mask_rows > 0 ? mask_words : 0);
@@ -1212,7 +1302,8 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
     // MTP: the layer's K / V (and indexer keys) for these positions, each from its token and the trunk's streams
     // after the position before - what a later draft attends to. The rest of the
     // layer only matters for a draft's own row, so it's skipped here.
-    if (mtp_) {
+    if (n_logits > 0) tp_exchange(nullptr, n_logits, 2);  // the vocabulary halves' candidates merged
+    if (mtp_ && mtp_catchup_) {
         const Qwen4ExpModel::Layer &ml = m_.mtp().layer;
         mtp_input(T, mtp_prev_.get());
         hc_mix(ml.hc_attn, true, false, mtp_x_.get());
@@ -1232,7 +1323,7 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
                                        stream_),
                         "MTP previous streams");
     }
-    std::vector<float> logits = cands ? read_back(0, "", n_logits) : read_back((size_t)(n_logits * D.vocab), "");
+    std::vector<float> logits = cands ? read_back(0, "", n_logits) : read_back((size_t)(n_logits * D.lm_rows), "");
     pos_ += T;
     broken_ = false;
     mtp_chain_step_ = -1;

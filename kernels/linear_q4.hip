@@ -1,3 +1,5 @@
+#include <algorithm>
+#include "kernels/linear_q8.hpp"
 #include "kernels/linear_q4.hpp"
 
 #include "common/hip_check.hpp"
@@ -303,7 +305,7 @@ void launch_mr(const TX *x, const Q4DeviceView &w, TY *y, int64_t M, int KS, hip
 int split_k(int64_t K) {
     int ks = 1;
     while (ks < 8 && K / (2048 * (ks * 2)) >= 1) ks *= 2;
-    return ks;
+    return std::min(8, ks * split_k_scale());  // split_k_scale: kernels/linear_q8.hpp (noise floor)
 }
 
 template <typename TX, typename TY>

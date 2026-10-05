@@ -99,8 +99,158 @@ StrixwDevice::StrixwDevice(const std::string &path, int read_threads) {
     load_seconds_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
+namespace {
+
+// Bytes per K element of a component of a row-major quantized tensor (codes / scales / mins), as num / den.
+std::pair<int64_t, int64_t> bytes_per_k(const StrixwTensor &t, StrixwRole role) {
+    const bool q4 = t.encoding == StrixwEncoding::Q4RowMajor, q8 = t.encoding == StrixwEncoding::Q8RowMajor;
+    STRIX_CHECK(q4 || q8, "StrixwDevice split: column slice of '", t.name, "' (", strixw_encoding_name(t.encoding),
+                "): only Q4 / Q8 row-major");
+    if (role == StrixwRole::Q) return {1, q4 ? 2 : 1};
+    return {2, t.group_size};  // one BF16 scale / min per group
+}
+
+}  // namespace
+
+StrixwDevice::StrixwDevice(const std::string &path, const StrixwSlicePlan &plan, int read_threads) : split_(true) {
+    STRIX_CHECK(read_threads >= 1 && read_threads <= 64, "StrixwDevice: read_threads = ", read_threads);
+    const auto t0 = std::chrono::steady_clock::now();
+    file_ = std::make_unique<StrixwFile>(path);
+    // 1. Plan: each kept tensor's sliced shape and component sizes, at 256-aligned offsets of one device region.
+    struct Job {
+        const StrixwTensor *src;
+        StrixwSlice sl;
+        bool whole;
+    };
+    std::vector<Job> jobs;
+    uint64_t total = 0;
+    for (const StrixwTensor &t : file_->tensors()) {
+        std::optional<StrixwSlice> o = plan(t);
+        if (o && o->skip) continue;
+        Job j{&t, o ? *o : StrixwSlice{}, !o.has_value()};
+        StrixwTensor lt = t;
+        const int64_t N = t.shape.at(0);
+        if (j.sl.rows.empty()) j.sl.rows.push_back({0, N});
+        int64_t rows = 0;
+        for (auto [a, b] : j.sl.rows) {
+            STRIX_CHECK(0 <= a && a < b && b <= N, "StrixwDevice split: '", t.name, "' rows [", a, ", ", b, ") of ", N);
+            rows += b - a;
+        }
+        lt.shape[0] = rows;
+        if (j.sl.k1 > 0) {
+            STRIX_CHECK(t.shape.size() == 2 && t.group_size > 0 && 0 <= j.sl.k0 && j.sl.k0 < j.sl.k1 &&
+                            j.sl.k1 <= t.shape[1] && j.sl.k0 % t.group_size == 0 && j.sl.k1 % t.group_size == 0,
+                        "StrixwDevice split: '", t.name, "' columns [", j.sl.k0, ", ", j.sl.k1, ") not on whole groups of ",
+                        t.group_size);
+            lt.shape[1] = j.sl.k1 - j.sl.k0;
+        }
+        lt.parts.clear();
+        for (StrixwComponent &c : lt.components) {
+            const uint64_t row_bytes = c.bytes / (uint64_t)N;
+            STRIX_CHECK(row_bytes * (uint64_t)N == c.bytes, "StrixwDevice split: '", t.name, "' component ",
+                        strixw_role_name(c.role), " of ", c.bytes, " bytes isn't ", N, " equal rows");
+            uint64_t out_row = row_bytes;
+            if (j.sl.k1 > 0) {
+                const auto [num, den] = bytes_per_k(t, c.role);
+                out_row = (uint64_t)((j.sl.k1 - j.sl.k0) * num / den);
+            }
+            c.bytes = out_row * (uint64_t)rows;
+            total = (total + 255) & ~(uint64_t)255;
+            dev_off_[{t.name, (int)c.role}] = total;
+            total += c.bytes;
+        }
+        local_[t.name] = std::move(lt);
+        jobs.push_back(std::move(j));
+    }
+    STRIX_CHECK(total > 0, "StrixwDevice split: nothing to load from '", path, "'");
+    data_ = DeviceBuffer<uint8_t>((size_t)total, "strixw split region of '" + path + "'");
+    // 2. Load: each component read whole, sliced on the host, uploaded through two gated pinned staging buffers.
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    STRIX_CHECK(fd >= 0, "StrixwDevice: open '", path, "' failed: ", std::strerror(errno));
+    void *stage[2] = {nullptr, nullptr};
+    hipEvent_t done[2] = {nullptr, nullptr};
+    hipStream_t stream = nullptr;
+    std::vector<uint8_t> src, out;
+    try {
+        STRIX_HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "StrixwDevice: stream");
+        for (int i = 0; i < 2; ++i) {
+            STRIX_HIP_CHECK(hipHostMalloc(&stage[i], kStageBytes, hipHostMallocDefault), "StrixwDevice: staging ", i);
+            STRIX_HIP_CHECK(hipEventCreateWithFlags(&done[i], hipEventDisableTiming), "StrixwDevice: event ", i);
+        }
+        bool pending[2] = {false, false};
+        int cur = 0;
+        auto upload = [&](const uint8_t *p, uint64_t n, uint64_t dst) {
+            for (uint64_t at = 0; at < n; at += kStageBytes, cur ^= 1) {
+                const size_t len = (size_t)std::min<uint64_t>(kStageBytes, n - at);
+                if (pending[cur]) STRIX_HIP_CHECK(hipEventSynchronize(done[cur]), "StrixwDevice: staging gate");
+                std::memcpy(stage[cur], p + at, len);
+                STRIX_HIP_CHECK(hipMemcpyAsync(data_.get() + dst + at, stage[cur], len, hipMemcpyHostToDevice, stream),
+                                "StrixwDevice: copy");
+                STRIX_HIP_CHECK(hipEventRecord(done[cur], stream), "StrixwDevice: event record");
+                pending[cur] = true;
+            }
+        };
+        for (const Job &j : jobs) {
+            const StrixwTensor &t = *j.src;
+            const int64_t N = t.shape[0];
+            for (const StrixwComponent &c : t.components) {
+                const uint64_t dst = dev_off_.at({t.name, (int)c.role});
+                src.resize(c.bytes);
+                pread_parallel(fd, src.data(), c.bytes, c.offset, read_threads, path);
+                if (j.whole) {
+                    upload(src.data(), c.bytes, dst);
+                    continue;
+                }
+                const uint64_t row_bytes = c.bytes / (uint64_t)N;
+                uint64_t b0 = 0, b1 = row_bytes;
+                if (j.sl.k1 > 0) {
+                    const auto [num, den] = bytes_per_k(t, c.role);
+                    b0 = (uint64_t)(j.sl.k0 * num / den), b1 = (uint64_t)(j.sl.k1 * num / den);
+                }
+                const uint64_t ob = b1 - b0;
+                uint64_t rows = 0;
+                for (auto [a, b] : j.sl.rows) rows += (uint64_t)(b - a);
+                out.resize(ob * rows);
+                uint8_t *w = out.data();
+                for (auto [a, b] : j.sl.rows) {
+                    if (b0 == 0 && b1 == row_bytes) {  // whole rows: one run
+                        std::memcpy(w, src.data() + (uint64_t)a * row_bytes, (uint64_t)(b - a) * row_bytes);
+                        w += (uint64_t)(b - a) * row_bytes;
+                    } else {
+                        for (int64_t r = a; r < b; ++r, w += ob) std::memcpy(w, src.data() + (uint64_t)r * row_bytes + b0, ob);
+                    }
+                }
+                upload(out.data(), out.size(), dst);
+            }
+        }
+        STRIX_HIP_CHECK(hipStreamSynchronize(stream), "StrixwDevice: final sync");
+    } catch (...) {
+        for (int i = 0; i < 2; ++i) {
+            if (done[i]) (void)hipEventDestroy(done[i]);
+            if (stage[i]) (void)hipHostFree(stage[i]);
+        }
+        if (stream) (void)hipStreamDestroy(stream);
+        ::close(fd);
+        throw;
+    }
+    for (int i = 0; i < 2; ++i) (void)hipEventDestroy(done[i]), (void)hipHostFree(stage[i]);
+    (void)hipStreamDestroy(stream);
+    (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    ::close(fd);
+    load_seconds_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
 const StrixwTensor &StrixwDevice::tensor(const std::string &name, StrixwEncoding enc,
                                          const std::vector<int64_t> &shape) const {
+    if (split_) {
+        const auto it = local_.find(name);
+        STRIX_CHECK(it != local_.end(), "StrixwDevice: '", name, "' was not loaded on this rank (split plan)");
+        const StrixwTensor &t = it->second;
+        STRIX_CHECK(t.encoding == enc && t.shape == shape, "StrixwDevice: '", name, "' (this rank) is ",
+                    strixw_encoding_name(t.encoding), " ", shape_str(t.shape), ", expected ", strixw_encoding_name(enc),
+                    " ", shape_str(shape));
+        return t;
+    }
     const StrixwTensor &t = file_->get(name);
     STRIX_CHECK(t.encoding == enc && t.shape == shape, "StrixwDevice: '", name, "' in '", file_->path(), "' is ",
                 strixw_encoding_name(t.encoding), " ", shape_str(t.shape), ", expected ", strixw_encoding_name(enc),
@@ -109,6 +259,11 @@ const StrixwTensor &StrixwDevice::tensor(const std::string &name, StrixwEncoding
 }
 
 const void *StrixwDevice::ptr(const StrixwTensor &t, StrixwRole role) const {
+    if (split_) {
+        const auto it = dev_off_.find({t.name, (int)role});
+        STRIX_CHECK(it != dev_off_.end(), "StrixwDevice: '", t.name, "' has no ", strixw_role_name(role), " component here");
+        return data_.get() + it->second;
+    }
     for (const StrixwComponent &c : t.components)
         if (c.role == role) return data_.get() + (c.offset - file_->data_offset());
     STRIX_CHECK(false, "StrixwDevice: '", t.name, "' has no ", strixw_role_name(role), " component");
