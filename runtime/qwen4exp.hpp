@@ -369,6 +369,10 @@ public:
     // by frequency) and returns n logits. Default: the whole vocabulary. 1..vocab.
     // n <= model().draft_rows() (under tensor parallelism: the LM head rows rank 0 holds).
     void set_mtp_vocab(int64_t n);
+    // On (the default): drafts score the model's Q4 copy whenever make_draft_head_q4 made one covering mtp_vocab()
+    // rows, as served. Off: the Q8 rows (draft_lm()) - tp_ar's comparison cells; switchable between calls.
+    void set_mtp_draft_q4(bool on);
+    bool mtp_draft_q4() const { return mtp_draft_q4_; }
     int64_t mtp_vocab() const { return mtp_vocab_; }
     // ST-3 test hooks. debug_mtp_feed: the MTP catch-up for ids at pos().. from the given trunk streams X [T, H * d]
     // (activation dtype, host) instead of a trunk forward - pos() advances by T, mtp_prev_ = X's last row; the trunk's
@@ -436,6 +440,7 @@ private:
     DeviceBuffer<float> y32_;  // set_tp_f32_mixer: the mixer's FP32 partials [max_tokens, d]
     int mtp_tail_cur_ = 0;
     int64_t mtp_vocab_ = 0;  // set to the vocabulary by the constructor
+    bool mtp_draft_q4_ = true;
     DeviceBuffer<uint8_t> mtp_emb_, mtp_norm_emb_, mtp_norm_hid_, mtp_proj_emb_, mtp_x_, mtp_prev_;
     DeviceBuffer<uint8_t> k_cache_mtp_, v_cache_mtp_, block_keys_mtp_, tail_mtp_[2];
     DeviceBuffer<float> mtp_ones_;

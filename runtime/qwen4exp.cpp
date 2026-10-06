@@ -28,6 +28,7 @@
 #include <cstring>
 #include <filesystem>
 #include <optional>
+#include <thread>
 
 namespace strix {
 
@@ -1649,6 +1650,8 @@ void Qwen4ExpSession::set_mtp_vocab(int64_t n) {
     mtp_vocab_ = n;
 }
 
+void Qwen4ExpSession::set_mtp_draft_q4(bool on) { mtp_draft_q4_ = on; }
+
 void Qwen4ExpSession::mtp_input(int64_t T, const void *prev0) {
     STRIX_CHECK(mtp_, "Qwen4ExpSession::mtp_input: MTP is off");
     STRIX_CHECK(T >= 1 && T <= max_tokens_, "Qwen4ExpSession::mtp_input: ", T, " rows, expected 1..", max_tokens_);
@@ -1828,7 +1831,8 @@ void Qwen4ExpSession::run_mtp(int32_t token_id, int64_t step) {
     // else from the LM head as loaded.
     hc_mix(mtp.hc_mixer, false);
     const QWeightView &draft = m_.draft_head_q4();
-    QWeightView head = draft.bits != 0 && mtp_vocab_ <= draft.N() ? draft : m_.draft_lm();
+    // mtp_draft_q4_ off (tp_ar's Q8 comparison cells): the Q8 rows, as before the copy.
+    QWeightView head = mtp_draft_q4_ && draft.bits != 0 && mtp_vocab_ <= draft.N() ? draft : m_.draft_lm();
     STRIX_CHECK(head.K() == m_.lm_head().K() && mtp_vocab_ <= head.N(), "Qwen4ExpSession::forward_mtp: draft head [",
                 head.N(), ", ", head.K(), "] for mtp_vocab ", mtp_vocab_, " and the LM head's K ", m_.lm_head().K());
     switch (head.bits) {

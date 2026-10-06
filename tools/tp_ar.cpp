@@ -21,6 +21,11 @@
 // MTP (ST-3; --mtp 1: rank 0's session keeps the draft head, the executors' don't): per depth, after AR,
 //   verify_k  (--verify-k 1) forward_verify(k) + drop_verify for k = 2..6, mirrored, timed
 //   ar_gen    --gen greedy T = 1 forwards (candidates): the continuation the MTP loop replays
+//   PF-5      --mtp-draft-q4 on|off: the draft scores a Q4 copy of the draft vocabulary rows (made once at load,
+//             --mtp-draft-q4-group 64) instead of the loaded Q8 head; --mtp-free-q4 1: per depth also the free-running
+//             greedy MTP decode with the Q8 head and with the Q4 head, compared token by token ("free_q4").
+//   sweep     --mtp-sweep 1.0x3,2.0x5,2.0x5q4,..: per depth, the MTP loop over the same ar_gen for each cell (margin x
+//             most drafts, "q4" = the Q4 draft head), --sweep-reps passes (odd passes in reverse cell order), "sweep".
 //   mtp       the engine's draft / verify / keep loop over ar_gen teacher-forced (strix_bench's, on TpDriver: PF-1, or
 //             --mtp-reject-forward 1): steps, forwards, drafted, accepted, rollbacks, draft / verify / single ms, t/s,
 //             exchanges per token; with --hash 1 first one pass with every forward's / verify's replicated activations
@@ -246,6 +251,13 @@ struct RowHashes {
     }
 };
 
+// "on" / "off" / 1 / 0 (PF-5 switches).
+bool onoff_arg(const std::string &v, const char *what) {
+    if (v == "on" || v == "1" || v == "true") return true;
+    if (v == "off" || v == "0" || v == "false" || v.empty()) return false;
+    STRIX_FAIL(what, ": '", v, "', expected on or off");
+}
+
 double cand_gap(const Qwen4ExpSession::Candidates &c, int64_t row) {
     const kernels::LogitCand *x = c.cand.data() + row * kernels::kLogitCands;
     return (double)x[0].v - (double)x[1].v;
@@ -346,7 +358,7 @@ int main(int argc, char **argv) {
         const bool reject_forward = a.num("mtp-reject-forward", 0) != 0, verify_k = a.num("verify-k", 1) != 0;
         const int64_t verify_reps = a.num("verify-reps", 8);
         STRIX_CHECK(!shadow || world == 1, "tp_ar: --shadow runs the whole model in one process (world 1)");
-        const Qwen4ExpModel model(weights, ngram, kernels::Act::BF16, false, cache_rows, yarn,
+        Qwen4ExpModel model(weights, ngram, kernels::Act::BF16, false, cache_rows, yarn,
                                   TpConfig{world, rank, std::max<int64_t>(1, mtp_vocab)});
         const double load_s = (now_ms() - t0) / 1000;
         const Qwen4ExpDims &Dm = model.dims();
@@ -367,6 +379,32 @@ int main(int argc, char **argv) {
         else own = std::make_unique<Qwen4ExpSession>(model, cap, chunk, PrefillMath::WmmaBf16, ses_mtp);
         Qwen4ExpSession &ses = be ? be->session() : *own;
         if (ses_mtp) ses.set_mtp_vocab(mtp_vocab);
+        // PF-5: the Q4 draft head (rank 0 / world 1 only: executors never draft)
+        const bool draft_q4 = onoff_arg(a.get("mtp-draft-q4", "off"), "tp_ar --mtp-draft-q4");
+        const bool free_q4 = a.num("mtp-free-q4", 0) != 0;
+        struct SweepCell {
+            std::string key;
+            double margin;
+            int64_t draft;
+            bool q4;
+        };
+        std::vector<SweepCell> sweep;
+        for (const std::string &c : split(a.get("mtp-sweep"), ',')) {
+            const size_t x = c.find('x');
+            STRIX_CHECK(x != std::string::npos, "tp_ar --mtp-sweep: cell '", c, "', expected MARGINxDRAFTS[q4]");
+            const bool q4 = c.size() > 2 && c.compare(c.size() - 2, 2, "q4") == 0;
+            sweep.push_back({c, std::stod(c.substr(0, x)), std::stoll(c.substr(x + 1, c.size() - x - 1 - (q4 ? 2 : 0))), q4});
+        }
+        const int64_t sweep_reps = a.num("sweep-reps", 2);
+        double draft_q4_s = 0;
+        if (ses_mtp && (draft_q4 || free_q4 || std::any_of(sweep.begin(), sweep.end(), [](const SweepCell &c) { return c.q4; }))) {
+            const double q0 = now_ms();
+            model.make_draft_head_q4(ses.mtp_vocab(), a.num("mtp-draft-q4-group", 64));
+            draft_q4_s = (now_ms() - q0) / 1000;
+            std::fprintf(stderr, "tp_ar: Q4 draft head: %lld rows, group %lld, made in %.1f s\n",
+                         (long long)model.draft_head_q4().N(), (long long)model.draft_head_q4().q4.G, draft_q4_s);
+        }
+        if (ses_mtp) ses.set_mtp_draft_q4(draft_q4);
         const bool f32_mixer = a.num("tp-f32-mixer", 0) != 0;  // experiment: FP32 mixer partials (ST-2 KL study)
         if (f32_mixer && world > 1) ses.set_tp_f32_mixer(true);
         std::unique_ptr<TpComm> comm;
@@ -1111,6 +1149,75 @@ int main(int argc, char **argv) {
                     mtp_total.verify_ms.insert(mtp_total.verify_ms.end(), r.verify_ms.begin(), r.verify_ms.end());
                     mtp_total.single_ms.insert(mtp_total.single_ms.end(), r.single_ms.begin(), r.single_ms.end());
                     mtp_gen_total += gen_n, mtp_exch_total += ept * (double)gen_n;
+                    // PF-5: free-running greedy MTP with the Q8 head vs the Q4 head (the verify decides every token;
+                    // drafts differing changes which rows verify them, so near-ties can move)
+                    if (free_q4) {
+                        FreeRun fr[2];
+                        for (int h = 0; h < 2; ++h) {
+                            ses.set_mtp_draft_q4(h == 1);
+                            drv.restore(snap);
+                            fr[h] = mtp_free(drv, gen[0], gen_n, nv, mtp_draft, margin);
+                        }
+                        ses.set_mtp_draft_q4(draft_q4);
+                        int64_t same = 0, d = -1, same8 = 0, same4 = 0;
+                        for (int64_t t = 0; t < gen_n; ++t) {
+                            const bool e = fr[0].seq[(size_t)t] == fr[1].seq[(size_t)t];
+                            same += e;
+                            if (!e && d < 0) d = t;
+                            same8 += fr[0].seq[(size_t)t] == gen[(size_t)t];
+                            same4 += fr[1].seq[(size_t)t] == gen[(size_t)t];
+                        }
+                        J << ",\"free_q4\":{\"tokens\":" << gen_n << ",\"identical\":" << (d < 0 ? "true" : "false")
+                          << ",\"first_divergence\":" << d << ",\"positions_equal\":" << same
+                          << ",\"q8_vs_ar_equal\":" << same8 << ",\"q4_vs_ar_equal\":" << same4;
+                        if (d >= 0)
+                            J << ",\"q8_gap\":" << fr[0].gap[(size_t)d] << ",\"q4_gap\":" << fr[1].gap[(size_t)d]
+                              << ",\"near_tie\":" << (std::min(fr[0].gap[(size_t)d], fr[1].gap[(size_t)d]) < eps ? "true" : "false");
+                        J << "}";
+                        std::fprintf(stderr, "tp_ar: depth %lld: free-running MTP Q8 vs Q4 draft head: %s (first divergence %lld, %lld/%lld equal)\n",
+                                     (long long)D, d < 0 ? "identical" : "DIFFERENT", (long long)d, (long long)same, (long long)gen_n);
+                    }
+                    if (!sweep.empty()) {
+                        std::vector<std::vector<MtpRun>> runs(sweep.size());
+                        for (int64_t rp = 0; rp < sweep_reps; ++rp)
+                            for (size_t ci = 0; ci < sweep.size(); ++ci) {
+                                const size_t c = rp % 2 ? sweep.size() - 1 - ci : ci;
+                                ses.set_mtp_draft_q4(sweep[c].q4);
+                                drv.restore(snap);
+                                runs[c].push_back(mtp_loop(drv, gen, nv, sweep[c].draft, sweep[c].margin, reject_forward));
+                            }
+                        ses.set_mtp_draft_q4(draft_q4);
+                        J << ",\"sweep\":{";
+                        for (size_t c = 0; c < sweep.size(); ++c) {
+                            const MtpRun &f = runs[c].front();
+                            std::vector<double> tps, dms, vms, sms;
+                            for (const MtpRun &x : runs[c]) {
+                                tps.push_back((double)gen_n / x.decode_ms * 1000);
+                                dms.insert(dms.end(), x.draft_ms.begin(), x.draft_ms.end());
+                                vms.insert(vms.end(), x.verify_ms.begin(), x.verify_ms.end());
+                                sms.insert(sms.end(), x.single_ms.begin(), x.single_ms.end());
+                            }
+                            const Stats ts = stats(tps);
+                            J << (c ? "," : "") << "\"" << sweep[c].key << "\":{\"margin\":" << sweep[c].margin
+                              << ",\"drafts\":" << sweep[c].draft << ",\"q4\":" << (sweep[c].q4 ? "true" : "false")
+                              << ",\"tps_mean\":" << ts.mean << ",\"tps\":[";
+                            for (size_t z = 0; z < tps.size(); ++z) J << (z ? "," : "") << tps[z];
+                            J << "],\"steps\":" << f.steps << ",\"tokens_per_step\":" << (double)gen_n / (double)f.steps
+                              << ",\"forwards\":" << f.forwards << ",\"singles\":" << (f.steps - (int64_t)f.verify_ms.size())
+                              << ",\"draft_calls\":" << f.draft_calls << ",\"drafted\":" << f.drafted << ",\"accepted\":" << f.accepted
+                              << ",\"margin_failed_calls\":" << f.draft_calls - f.drafted << ",\"rejected_drafts\":" << f.drafted - f.accepted
+                              << ",\"wasted_drafts\":" << f.draft_calls - f.accepted << ",\"rollbacks\":" << f.rollbacks
+                              << ",\"kept_all\":" << f.kept_all << ",\"draft_call_ms\":" << js(stats(dms))
+                              << ",\"verify_call_ms\":" << js(stats(vms)) << ",\"single_forward_ms\":" << js(stats(sms)) << ",\"accepted_hist\":{";
+                            bool fh = true;
+                            for (auto [k, n] : f.acc_hist) J << (fh ? "" : ",") << "\"" << k << "\":" << n, fh = false;
+                            J << "}}";
+                            std::fprintf(stderr, "tp_ar: depth %lld: sweep %s: %.2f t/s (%.3f tok/step, %lld calls, %lld drafted, %lld accepted, draft %.3f ms)\n",
+                                         (long long)D, sweep[c].key.c_str(), ts.mean, (double)gen_n / (double)f.steps,
+                                         (long long)f.draft_calls, (long long)f.drafted, (long long)f.accepted, stats(dms).mean);
+                        }
+                        J << "}";
+                    }
                     drv.restore(snap);
                 }
                 J << "}";
@@ -1167,7 +1274,8 @@ int main(int argc, char **argv) {
         }
         const Qwen4ExpSession::PleStats ps = ses.ple_stats();
         J << ",\"mtp_on\":" << (use_mtp && drv.has_mtp() ? "true" : "false") << ",\"mtp_draft\":" << mtp_draft
-          << ",\"mtp_margin\":" << margin << ",\"mtp_vocab\":" << mtp_vocab << ",\"mtp_reject_forward\":"
+          << ",\"mtp_margin\":" << margin << ",\"mtp_vocab\":" << mtp_vocab << ",\"mtp_draft_q4\":"
+          << (draft_q4 ? "true" : "false") << ",\"draft_q4_make_s\":" << draft_q4_s << ",\"mtp_reject_forward\":"
           << (reject_forward ? "true" : "false") << ",\"ple_wait_s\":" << ps.wait_seconds << ",\"ple_waits\":" << ps.waits;
         if (world > 1) {
             const std::vector<Qwen4ExpSession::PleStats> es = drv.executor_stats();

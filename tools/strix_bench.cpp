@@ -114,6 +114,13 @@ int64_t argmax(const float *x, int64_t n) {
 
 }  // namespace
 
+// "on" / "off" / 1 / 0 (PF-5 switches).
+bool onoff_arg(const std::string &v, const char *what) {
+    if (v == "on" || v == "1" || v == "true") return true;
+    if (v == "off" || v == "0" || v == "false" || v.empty()) return false;
+    STRIX_FAIL(what, ": '", v, "', expected on or off");
+}
+
 int main(int argc, char **argv) {
     try {
         Args a;
@@ -179,7 +186,7 @@ int main(int argc, char **argv) {
         }
 
         t0 = now_ms();
-        const Qwen4ExpModel model(weights, ngram, kernels::Act::BF16, false, cache_rows, yarn,
+        Qwen4ExpModel model(weights, ngram, kernels::Act::BF16, false, cache_rows, yarn,
                                   TpConfig{tp_world, tp_rank, std::max<int64_t>(1, mtp_vocab)});
         const double load_s = (now_ms() - t0) / 1000;
         const Qwen4ExpDims &Dm = model.dims();
@@ -188,6 +195,15 @@ int main(int argc, char **argv) {
         const int64_t capacity = ((maxD + gen_n + 4096) / 4096 + 1) * 4096;
         Qwen4ExpSession ses(model, capacity, chunk, PrefillMath::WmmaBf16, model.has_mtp());
         if (model.has_mtp()) ses.set_mtp_vocab(mtp_vocab);
+        // PF-5: --mtp-draft-q4 on: draft over a Q4 copy of the draft vocabulary rows (made here, once)
+        const bool draft_q4 = onoff_arg(a.get("mtp-draft-q4", "off"), "strix_bench --mtp-draft-q4");
+        if (draft_q4 && model.has_mtp()) {
+            const double q0 = now_ms();
+            model.make_draft_head_q4(ses.mtp_vocab(), a.num("mtp-draft-q4-group", 64));
+            ses.set_mtp_draft_q4(true);
+            std::fprintf(stderr, "strix_bench: Q4 draft head: %lld rows made in %.1f s\n", (long long)model.draft_head_q4().N(),
+                         (now_ms() - q0) / 1000);
+        }
         // ST-3 step 1 draft equivalence: --mtp-equiv-out FILE (whole model) runs one forward of --equiv-n corpus tokens,
         // keeps the trunk's streams after the last layer (L<last>.out) and the head's 5 chained drafts from the
         // forward's greedy token; --mtp-equiv-in FILE (rank 0 of a TP group) feeds the same ids + streams to its MTP
@@ -515,6 +531,7 @@ int main(int argc, char **argv) {
           << ",\"load_s\":" << load_s << ",\"capacity\":" << capacity << ",\"chunk\":" << chunk << ",\"yarn\":" << yarn
           << ",\"mtp\":" << (model.has_mtp() ? "true" : "false") << ",\"mtp_draft\":" << mtp_draft << ",\"mtp_margin\":" << margin
           << ",\"mtp_reject_forward\":" << (reject_forward ? "true" : "false")
+          << ",\"mtp_draft_q4\":" << (draft_q4 ? "true" : "false")
           << ",\"mtp_vocab\":" << mtp_vocab << ",\"ngram_cache_rows\":" << cache_rows
           << ",\"gpu_mem_free_gib_after_session\":" << (double)free_b / (1ull << 30) << ",\"depths\":{";
 
