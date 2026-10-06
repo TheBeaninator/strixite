@@ -199,6 +199,10 @@ public:
     struct Options {
         PromptCache *cache = nullptr;
         float mtp_margin = 1.5f;  // logit margin (top1 - top2) required to draft MTP token
+        // After a rejected draft, the old path forwarded the rejected position's token v alone to get the next logits.
+        // Off (default, PF-1): v becomes the next step's first token instead - drafted from right away and run as
+        // row 0 of the next verify (or alone when no draft passes). On: the old path, kept for A/B comparison only.
+        bool mtp_reject_forward = false;
         int64_t mtp_draft = 1;    // most drafts per verify (the head chained), 1..15
         // Non-empty: every finished request's token ids and MTP steps are written there (serve/capture.hpp). The
         // directory must exist.
