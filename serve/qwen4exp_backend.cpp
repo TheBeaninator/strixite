@@ -143,7 +143,7 @@ BackendStats Qwen4ExpBackend::backend_stats() const {
 }
 
 void Qwen4ExpBackend::export_snapshot(int slot, HostBuffer &out, int64_t from) {
-    STRIX_CHECK(!tp_, "Qwen4ExpBackend::export_snapshot: not under tensor parallelism yet (each rank holds its own state; ST-4)");
+    STRIX_CHECK(!tp_, "Qwen4ExpBackend::export_snapshot: not under tensor parallelism yet (each rank holds its own state)");
     const Qwen4ExpSnapshot &s = snap(slot);
     STRIX_CHECK(s.pos() >= 1, "Qwen4ExpBackend::export_snapshot: slot ", slot, " was never saved");
     out.resize(session_.state_bytes(s.pos(), from));
@@ -151,7 +151,7 @@ void Qwen4ExpBackend::export_snapshot(int slot, HostBuffer &out, int64_t from) {
 }
 
 void Qwen4ExpBackend::import_state(const HostBuffer &state, int64_t n, int64_t from) {
-    STRIX_CHECK(!tp_, "Qwen4ExpBackend::import_state: not under tensor parallelism yet (each rank holds its own state; ST-4)");
+    STRIX_CHECK(!tp_, "Qwen4ExpBackend::import_state: not under tensor parallelism yet (each rank holds its own state)");
     session_.import_state(state.data(), state.size(), n, from);
 }
 

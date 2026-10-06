@@ -1,4 +1,4 @@
-// tp_ar (strixite-tp2 ST-2): the TP-N autoregressive forward checked and timed - and the same measurements on the whole
+// tp_ar: the TP-N autoregressive forward checked and timed - and the same measurements on the whole
 // model (world 1), so the reference and the TP run come from one code path (runtime/tp_mirror.hpp TpDriver).
 //
 //   whole model:  tp_ar --weights W --ngram T --tokenizer J --corpus train.raw --kl-corpus test.raw
@@ -18,25 +18,25 @@
 // Speed: per --depths D, the context (--corpus) grown to D by chunked prefill (lookahead hints mirrored), a snapshot,
 // then --ar-steps T = 1 forwards teacher-forced with GPU candidates (the engine's decode path); p50 / mean ms.
 //
-// MTP (ST-3; --mtp 1: rank 0's session keeps the draft head, the executors' don't): per depth, after AR,
+// MTP (--mtp 1: rank 0's session keeps the draft head, the executors' don't): per depth, after AR,
 //   verify_k  (--verify-k 1) forward_verify(k) + drop_verify for k = 2..6, mirrored, timed
 //   ar_gen    --gen greedy T = 1 forwards (candidates): the continuation the MTP loop replays
-//   PF-5      --mtp-draft-q4 on|off: the draft scores a Q4 copy of the draft vocabulary rows (made once at load,
+//   q4 head   --mtp-draft-q4 on|off: the draft scores a Q4 copy of the draft vocabulary rows (made once at load,
 //             --mtp-draft-q4-group 64) instead of the loaded Q8 head; --mtp-free-q4 1: per depth also the free-running
 //             greedy MTP decode with the Q8 head and with the Q4 head, compared token by token ("free_q4").
 //   sweep     --mtp-sweep 1.0x3,2.0x5,2.0x5q4,..: per depth, the MTP loop over the same ar_gen for each cell (margin x
 //             most drafts, "q4" = the Q4 draft head), --sweep-reps passes (odd passes in reverse cell order), "sweep".
-//   mtp       the engine's draft / verify / keep loop over ar_gen teacher-forced (strix_bench's, on TpDriver: PF-1, or
+//   mtp       the engine's draft / verify / keep loop over ar_gen teacher-forced (strix_bench's, on TpDriver: carry, or
 //             --mtp-reject-forward 1): steps, forwards, drafted, accepted, rollbacks, draft / verify / single ms, t/s,
 //             exchanges per token; with --hash 1 first one pass with every forward's / verify's replicated activations
 //             and every keep / drop's replicated state compared across ranks ("verify_hash"), then the timed pass.
 // Rank 1's PLE stats come back at the end (kStats): ple_wait_s_rank1.
 //
-// --shadow 1 (world 1, ST-3 step 2, design 3.2 check 1): the mirror-shadow test - one process, one weight copy, two
+// --shadow 1 (world 1): the mirror-shadow test - one process, one weight copy, two
 // sessions (the driver's with MTP, an executor's without) joined by an in-process control channel (TpLoopback), the
 // executor on a thread. Both are the whole model, so after every mirrored forward / verify their logits rows and
 // replicated activations must be bit-identical, and after every keep / drop / restore / reset their replicated
-// state. Drives the real MTP loop over --shadow-tokens generated tokens (PF-1 and reject-forward rounds alternating)
+// state. Drives the real MTP loop over --shadow-tokens generated tokens (carry and reject-forward rounds alternating)
 // with injected drops, mid-run snapshot restores and rank-0 failures followed by reset().
 
 #include "common/check.hpp"
@@ -213,7 +213,7 @@ MtpRun mtp_loop(TpDriver &drv, const std::vector<int32_t> &gen, int64_t n_valid,
         ++r.rollbacks;
         drv.keep_verify_prefix(j + 1);
         const int64_t v = i + j + 1;
-        if (reject_forward) {  // pre-PF-1: forward the rejected position's token alone
+        if (reject_forward) {  // the old path: forward the rejected position's token alone
             drv.prefetch_ple({gen[(size_t)v]}, 0);
             drv.want_candidates(n_valid);
             const double f0 = now_ms();
@@ -222,7 +222,7 @@ MtpRun mtp_loop(TpDriver &drv, const std::vector<int32_t> &gen, int64_t n_valid,
             ++r.forwards;
             i = v + 1;
         } else {
-            i = v;  // PF-1: gen[v] is the next step's first token (known, not yet forwarded)
+            i = v;  // carry: gen[v] is the next step's first token (known, not yet forwarded)
         }
         r.step_ms.push_back(now_ms() - st0);
     }
@@ -231,7 +231,7 @@ MtpRun mtp_loop(TpDriver &drv, const std::vector<int32_t> &gen, int64_t n_valid,
 }
 
 // Per-row hashes of a forward's L<i>.out rows (every layer, combined): rank 0's local probe (TpDriver::set_probe) -
-// the cross-run row-hash check (design 3.2 check 4).
+// the cross-run row-hash check.
 struct RowHashes {
     std::vector<uint64_t> h;  // [rows] of the last forward
     std::vector<uint8_t> host;
@@ -251,7 +251,7 @@ struct RowHashes {
     }
 };
 
-// "on" / "off" / 1 / 0 (PF-5 switches).
+// "on" / "off" / 1 / 0 (the Q4 draft-head switches).
 bool onoff_arg(const std::string &v, const char *what) {
     if (v == "on" || v == "1" || v == "true") return true;
     if (v == "off" || v == "0" || v == "false" || v.empty()) return false;
@@ -264,7 +264,7 @@ double cand_gap(const Qwen4ExpSession::Candidates &c, int64_t row) {
 }
 
 // Free-running greedy decode with MTP, as the engine runs it at temperature 0 (drafts accepted while they equal the
-// verify rows' greedy picks; PF-1: the first rejected row's pick is the next step's known token). From the state
+// verify rows' greedy picks; carry: the first rejected row's pick is the next step's known token). From the state
 // before `first` (known, not yet forwarded): n tokens (first included) and, per token t >= 1, the top-2 gap of the
 // row that chose it.
 struct FreeRun {
@@ -365,7 +365,7 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "tp_ar: rank %d of %d: %.2f GiB of weights (%.2f GiB read) loaded in %.1f s\n", rank, world,
                      (double)model.weights().data_bytes() / (1ull << 30), (double)model.weights().bytes_read() / (1ull << 30),
                      load_s);
-        // ST-3: rank 0 (or the whole model) keeps the MTP head with --mtp 1; executors never draft (no head loaded).
+        // Rank 0 (or the whole model) keeps the MTP head with --mtp 1; executors never draft (no head loaded).
         const bool ses_mtp = (use_mtp || shadow) && rank == 0;
         STRIX_CHECK(!ses_mtp || model.has_mtp(), "tp_ar: --mtp 1 but the weights have no MTP head");
         const int64_t cap = shadow ? ((a.num("shadow-prefix", 4096) + a.num("shadow-tokens", 2048) + 1024) / 4096 + 1) * 4096
@@ -379,7 +379,7 @@ int main(int argc, char **argv) {
         else own = std::make_unique<Qwen4ExpSession>(model, cap, chunk, PrefillMath::WmmaBf16, ses_mtp);
         Qwen4ExpSession &ses = be ? be->session() : *own;
         if (ses_mtp) ses.set_mtp_vocab(mtp_vocab);
-        // PF-5: the Q4 draft head (rank 0 / world 1 only: executors never draft)
+        // The Q4 draft head (rank 0 / world 1 only: executors never draft)
         const bool draft_q4 = onoff_arg(a.get("mtp-draft-q4", "off"), "tp_ar --mtp-draft-q4");
         const bool free_q4 = a.num("mtp-free-q4", 0) != 0;
         // control for free_q4: the same free-running decode with the Q8 head under another policy (MARGINxDRAFTS):
@@ -408,10 +408,10 @@ int main(int argc, char **argv) {
                          (long long)model.draft_head_q4().N(), (long long)model.draft_head_q4().q4.G, draft_q4_s);
         }
         if (ses_mtp) ses.set_mtp_draft_q4(draft_q4);
-        // FP32 partials are the session's default under TP (ST-N2); 0 switches them off (the BF16 A/B).
+        // FP32 partials are the session's default under TP; 0 switches them off (the BF16 A/B).
         const bool f32_mixer = world > 1 && a.num("tp-f32-mixer", 1) != 0;
         const bool f32_moe = world > 1 && a.num("tp-f32-moe", 1) != 0;
-        ses.set_grouped_min_tokens(a.num("grouped-min-tokens", Qwen4ExpSession::kGroupedMinTokens));  // PF-Q1 A/B
+        ses.set_grouped_min_tokens(a.num("grouped-min-tokens", Qwen4ExpSession::kGroupedMinTokens));  // A/B
         if (world > 1) {
             ses.set_tp_f32_mixer(f32_mixer);
             ses.set_tp_f32_moe(f32_moe);
@@ -424,7 +424,7 @@ int main(int argc, char **argv) {
             cc.rank = rank;
             cc.peers = split(a.get("tp-peers"), ',');
             STRIX_CHECK((int)cc.peers.size() == world, "tp_ar: --tp-peers lists ", cc.peers.size(), " addresses for world ", world);
-            cc.dev = a.get("tp-dev", "");  // empty: the mlx5 device with a RoCE v2 GID for this rank's rail-0 address
+            cc.dev = a.get("tp-dev", "");  // empty: the mlx5 device with a RoCE v2 GID for this rank's address
             cc.port = (int)a.num("tp-port", 18600);
             cc.max_bytes = (size_t)(chunk * Dm.d * (f32_mixer || f32_moe ? 4 : 2));
             cc.exchange_timeout_s = a.real("tp-timeout", 900);
@@ -593,7 +593,7 @@ int main(int argc, char **argv) {
                 done += G, ++round;
                 const TpDriver::HashStats &h = drv.hash_stats();
                 std::fprintf(stderr, "tp_ar: shadow: round %lld (%s) done: %lld tokens, %lld forwards, %lld mismatched, %lld state checks, %lld mismatched (%.0f s)\n",
-                             (long long)round, pf1 ? "PF-1" : "reject-forward", (long long)done, (long long)h.forwards,
+                             (long long)round, pf1 ? "carry" : "reject-forward", (long long)done, (long long)h.forwards,
                              (long long)h.mismatched, (long long)h.state_checks, (long long)h.state_mismatched,
                              (now_ms() - t_start) / 1000);
                 if (h.mismatched || h.state_mismatched) break;
@@ -702,7 +702,7 @@ int main(int argc, char **argv) {
             std::vector<double> kls;
             int64_t agree = 0;
             double nll = 0, nll_g = 0;
-            // ST-3 check 4: rank 0's per-position L<i>.out row hashes of this AR pass, for the MTP pass below
+            // Row-hash check: rank 0's per-position L<i>.out row hashes of this AR pass, for the MTP pass below
             const bool mtp_q = use_mtp && drv.has_mtp() && a.num("mtp-quality", 1) != 0;
             RowHashes rhp;
             std::vector<uint64_t> ar_rows;
@@ -726,7 +726,7 @@ int main(int argc, char **argv) {
                 J << ",\"vs_golden\":{\"golden\":\"" << golden_in << "\",\"kl_mean\":" << km << ",\"kl\":" << js(stats(kls))
                   << ",\"top1_agree\":" << (double)agree / (double)kls.size() << ",\"top1_agree_n\":" << agree
                   << ",\"golden_nll\":" << nll_g / (double)kls.size() << ",\"golden_ppl\":" << std::exp(nll_g / (double)kls.size());
-                // the first 256 positions alone (ST-0a's golden span, when the weights are ST-0a's)
+                // the first 256 positions alone (strix_bench's golden span, when the weights are the same)
                 if (kls.size() >= 256) {
                     double k256 = 0;
                     for (size_t i = 0; i < 256; ++i) k256 += kls[i];
@@ -775,7 +775,7 @@ int main(int argc, char **argv) {
                 std::fprintf(stderr, "tp_ar: candidate check: %lld / %lld mismatched\n", (long long)bad, (long long)cand_check);
             }
             if (mtp_q) {
-                // ST-3 check 5 (+ 4): the same 5120 positions teacher-forced through the MTP loop (PF-1 / reject path as
+                // MTP quality (+ row hashes): the same 5120 positions teacher-forced through the MTP loop (reject path as
                 // set): every position gets exactly one logits row - a verify row (row 0: the step's known token; rows
                 // >= 1: accepted drafts) or a single forward - scored against the goldens; each row's L<i>.out hash
                 // compared with the AR pass's at the same position (a rate: verify rows are not bit-equal, step 0).
@@ -1099,7 +1099,7 @@ int main(int argc, char **argv) {
                     // --router-overlap 1: rank 0's routed expert ids of every verify row in the timed MTP loop
                     // (the router_ids probe; it syncs per probe point, so that run's timings are not speed numbers).
                     // adj = |top-k(row r) & top-k(row r+1)| / k over adjacent rows; uniq = distinct experts / (T k)
-                    // over a verify's rows, per layer - what item 14 (expert dedup across rows) could save.
+                    // over a verify's rows, per layer - what expert dedup across rows could save.
                     const bool rov = a.num("router-overlap", 0) != 0;
                     std::map<int64_t, std::array<double, 4>> rov_t;  // T -> {adj shared, adj pairs*k, uniq, T*k}
                     if (rov) {
@@ -1162,7 +1162,7 @@ int main(int argc, char **argv) {
                     mtp_total.verify_ms.insert(mtp_total.verify_ms.end(), r.verify_ms.begin(), r.verify_ms.end());
                     mtp_total.single_ms.insert(mtp_total.single_ms.end(), r.single_ms.begin(), r.single_ms.end());
                     mtp_gen_total += gen_n, mtp_exch_total += ept * (double)gen_n;
-                    // PF-5: free-running greedy MTP with the Q8 head vs the Q4 head (the verify decides every token;
+                    // Free-running greedy MTP with the Q8 head vs the Q4 head (the verify decides every token;
                     // drafts differing changes which rows verify them, so near-ties can move)
                     if (free_q4) {
                         FreeRun fr[2];

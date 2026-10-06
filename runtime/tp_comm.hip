@@ -1,5 +1,5 @@
-// strixite-tp2: TpComm (runtime/tp_comm.hpp) - HIP kernels + ibverbs over rail 0. The transport is
-// tools/tp_exchange_bench's (ST-1: c_p50 15.1 us per 5 KiB exchange under load), made a library.
+// TpComm (runtime/tp_comm.hpp) - HIP kernels + ibverbs over RoCE v2. The transport is
+// tools/tp_exchange_bench's (c_p50 15.1 us per 5 KiB exchange under load), made a library.
 
 #include "runtime/tp_comm.hpp"
 
@@ -484,7 +484,7 @@ TpComm::TpComm(const TpCommConfig &cfg) : impl_(std::make_unique<Impl>()) {
                     "TpComm: QP INIT");
         I.P[(size_t)p].qp = qp;
     }
-    // TCP mesh on the rail-0 addresses: connect to lower ranks, accept higher ones.
+    // TCP mesh on the RDMA interfaces' addresses: connect to lower ranks, accept higher ones.
     const int ls = tcp_listen(cfg.peers[(size_t)rank_], cfg.port + rank_);
     for (int p = 0; p < rank_; ++p) {
         I.P[(size_t)p].fd = tcp_connect(cfg.peers[(size_t)p], cfg.port + p, deadline);

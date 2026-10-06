@@ -1,7 +1,7 @@
-// PF-6: the WMMA kernels at a K tail (K % 64 == 32, group size 32: a TP-4 rank's expert / shared-expert down,
+// The WMMA kernels at a K tail (K % 64 == 32, group size 32: a TP-4 rank's expert / shared-expert down,
 // K = 640 / 4 = 160) against the FP32 kernels (MoeMath::F32, linear_q4 / linear_q8), and those against a host double
 // reference, at K = 160, 320, 640. Every WMMA output is also hashed (FNV-1a over its bytes): K = 320 / 640 hashes are
-// the same before and after PF-6 (the TAIL = false instantiations are the unchanged kernels).
+// the same before and after the K-tail change (the TAIL = false instantiations are the unchanged kernels).
 //
 //   test_wmma_ktail [--tol 1e-2] [--json out.json]
 //

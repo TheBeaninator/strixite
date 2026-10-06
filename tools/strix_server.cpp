@@ -117,7 +117,7 @@ int run(int argc, char **argv) {
     if (use_mtp && settings.on("mtp-draft-q4") && backend.has_mtp()) {
         model.make_draft_head_q4(backend.session().mtp_vocab());
         backend.session().set_mtp_draft_q4(true);
-        slog(LogLevel::Info, "startup: MTP drafts over a Q4 copy of the first %lld LM head rows (PF-5)",
+        slog(LogLevel::Info, "startup: MTP drafts over a Q4 copy of the first %lld LM head rows",
              (long long)model.draft_head_q4().N());
     }
     std::unique_ptr<PromptCache> cache;

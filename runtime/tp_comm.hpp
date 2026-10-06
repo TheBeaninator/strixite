@@ -1,7 +1,7 @@
 #pragma once
 
-// strixite-tp2: the tensor-parallel communicator (world size N in {2, 4}) over RDMA on rail 0 (RoCE v2, ConnectX-6 Dx,
-// stock rdma-core mlx5 provider) - the exchange tools/tp_exchange_bench measured (ST-1), as a library.
+// The tensor-parallel communicator (world size N in {2, 4}) over RDMA (RoCE v2, ConnectX-6 Dx,
+// stock rdma-core mlx5 provider) - the exchange tools/tp_exchange_bench measures, as a library.
 //
 // Every exchange (an all-reduce or an all-gather) is queued on a HIP stream without any host wait:
 //   publish   the rank's payload is copied into send slot seq % 3 (host-coherent pinned memory registered with the NIC),
@@ -20,11 +20,11 @@
 // Failure: a WC error, a peer silent past exchange_timeout_s, or poison() poisons the communicator: every wait kernel
 // exits at once (the sums are then garbage) and check() throws - callers check after each forward.
 //
-// The control channel: the TCP mesh set up for the RDMA handshake stays open (one socket per peer, on the rail-0
+// The control channel: the TCP mesh set up for the RDMA handshake stays open (one socket per peer, on the RDMA
 // addresses, TCP_NODELAY); send() / recv() carry the mirrored calls (tp_mirror) and replies. Rank r listens on
-// port + r, so ranks may share a host (ST-3's one-node two-process loopback: two QPs on one port).
+// port + r, so ranks may share a host (the one-node two-process loopback: two QPs on one port).
 //
-// Size check (ST-3): the immediate of an exchange's last WRITE carries its sequence number (low 20 bits) and a 12-bit
+// Size check: the immediate of an exchange's last WRITE carries its sequence number (low 20 bits) and a 12-bit
 // tag of its size; a peer's exchange whose size disagrees with this rank's same exchange poisons the communicator
 // (a mirror bug - e.g. a verify of another T - would otherwise sum garbage silently). Arrival is published only after
 // the check.
@@ -46,7 +46,7 @@ namespace strix {
 
 struct TpCommConfig {
     int rank = 0;
-    std::vector<std::string> peers;  // rail-0 IPv4 address of every rank, in rank order (world = peers.size())
+    std::vector<std::string> peers;  // RDMA-interface IPv4 address of every rank, in rank order (world = peers.size())
     std::string dev;                 // RDMA device; empty: the mlx5 device with a RoCE v2 GID for this rank's address
     int port = 18600;                // TCP port of the handshake / control mesh (every rank listens on its own address)
     size_t max_bytes = 0;            // the largest payload of one exchange per rank
@@ -56,7 +56,7 @@ struct TpCommConfig {
 };
 
 // The control channel as tp_mirror uses it (TpDriver / tp_executor): TpComm's TCP mesh, or an in-process loopback
-// (TpLoopback, runtime/tp_mirror.hpp - the ST-3 mirror-shadow test).
+// (TpLoopback, runtime/tp_mirror.hpp - the mirror-shadow test).
 class TpControl {
 public:
     virtual ~TpControl() = default;
@@ -69,7 +69,7 @@ public:
     virtual void poison(const std::string &why) = 0;  // stops every wait now and later
 };
 
-// The RDMA device for a rank's rail-0 address: dev if given, else the mlx5 device with a RoCE v2 GID for ip.
+// The RDMA device for a rank's address: dev if given, else the mlx5 device with a RoCE v2 GID for ip.
 std::string tp_pick_device(const std::string &dev, const std::string &ip);
 
 class TpComm : public TpControl {

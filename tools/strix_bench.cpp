@@ -1,9 +1,9 @@
-// strix_bench (strixite-tp2, ST-0a / ST-0b): single-stream decode timing of Qwen4ExpSession at given context depths,
+// strix_bench: single-stream decode timing of Qwen4ExpSession at given context depths,
 // on WikiText-2 text, with the engine's own MTP policy replayed teacher-forced over the model's greedy continuation
 // (serve/replay.cpp's loop, timed per part), plus golden logits, the 1-node noise floor and needles.
 //
-//   whole model (ST-0a):  strix_bench --weights W --ngram T --tokenizer J --corpus a.raw,b.raw --out r.json
-//   one rank of N (ST-0b): ... --tp-world 2 --tp-rank 0   (exchanges stubbed: every all-reduce a no-op, counted)
+//   whole model:          strix_bench --weights W --ngram T --tokenizer J --corpus a.raw,b.raw --out r.json
+//   one rank of N:        ... --tp-world 2 --tp-rank 0   (exchanges stubbed: every all-reduce a no-op, counted)
 //
 // Per depth D (ascending; one session, the context grown by chunked prefill, a snapshot at D restored between parts):
 //   ar_tf     T=1 forwards teacher-forced on the corpus continuation (the gate's T1 / T_half: median ms; MTP catch-up off)
@@ -11,7 +11,7 @@
 //             "capture" the MTP replay decodes (whole model only)
 //   verify_k  forward_verify(k) + drop for k = 2..6 (catch-up off and on), drafts: forward_mtp_top2 per chained step
 //   mtp       the engine's draft / verify / keep loop over ar_gen's tokens: tokens/s, accepted per step
-// --hash-run 1: instead, one fixed call sequence with every result hashed (two builds compared bit for bit; ST-3).
+// --hash-run 1: instead, one fixed call sequence with every result hashed (two builds compared bit for bit).
 // Golden + noise floor (whole model): teacher-forced logits over WikiText-2 test after a prefill in chunks of 8192 vs
 // 4096 (only the arithmetic order differs) -> mean KL, top-1 agreement, NLL; rows saved for later gates.
 // Needles (whole model): 8 passcodes spliced into the context between 4k and 64k, asked for at each depth >= 64k.
@@ -114,7 +114,7 @@ int64_t argmax(const float *x, int64_t n) {
 
 }  // namespace
 
-// "on" / "off" / 1 / 0 (PF-5 switches).
+// "on" / "off" / 1 / 0 (the Q4 draft-head switches).
 bool onoff_arg(const std::string &v, const char *what) {
     if (v == "on" || v == "1" || v == "true") return true;
     if (v == "off" || v == "0" || v == "false" || v.empty()) return false;
@@ -137,7 +137,7 @@ int main(int argc, char **argv) {
         const int64_t ar_steps = a.num("ar-steps", 128), gen_n = a.num("gen", 256), chunk = a.num("chunk", 8192);
         const int64_t mtp_draft = a.num("mtp-draft", 5), mtp_vocab = a.num("mtp-vocab", 65536);
         const double margin = a.real("mtp-margin", 2.0);
-        const bool reject_forward = a.num("mtp-reject-forward", 0) != 0;  // pre-PF-1 path (A/B)
+        const bool reject_forward = a.num("mtp-reject-forward", 0) != 0;  // the old reject path (A/B)
         const int64_t cache_rows = a.num("ngram-cache-rows", 8388608);
         const float yarn = (float)a.real("yarn", 2.0);
         const int tp_world = (int)a.num("tp-world", 1), tp_rank = (int)a.num("tp-rank", 0);
@@ -195,7 +195,7 @@ int main(int argc, char **argv) {
         const int64_t capacity = ((maxD + gen_n + 4096) / 4096 + 1) * 4096;
         Qwen4ExpSession ses(model, capacity, chunk, PrefillMath::WmmaBf16, model.has_mtp());
         if (model.has_mtp()) ses.set_mtp_vocab(mtp_vocab);
-        // PF-5: --mtp-draft-q4 on: draft over a Q4 copy of the draft vocabulary rows (made here, once)
+        // --mtp-draft-q4 on: draft over a Q4 copy of the draft vocabulary rows (made here, once)
         const bool draft_q4 = onoff_arg(a.get("mtp-draft-q4", "off"), "strix_bench --mtp-draft-q4");
         if (draft_q4 && model.has_mtp()) {
             const double q0 = now_ms();
@@ -204,7 +204,7 @@ int main(int argc, char **argv) {
             std::fprintf(stderr, "strix_bench: Q4 draft head: %lld rows made in %.1f s\n", (long long)model.draft_head_q4().N(),
                          (now_ms() - q0) / 1000);
         }
-        // ST-3 step 1 draft equivalence: --mtp-equiv-out FILE (whole model) runs one forward of --equiv-n corpus tokens,
+        // Draft equivalence: --mtp-equiv-out FILE (whole model) runs one forward of --equiv-n corpus tokens,
         // keeps the trunk's streams after the last layer (L<last>.out) and the head's 5 chained drafts from the
         // forward's greedy token; --mtp-equiv-in FILE (rank 0 of a TP group) feeds the same ids + streams to its MTP
         // catch-up (Qwen4ExpSession::debug_mtp_feed) and drafts the same chain: the top-2s must be bit-equal.
@@ -288,9 +288,9 @@ int main(int argc, char **argv) {
             return ses.candidates().cand[0].id;
         };
 
-        // --hash-run 1 (ST-3 step 1's "world 1 bit-identical" check): one fixed sequence of calls, every result hashed -
+        // --hash-run 1 (the "world 1 bit-identical" check): one fixed sequence of calls, every result hashed -
         // the prefill's logits, --gen greedy T = 1 forwards (whole rows), then the MTP loop over that continuation twice
-        // (PF-1, then --mtp-reject-forward's path) with whole rows on every verify / single forward and every draft's
+        // (carry, then --mtp-reject-forward's path) with whole rows on every verify / single forward and every draft's
         // top-2, and the whole exported state at the end (trunk + MTP K / V, block keys, tails, streams). Two builds that
         // print the same hashes ran bit-identical arithmetic on these paths.
         if (a.num("hash-run", 0) != 0) {
@@ -391,7 +391,7 @@ int main(int argc, char **argv) {
             return 0;
         }
 
-        // --row-invariance 1 (ST-3 step 0, whole model): is a verify row's arithmetic a T = 1 forward's? Per depth, for
+        // --row-invariance 1 (whole model): is a verify row's arithmetic a T = 1 forward's? Per depth, for
         // --ri-positions positions q (each from a snapshot of the state at q): T = 1 forwards of ids[q..q+6) (whole rows,
         // every layer's L<i>.out row hashed), then forward_verify(ids[q..q+T)) + drop for T = 2..6 with the same rows and
         // hashes, compared bit for bit; and one T = 1 forward at q with the decode linears' split-K x2 - the p99 of
@@ -676,7 +676,7 @@ int main(int argc, char **argv) {
                     ++rollbacks;
                     ses.keep_verify_prefix(j + 1);
                     const int64_t v = i + j + 1;
-                    if (reject_forward) {  // pre-PF-1: forward the rejected position's token alone
+                    if (reject_forward) {  // the old path: forward the rejected position's token alone
                         ses.prefetch_ple({gen[(size_t)v]}, 0);
                         const double f0 = now_ms();
                         greedy({gen[(size_t)v]});
@@ -684,7 +684,7 @@ int main(int argc, char **argv) {
                         ++forwards;
                         i = v + 1;
                     } else {
-                        i = v;  // PF-1: gen[v] is the next step's first token (known, not yet forwarded)
+                        i = v;  // carry: gen[v] is the next step's first token (known, not yet forwarded)
                     }
                     step_ms.push_back(now_ms() - st0);
                 }

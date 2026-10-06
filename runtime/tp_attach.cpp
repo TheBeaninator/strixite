@@ -1,4 +1,4 @@
-// strixite-tp2: tp_attach (runtime/tp_mirror.hpp) - a session's exchanges through the RDMA communicator. Its own
+// tp_attach (runtime/tp_mirror.hpp) - a session's exchanges through the RDMA communicator. Its own
 // file (in strix_tp, with runtime/tp_comm.hip) so that TpDriver / tp_executor need no RDMA library.
 
 #include "runtime/tp_mirror.hpp"

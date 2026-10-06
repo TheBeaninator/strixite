@@ -81,7 +81,7 @@ QWeightView rows_prefix(QWeightView v, int64_t n, const char *what) {
 // Rank r of N's share of each tensor (StrixwSlice): F the whole model's dims. See Qwen4ExpDims::tp_world.
 std::optional<StrixwSlice> tp_slice(const StrixwTensor &t, const Qwen4ExpDims &F, int N, int r, int64_t draft_rows) {
     const std::string &n = t.name;
-    // ST-3: the MTP draft head lives on rank 0 only, whole (its drafts and the catch-up need no exchange).
+    // Under TP the MTP draft head lives on rank 0 only, whole (its drafts and the catch-up need no exchange).
     if (n.rfind("mtp.", 0) == 0) return r == 0 ? std::nullopt : std::optional<StrixwSlice>(StrixwSlice{true, {}, 0, 0});
     if (n.rfind(kLm + "layers.", 0) != 0) {
         if (n == "lm_head.weight") {
@@ -401,7 +401,7 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
     auto act_buf = [&](int64_t per_token, const std::string &name) {
         return DeviceBuffer<uint8_t>((size_t)(M * per_token) * e, name);
     };
-    // Buffers sized from both the per-rank dims D and the MTP head's whole dims MD (ST-3; equal at world 1): at least
+    // Buffers sized from both the per-rank dims D and the MTP head's whole dims MD (equal at world 1): at least
     // `bytes`, plus a guard (canaries_ok) past the end.
     auto guarded = [&](size_t bytes, const std::string &name) {
         DeviceBuffer<uint8_t> b(bytes + kCanaryBytes, name);
@@ -524,7 +524,7 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
     for (const auto &[at, n] : canaries_)
         STRIX_HIP_CHECK(hipMemset(const_cast<uint8_t *>(at), kCanaryByte, n), "Qwen4ExpSession: guard words");
     STRIX_HIP_CHECK(hipDeviceSynchronize(), "Qwen4ExpSession: guard words");
-    // Tensor parallelism: FP32 partials by default (ST-N2: TP4 perplexity within 0.5% of one node;
+    // Tensor parallelism: FP32 partials by default (TP4 perplexity within 0.5% of one node;
     // BF16 partials gave +0.71% AR / +0.55% MTP, FP32 +0.15% / +0.20%). The communicator's slots must hold FP32 rows.
     if (D.tp_world > 1 && m_.act() == Act::BF16) {
         set_tp_f32_mixer(true);
@@ -1062,7 +1062,7 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
     STRIX_TRACE_STAGE(stage);
     STRIX_TRACE_SET(stage, "embed");
     // Dense Q4 / Q8 projection: on the matrix units for large enough forwards when switched on - and when the kernel
-    // takes its K: a multiple of the K step (kernels/wmma_gemm.hpp kWmmaKC = 64), or of 32 for Q4 / Q8 (PF-6: a TP-4
+    // takes its K: a multiple of the K step (kernels/wmma_gemm.hpp kWmmaKC = 64), or of 32 for Q4 / Q8 (the K tail: a TP-4
     // rank's shared expert down, K = 160, runs the K-tail instantiation).
     auto lin = [&](const void *x, const QWeightView &w, void *y, int64_t M, Act out_act) {
         const bool wmma_k = w.K() % 64 == 0 || ((w.bits == 4 || w.bits == 8) && w.K() % 32 == 0);
@@ -1330,7 +1330,7 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
         if (T >= grouped_min_tokens_) {
             // Q4 experts on the matrix units take F16; Q5 stays on BF16 scaled codes
             // until its kernel moves over.
-            // The WMMA expert kernels step K by kWmmaKC (64); Q4 experts also take a K tail of 32 (PF-6: a TP-4 rank's
+            // The WMMA expert kernels step K by kWmmaKC (64); Q4 experts also take a K tail of 32 (a TP-4 rank's
             // intermediate 640 / 4 = 160 at G = 32). Anything else runs the FP32 math.
             const bool wmma_k = l.down.K() % 64 == 0 || (l.gate_up.bits == 4 && l.down.bits == 4 && l.down.K() % 32 == 0);
             const kernels::MoeMath em = !wmma_k ? kernels::MoeMath::F32
@@ -1595,7 +1595,7 @@ void Qwen4ExpSession::keep_verify_prefix(int64_t rows) {
     }
     if (mtp_) {
         // The MTP layer's projections are the last thing the verify wrote to proj_; its streams are still in x_.
-        // (Invariant, ST-3 design 1.2: nothing writes proj_ between the verify's catch-up and this keep - drafts come
+        // (Invariant: nothing writes proj_ between the verify's catch-up and this keep - drafts come
         // after it; a verify run with set_mtp_catchup(false) left no projections here.)
         STRIX_CHECK(verify_caught_up_, "Qwen4ExpSession::keep_verify_prefix: the verify ran without the MTP catch-up "
                     "(set_mtp_catchup(false)), so there are no MTP projections to keep");
@@ -1714,7 +1714,7 @@ void Qwen4ExpSession::run_mtp(int32_t token_id, int64_t step) {
     STRIX_TRACE_RANGE("draft " + std::to_string(step));
     STRIX_CHECK(mtp_, "Qwen4ExpSession::forward_mtp: the session was made without MTP");
     STRIX_CHECK(!broken_, "Qwen4ExpSession::forward_mtp: an earlier call failed midway; reset() the session first");
-    const Qwen4ExpDims &D = m_.dims(), &MD = m_.mtp_dims();  // MD: the whole head's widths (ST-3)
+    const Qwen4ExpDims &D = m_.dims(), &MD = m_.mtp_dims();  // MD: the whole head's widths
     STRIX_CHECK(token_id >= 0 && token_id < D.vocab, "Qwen4ExpSession::forward_mtp: token ", token_id,
                 " outside [0, ", D.vocab, ")");
     STRIX_CHECK(step >= 0, "Qwen4ExpSession::forward_mtp: step ", step, ", expected >= 0");

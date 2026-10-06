@@ -264,7 +264,7 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir, in
         {"mtp-reject-forward", K::OnOff, 0, 0, "off",
          "MTP: after a rejected draft, forward its position's token alone (the pre-PF-1 path; A/B only)"},
         {"mtp-draft-q4", K::OnOff, 0, 0, "off",
-         "MTP (PF-5): drafts score a Q4 copy of the draft vocabulary rows (made at load) instead of the Q8 LM head"},
+         "MTP: drafts score a Q4 copy of the draft vocabulary rows (made at load) instead of the Q8 LM head"},
         {"mtp-vocab", K::Int, 0, 1 << 30, "65536", "MTP: drafts are scored over token ids [0, N); 0 = the whole vocabulary"},
         {"ngram-cache-rows", K::Int, 0, 1 << 26, std::to_string(ngram_cache_rows_default),
          "the n-gram table's LRU row cache in rows (320 B each, plus index); 0 = none"},

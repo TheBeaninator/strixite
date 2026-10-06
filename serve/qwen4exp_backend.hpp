@@ -3,12 +3,12 @@
 // LmBackend on the real model: one Qwen4ExpSession (BF16 activations, WMMA prefill - the shipping settings) and one
 // Qwen4ExpSnapshot slot.
 //
-// Tensor parallelism (ST-3; rank 0 of a TP group): set_tp_driver(drv) routes every call that changes the trunk's state
+// Tensor parallelism (rank 0 of a TP group): set_tp_driver(drv) routes every call that changes the trunk's state
 // (forwards, verifies and their keeps / drops, resets, snapshots, PLE hints) through drv - mirrored to the executors
 // (runtime/tp_mirror.hpp) - and the MTP calls (drafts) to the session, as before: the head lives on rank 0 only.
 // Under TP a forward's logits are rank 0's vocabulary share, so forward_rows / forward_verify_rows refuse samplers that
 // need whole rows (the served defaults - greedy, top_k <= 20 - take candidates); forward / forward_verify gather whole
-// rows over the control channel (slow: quality runs). The prompt cache's export / import is not mirrored yet (ST-4).
+// rows over the control channel (slow: quality runs). The prompt cache's export / import is not mirrored yet.
 
 #include "runtime/qwen4exp.hpp"
 #include "serve/engine.hpp"
