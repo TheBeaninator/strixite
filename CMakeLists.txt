@@ -199,7 +199,7 @@ target_include_directories(strix_kernels PUBLIC "${CMAKE_SOURCE_DIR}")
 target_link_libraries(strix_kernels PUBLIC strix_rocm strix_formats)
 
 add_library(strix_model STATIC runtime/qwen3_5.cpp runtime/qwen4exp.cpp runtime/strixw_loader.cpp
-    runtime/ngram_rows.cpp runtime/ngram_table.cpp)
+    runtime/ngram_rows.cpp runtime/ngram_table.cpp runtime/tp_mirror.cpp)
 target_link_libraries(strix_model PUBLIC strix_kernels strix_formats strix_runtime)
 # ROCTX ranges (common/trace.hpp) for profiler timelines - off in every shipping build.
 option(STRIX_ROCTX "Compile in ROCTX ranges (forward / layer / sublayer) for rocprofv3 --marker-trace" OFF)
@@ -337,7 +337,9 @@ target_link_libraries(tp_exchange_bench PRIVATE strix_rocm ${STRIX_IBVERBS_LIB} 
 
 # strixite-tp2 ST-2: the TP-N communicator (runtime/tp_comm) and rank 0's driver / the executors (runtime/tp_mirror);
 # tools/tp_ar checks and times the TP forward against the whole model.
-add_library(strix_tp STATIC runtime/tp_mirror.cpp)
+# (TpDriver / tp_executor / TpLoopback - runtime/tp_mirror.cpp - are in strix_model: no RDMA; tp_attach joins a session
+# to the communicator.)
+add_library(strix_tp STATIC runtime/tp_attach.cpp)
 strix_hip_sources(strix_tp runtime/tp_comm.hip)
 target_link_libraries(strix_tp PUBLIC strix_model ${STRIX_IBVERBS_LIB} Threads::Threads)
 add_executable(tp_ar tools/tp_ar.cpp)

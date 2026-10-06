@@ -21,7 +21,13 @@
 // exits at once (the sums are then garbage) and check() throws - callers check after each forward.
 //
 // The control channel: the TCP mesh set up for the RDMA handshake stays open (one socket per peer, on the rail-0
-// addresses, TCP_NODELAY); send() / recv() carry the mirrored calls (tp_mirror) and replies.
+// addresses, TCP_NODELAY); send() / recv() carry the mirrored calls (tp_mirror) and replies. Rank r listens on
+// port + r, so ranks may share a host (ST-3's one-node two-process loopback: two QPs on one port).
+//
+// Size check (ST-3): the immediate of an exchange's last WRITE carries its sequence number (low 20 bits) and a 12-bit
+// tag of its size; a peer's exchange whose size disagrees with this rank's same exchange poisons the communicator
+// (a mirror bug - e.g. a verify of another T - would otherwise sum garbage silently). Arrival is published only after
+// the check.
 //
 // Needs LimitMEMLOCK=infinity (the windows are 9 x max_bytes of pinned memory at N = 2).
 
@@ -41,7 +47,7 @@ namespace strix {
 struct TpCommConfig {
     int rank = 0;
     std::vector<std::string> peers;  // rail-0 IPv4 address of every rank, in rank order (world = peers.size())
-    std::string dev = "mlx5_0";  // RDMA device
+    std::string dev;                 // RDMA device; empty: the mlx5 device with a RoCE v2 GID for this rank's address
     int port = 18600;                // TCP port of the handshake / control mesh (every rank listens on its own address)
     size_t max_bytes = 0;            // the largest payload of one exchange per rank
     uint64_t chunk = 4ull << 20;     // WRITE size for large payloads (plan v2: never one WRITE above 32 MiB)
@@ -49,16 +55,34 @@ struct TpCommConfig {
     double exchange_timeout_s = 900; // a peer this late on an exchange poisons the communicator
 };
 
-class TpComm {
+// The control channel as tp_mirror uses it (TpDriver / tp_executor): TpComm's TCP mesh, or an in-process loopback
+// (TpLoopback, runtime/tp_mirror.hpp - the ST-3 mirror-shadow test).
+class TpControl {
+public:
+    virtual ~TpControl() = default;
+    virtual int rank() const = 0;
+    virtual int world() const = 0;
+    // blocking, whole buffers, to / from rank `peer` (!= rank())
+    virtual void send(int peer, const void *p, size_t n) = 0;
+    virtual void recv(int peer, void *p, size_t n, double timeout_s = 1e9) = 0;
+    virtual void check() const = 0;                   // throws (with the first error) once poisoned
+    virtual void poison(const std::string &why) = 0;  // stops every wait now and later
+};
+
+// The RDMA device for a rank's rail-0 address: dev if given, else the mlx5 device with a RoCE v2 GID for ip.
+std::string tp_pick_device(const std::string &dev, const std::string &ip);
+
+class TpComm : public TpControl {
 public:
     explicit TpComm(const TpCommConfig &cfg);
     ~TpComm();
     TpComm(const TpComm &) = delete;
     TpComm &operator=(const TpComm &) = delete;
 
-    int rank() const { return rank_; }
-    int world() const { return world_; }
+    int rank() const override { return rank_; }
+    int world() const override { return world_; }
     size_t max_bytes() const { return max_bytes_; }
+    const std::string &device() const { return dev_; }
 
     // In place on stream: buf [elems] of act (BF16 or F32) := the sum over the ranks of every rank's buf, in rank order.
     void allreduce(void *buf, int64_t elems, kernels::Act act, hipStream_t stream);
@@ -69,18 +93,19 @@ public:
 
     uint64_t exchanges() const { return seq_; }  // queued so far
     bool poisoned() const;
-    void check() const;                     // throws (with the first error) once poisoned
-    void poison(const std::string &why);    // stops every wait now and later
+    void check() const override;
+    void poison(const std::string &why) override;
 
     // Control channel (blocking, whole buffers): to / from rank `peer` (!= rank()).
-    void send(int peer, const void *p, size_t n);
-    void recv(int peer, void *p, size_t n, double timeout_s = 1e9);
+    void send(int peer, const void *p, size_t n) override;
+    void recv(int peer, void *p, size_t n, double timeout_s = 1e9) override;
     void barrier();
 
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     int rank_ = 0, world_ = 1;
+    std::string dev_;
     size_t max_bytes_ = 0;
     uint64_t seq_ = 0;
     void enqueue(const void *src, size_t bytes, hipStream_t stream);  // publish + wait for exchange seq_
