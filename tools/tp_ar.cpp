@@ -408,10 +408,15 @@ int main(int argc, char **argv) {
                          (long long)model.draft_head_q4().N(), (long long)model.draft_head_q4().q4.G, draft_q4_s);
         }
         if (ses_mtp) ses.set_mtp_draft_q4(draft_q4);
-        const bool f32_mixer = a.num("tp-f32-mixer", 0) != 0;  // experiment: FP32 mixer partials (ST-2 KL study)
-        if (f32_mixer && world > 1) ses.set_tp_f32_mixer(true);
-        const bool f32_moe = a.num("tp-f32-moe", 0) != 0;  // FP32 MoE partials (ST-N2 perplexity study)
-        if (f32_moe && world > 1) ses.set_tp_f32_moe(true);
+        // FP32 partials are the session's default under TP (ST-N2); 0 switches them off (the BF16 A/B).
+        const bool f32_mixer = world > 1 && a.num("tp-f32-mixer", 1) != 0;
+        const bool f32_moe = world > 1 && a.num("tp-f32-moe", 1) != 0;
+        if (world > 1) {
+            ses.set_tp_f32_mixer(f32_mixer);
+            ses.set_tp_f32_moe(f32_moe);
+        }
+        const int64_t f32_max_t = a.num("tp-f32-max-tokens", 0);  // > 0: FP32 partials only for forwards of <= this
+        if (f32_max_t > 0) ses.set_tp_f32_max_tokens(f32_max_t);
         std::unique_ptr<TpComm> comm;
         if (world > 1) {
             TpCommConfig cc;

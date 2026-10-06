@@ -524,6 +524,12 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
     for (const auto &[at, n] : canaries_)
         STRIX_HIP_CHECK(hipMemset(const_cast<uint8_t *>(at), kCanaryByte, n), "Qwen4ExpSession: guard words");
     STRIX_HIP_CHECK(hipDeviceSynchronize(), "Qwen4ExpSession: guard words");
+    // Tensor parallelism: FP32 partials by default (ST-N2: TP4 perplexity within 0.5% of one node;
+    // BF16 partials gave +0.71% AR / +0.55% MTP, FP32 +0.15% / +0.20%). The communicator's slots must hold FP32 rows.
+    if (D.tp_world > 1 && m_.act() == Act::BF16) {
+        set_tp_f32_mixer(true);
+        set_tp_f32_moe(true);
+    }
     reset();
 }
 
@@ -1072,8 +1078,8 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
         ++exchanges_;
         if (exchange_) exchange_(buf, elems, kind, stream_, out);
     };
-    const bool f32_mixer = tp && tp_f32_mixer_;
-    const bool f32_moe = tp && tp_f32_moe_;  // y32_ is free again by the MoE: the mixer's exchange consumed it
+    const bool f32_mixer = tp && tp_f32_mixer_ && T <= tp_f32_max_tokens_;
+    const bool f32_moe = tp && tp_f32_moe_ && T <= tp_f32_max_tokens_;  // y32_ is free again by the MoE: the mixer's exchange consumed it
     cand_n_valid_ = 0;
     broken_ = true;
     const bool fresh = pos_ == 0;
