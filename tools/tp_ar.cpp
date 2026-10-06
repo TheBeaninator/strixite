@@ -47,6 +47,8 @@
 #include "serve/tokenizer.hpp"
 
 #include <algorithm>
+#include <array>
+#include <iterator>
 #include <chrono>
 #include <random>
 #include <thread>
@@ -1043,9 +1045,58 @@ int main(int argc, char **argv) {
                                      (long long)vh.state_checks, (long long)vh.state_mismatched);
                     }
                     drv.restore(snap);
+                    // --router-overlap 1: rank 0's routed expert ids of every verify row in the timed MTP loop
+                    // (the router_ids probe; it syncs per probe point, so that run's timings are not speed numbers).
+                    // adj = |top-k(row r) & top-k(row r+1)| / k over adjacent rows; uniq = distinct experts / (T k)
+                    // over a verify's rows, per layer - what item 14 (expert dedup across rows) could save.
+                    const bool rov = a.num("router-overlap", 0) != 0;
+                    std::map<int64_t, std::array<double, 4>> rov_t;  // T -> {adj shared, adj pairs*k, uniq, T*k}
+                    if (rov) {
+                        drv.set_probe([&](const std::string &n, const void *d, int64_t rows, int64_t cols, ProbeType) {
+                            if (rows < 2 || rows > 16 || n.size() < 10 || n.compare(n.size() - 10, 10, "router_ids") != 0)
+                                return;
+                            std::vector<int32_t> h((size_t)(rows * cols));
+                            STRIX_HIP_CHECK(hipMemcpy(h.data(), d, h.size() * 4, hipMemcpyDeviceToHost), "router_ids probe");
+                            std::vector<std::vector<int32_t>> sets((size_t)rows);
+                            for (int64_t r = 0; r < rows; ++r) {
+                                for (int64_t c = 0; c < cols; ++c) {
+                                    const int32_t e = h[(size_t)(r * cols + c)];
+                                    if (e >= 0 && e < (int32_t)Dm.experts) sets[(size_t)r].push_back(e);
+                                }
+                                std::sort(sets[(size_t)r].begin(), sets[(size_t)r].end());
+                            }
+                            auto &acc = rov_t[rows];
+                            std::vector<int32_t> all;
+                            for (int64_t r = 0; r < rows; ++r) {
+                                all.insert(all.end(), sets[(size_t)r].begin(), sets[(size_t)r].end());
+                                acc[3] += (double)sets[(size_t)r].size();
+                                if (r + 1 < rows) {
+                                    std::vector<int32_t> x;
+                                    std::set_intersection(sets[(size_t)r].begin(), sets[(size_t)r].end(),
+                                                          sets[(size_t)r + 1].begin(), sets[(size_t)r + 1].end(),
+                                                          std::back_inserter(x));
+                                    acc[0] += (double)x.size(), acc[1] += (double)sets[(size_t)r].size();
+                                }
+                            }
+                            std::sort(all.begin(), all.end());
+                            acc[2] += (double)(std::unique(all.begin(), all.end()) - all.begin());
+                        });
+                    }
                     const uint64_t m0 = exch();
                     const MtpRun r = mtp_loop(drv, gen, nv, mtp_draft, margin, reject_forward);
                     const double ept = (double)(exch() - m0) / (double)gen_n;
+                    if (rov) {
+                        drv.set_probe(nullptr);
+                        J << ",\"router_overlap\":{";
+                        std::array<double, 4> tot{};
+                        for (auto &[t, v] : rov_t) {
+                            J << "\"" << t << "\":{\"adj_shared_frac\":" << v[0] / std::max(1.0, v[1])
+                              << ",\"unique_frac\":" << v[2] / std::max(1.0, v[3]) << ",\"row_layers\":" << v[3] << "},";
+                            for (int q = 0; q < 4; ++q) tot[(size_t)q] += v[(size_t)q];
+                        }
+                        J << "\"all\":{\"adj_shared_frac\":" << tot[0] / std::max(1.0, tot[1])
+                          << ",\"unique_frac\":" << tot[2] / std::max(1.0, tot[3]) << "}}";
+                    }
                     J << ",\"mtp\":" << mtp_json(r, gen_n, ept);
                     last_mtp = r;
                     std::fprintf(stderr, "tp_ar: depth %lld: MTP %.2f t/s (%lld steps, %lld forwards, %lld drafted, %lld accepted, %lld rollbacks; %.1f exchanges/token)\n",
