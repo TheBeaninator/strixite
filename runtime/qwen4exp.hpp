@@ -81,6 +81,10 @@ struct Qwen4ExpDims {
 
 struct TpConfig {
     int world = 1, rank = 0;
+    // Rank 0 holds the MTP draft head whole (ST-3, phase 1) and drafts over the LM head's first rows: its LM head share
+    // is rows [0, max(vocab / N, draft_rows)) - the trunk uses the first vocab / N (a prefix view), the draft up to
+    // draft_rows (at N = 4: 62,080 < 65,536, the served mtp-vocab; design 1.3 item 4, option 2).
+    int64_t draft_rows = 65536;
 };
 
 class Qwen4ExpModel {
@@ -144,6 +148,13 @@ public:
     const NgramRowSource &ngram_rows() const;
     bool has_mtp() const { return has_mtp_; }
     const MtpHead &mtp() const { return mtp_; }
+    // The MTP head's dims: the whole model's (the head is never split - rank 0 holds it whole under tensor
+    // parallelism) for hq / hkv / astride / idx_col / inter (and the GDN widths); the rest as dims(). = dims() at world 1.
+    const Qwen4ExpDims &mtp_dims() const { return mtp_dims_; }
+    // The LM head rows the draft may score (and make_draft_head_q4 copies from): lm_head() as loaded (rank 0: max(lm_rows, TpConfig::draft_rows); the
+    // trunk's lm_head() is its first lm_rows), the vocabulary at world 1.
+    const QWeightView &draft_lm() const { return draft_lm_; }
+    int64_t draft_rows() const { return draft_lm_.N(); }
 
     // The MTP draft's own Q4 copy of the LM head's first `rows` rows (strixite PR #2 by @TheBeaninator, rewritten;
     // formats/q4_from_q8.hpp). Every draft call scores the first mtp_vocab rows of the LM head; the served head is
@@ -164,7 +175,7 @@ public:
     size_t draft_head_q4_bytes() const { return draft_q4_ ? draft_q4_bytes_ : 0; }
 
 private:
-    Qwen4ExpDims dims_;
+    Qwen4ExpDims dims_, mtp_dims_;
     kernels::Act act_;
     std::unique_ptr<StrixwDevice> w_;
     std::unique_ptr<NgramRowSource> ngram_;
@@ -172,6 +183,7 @@ private:
     const uint16_t *embed_ = nullptr;
     Q8DeviceView embed_q8_{};
     QWeightView lm_head_;
+    QWeightView draft_lm_;                   // the LM head rows the draft may score (draft_lm())
     QWeightView draft_head_;                 // make_draft_head_q4's copy (bits 0: none)
     std::unique_ptr<Q4Device> draft_q4_;     // its storage when made from a Q8 head
     size_t draft_q4_bytes_ = 0;
@@ -355,8 +367,17 @@ public:
     MtpTop2 forward_mtp_top2(int32_t token_id, int64_t step = 0);
     // The draft's vocabulary: forward_mtp scores only ids [0, n) (the LM head's first n rows - BPE ids run roughly
     // by frequency) and returns n logits. Default: the whole vocabulary. 1..vocab.
+    // n <= model().draft_rows() (under tensor parallelism: the LM head rows rank 0 holds).
     void set_mtp_vocab(int64_t n);
     int64_t mtp_vocab() const { return mtp_vocab_; }
+    // ST-3 test hooks. debug_mtp_feed: the MTP catch-up for ids at pos().. from the given trunk streams X [T, H * d]
+    // (activation dtype, host) instead of a trunk forward - pos() advances by T, mtp_prev_ = X's last row; the trunk's
+    // own state is NOT advanced (garbage for the trunk: reset() after). With the same ids + X a world-1 session (after
+    // its trunk forward) and a rank-0 TP session hold the same MTP state, so their drafts must agree bit for bit.
+    void debug_mtp_feed(const std::vector<int32_t> &ids, const void *x_host, size_t bytes);
+    // Guard words written past the end of the buffers sized from mixed whole / per-rank dims (proj_, core_, gu_, hh_,
+    // attn_ws_, the MTP K / V caches) at construction; false if any was overwritten since.
+    bool canaries_ok() const;
 
     // Tensor parallelism (dims().tp_world > 1): the all-reduce of a partial sum at a row-parallel output - kind 0 the
     // mixer's (o_proj / GDN out_proj), 1 the MoE's (routed + gated shared expert): elems activations [T, d] in buf,
@@ -434,6 +455,15 @@ private:
     // The MTP layer's input for T rows at positions pos_..pos_+T-1 into mtp_x_: token ids_[t] with the streams
     // after position pos_ + t - 1 (prev0 for t = 0, x_ row t - 1 after it).
     void mtp_input(int64_t T, const void *prev0);
+    // The end of a forward with MTP on: the MTP layer's K / V, block keys and indexer tail for ids_ rows [0, T) at
+    // pos_.., from x_ (rows 0..T-2) and mtp_prev_; mtp_prev_ := x_ row T - 1. Writes proj_ (keep_verify_prefix reads it).
+    void mtp_catchup(int64_t T);
+    static constexpr int64_t kCanaryBytes = 256;
+    static constexpr uint8_t kCanaryByte = 0xa5;
+    std::vector<std::pair<const uint8_t *, size_t>> canaries_;
+    // The pending verify ran the MTP catch-up (so proj_ holds its projections for keep_verify_prefix): set by
+    // forward_verify. Invariant (ST-3 design 1.2): no kernel writes proj_ between a verify's catch-up and its keep.
+    bool verify_caught_up_ = false;
     // forward_mtp / forward_mtp_top2's shared body: the head's layer and the LM head's logits into logits_ (queued on
     // stream_; broken_ set until the caller's read-back succeeds, which then calls mtp_done(step)).
     void run_mtp(int32_t token_id, int64_t step);

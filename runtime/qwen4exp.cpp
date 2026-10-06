@@ -60,13 +60,33 @@ bool ends_with(const std::string &s, const std::string &e) {
     return s.size() >= e.size() && s.compare(s.size() - e.size(), e.size(), e) == 0;
 }
 
+// The rows rank 0's LM head holds: its vocabulary share, at least the draft's rows (TpConfig::draft_rows).
+int64_t rank0_head_rows(const Qwen4ExpDims &F, int N, int64_t draft_rows) {
+    return std::min(F.vocab, std::max(F.vocab / N, draft_rows));
+}
+
+// The first n rows of a row-major quantized weight (the same data: a prefix view).
+QWeightView rows_prefix(QWeightView v, int64_t n, const char *what) {
+    STRIX_CHECK(n >= 1 && n <= v.N(), what, ": a prefix of ", n, " rows of ", v.N());
+    switch (v.bits) {
+        case 8: v.q8.N = n; break;
+        case 6: v.q6.N = n; break;
+        case 5: v.q5.N = n; break;
+        case 4: v.q4.N = n; break;
+        default: STRIX_FAIL(what, ": ", v.bits, " bits, expected 4, 5, 6 or 8");
+    }
+    return v;
+}
+
 // Rank r of N's share of each tensor (StrixwSlice): F the whole model's dims. See Qwen4ExpDims::tp_world.
-std::optional<StrixwSlice> tp_slice(const StrixwTensor &t, const Qwen4ExpDims &F, int N, int r) {
+std::optional<StrixwSlice> tp_slice(const StrixwTensor &t, const Qwen4ExpDims &F, int N, int r, int64_t draft_rows) {
     const std::string &n = t.name;
-    if (n.rfind("mtp.", 0) == 0) return StrixwSlice{true, {}, 0, 0};  // MTP drafts run on rank 0 only (whole head): ST-3
+    // ST-3: the MTP draft head lives on rank 0 only, whole (its drafts and the catch-up need no exchange).
+    if (n.rfind("mtp.", 0) == 0) return r == 0 ? std::nullopt : std::optional<StrixwSlice>(StrixwSlice{true, {}, 0, 0});
     if (n.rfind(kLm + "layers.", 0) != 0) {
         if (n == "lm_head.weight") {
             const int64_t V = F.vocab / N;
+            if (r == 0) return StrixwSlice{false, {{0, rank0_head_rows(F, N, draft_rows)}}, 0, 0};
             return StrixwSlice{false, {{r * V, (r + 1) * V}}, 0, 0};
         }
         return std::nullopt;
@@ -124,6 +144,8 @@ Qwen4ExpModel::Qwen4ExpModel(const std::string &weights, const std::string &ngra
     STRIX_CHECK(std::isfinite(yarn_factor) && yarn_factor >= 1.0f && yarn_factor <= 8.0f, "Qwen4ExpModel: yarn_factor = ",
                 yarn_factor, ", expected 1 (RoPE as trained) .. 8");
     Qwen4ExpDims &D = dims_;
+    const Qwen4ExpDims whole = D;  // the MTP head's (mtp_dims_)
+    STRIX_CHECK(tp.draft_rows >= 1, "Qwen4ExpModel: draft_rows = ", tp.draft_rows);
     STRIX_CHECK((tp.world == 1 && tp.rank == 0) || ((tp.world == 2 || tp.world == 4) && tp.rank >= 0 && tp.rank < tp.world),
                 "Qwen4ExpModel: tensor parallelism world ", tp.world, " rank ", tp.rank, " (world 1, 2 or 4)");
     if (tp.world > 1) {
@@ -137,7 +159,9 @@ Qwen4ExpModel::Qwen4ExpModel(const std::string &weights, const std::string &ngra
         D.conv_c = 2 * D.gk * kHD + D.gv * kHD, D.gz = D.gv * kHD, D.gstride = D.conv_c + D.gz + 2 * D.gv;
         D.idx_col = D.hq * 2 * D.hd + 2 * D.hkv * D.hd, D.astride = D.idx_col + D.idx_h * D.idx_d + D.idx_d;
         const int rank = tp.rank;
-        w_ = std::make_unique<StrixwDevice>(weights, [F, N, rank](const StrixwTensor &t) { return tp_slice(t, F, N, rank); });
+        const int64_t draft_rows = tp.draft_rows;
+        w_ = std::make_unique<StrixwDevice>(
+            weights, [F, N, rank, draft_rows](const StrixwTensor &t) { return tp_slice(t, F, N, rank, draft_rows); });
     } else {
         w_ = std::make_unique<StrixwDevice>(weights);
     }
@@ -166,7 +190,10 @@ Qwen4ExpModel::Qwen4ExpModel(const std::string &weights, const std::string &ngra
     } else {
         embed_ = w_->bf16(kLm + "embed_tokens.weight", {D.vocab, D.d});
     }
-    lm_head_ = w_->qw("lm_head.weight", {D.lm_rows, D.d});
+    // Rank 0 of N may hold more rows than its share (the draft's; tp_slice): the trunk's head is the first lm_rows.
+    const int64_t head_rows = D.tp_world > 1 && D.tp_rank == 0 ? rank0_head_rows(whole, D.tp_world, tp.draft_rows) : D.lm_rows;
+    draft_lm_ = w_->qw("lm_head.weight", {head_rows, D.d});
+    lm_head_ = head_rows == D.lm_rows ? draft_lm_ : rows_prefix(draft_lm_, D.lm_rows, "Qwen4ExpModel: LM head");
     final_ = load_hc(*w_, kLm + "hyper_connection_mixer.", D, false);
     D.yarn_factor = yarn_factor;
     if (yarn_factor > 1.0f) {
@@ -241,7 +268,15 @@ Qwen4ExpModel::Qwen4ExpModel(const std::string &weights, const std::string &ngra
         }
         layers_.push_back(l);
     }
-    has_mtp_ = D.tp_world == 1 && f.find("mtp.fc_embedding.weight") != nullptr;
+    // The MTP head: whole, on rank 0 only (tp_slice), so its shapes are the whole model's.
+    mtp_dims_ = D;
+    {
+        Qwen4ExpDims &M = mtp_dims_;
+        M.gk = whole.gk, M.gv = whole.gv, M.conv_c = whole.conv_c, M.gz = whole.gz, M.gstride = whole.gstride;
+        M.hq = whole.hq, M.hkv = whole.hkv, M.idx_col = whole.idx_col, M.astride = whole.astride, M.inter = whole.inter;
+    }
+    const Qwen4ExpDims &MD = mtp_dims_;
+    has_mtp_ = D.tp_rank == 0 && f.find("mtp.fc_embedding.weight") != nullptr;
     if (has_mtp_) {
         mtp_.fc_embedding = w_->qw("mtp.fc_embedding.weight", {D.d, D.d});
         mtp_.fc_hidden = w_->qw("mtp.fc_hidden.weight", {D.d, D.d});
@@ -253,18 +288,18 @@ Qwen4ExpModel::Qwen4ExpModel(const std::string &weights, const std::string &ngra
         l.hc_attn = load_hc(*w_, M + "attn_hyper_connection.", D, true);
         l.hc_mlp = load_hc(*w_, M + "mlp_hyper_connection.", D, true);
         const std::string A = M + "self_attn.";
-        l.qkv = w_->qw(A + "qkv", {D.astride, D.d});
-        l.o_proj = w_->qw(A + "o_proj.weight", {D.d, D.hq * D.hd});
+        l.qkv = w_->qw(A + "qkv", {MD.astride, D.d});
+        l.o_proj = w_->qw(A + "o_proj.weight", {D.d, MD.hq * D.hd});
         l.q_norm = w_->f32(A + "q_norm.weight", {D.hd});
         l.k_norm = w_->f32(A + "k_norm.weight", {D.hd});
         l.idx_q_norm = w_->f32(A + "indexer.q_layernorm.weight", {D.idx_d});
         l.idx_k_norm = w_->f32(A + "indexer.k_layernorm.weight", {D.idx_d});
-        l.gate_up = w_->qw(M + "mlp.experts_gate_up", {Estack * 2 * D.inter, D.d});
-        l.down = w_->qw(M + "mlp.experts_down", {Estack * D.d, D.inter});
+        l.gate_up = w_->qw(M + "mlp.experts_gate_up", {Estack * 2 * MD.inter, D.d});
+        l.down = w_->qw(M + "mlp.experts_down", {Estack * D.d, MD.inter});
         l.router = w_->bf16(M + "mlp.router", {D.experts + 1, D.d});
         if (shared_separate_) {
-            l.shared_gate_up = w_->qw(M + "mlp.shared_expert.gate_up", {2 * D.inter, D.d});
-            l.shared_down = w_->qw(M + "mlp.shared_expert.down_proj.weight", {D.d, D.inter});
+            l.shared_gate_up = w_->qw(M + "mlp.shared_expert.gate_up", {2 * MD.inter, D.d});
+            l.shared_down = w_->qw(M + "mlp.shared_expert.down_proj.weight", {D.d, MD.inter});
         }
     }
 }
@@ -273,26 +308,29 @@ void Qwen4ExpModel::make_draft_head_q4(int64_t rows, int64_t G, int threads) {
     const char *fn = "Qwen4ExpModel::make_draft_head_q4";
     STRIX_CHECK(has_mtp_, fn, ": the model has no MTP head - nothing drafts");
     STRIX_CHECK(draft_head_.bits == 0, fn, ": a draft head copy of ", draft_head_.N(), " rows was already made (call once)");
-    STRIX_CHECK(lm_head_.bits != 0, fn, ": the LM head isn't loaded");
-    const int64_t N = lm_head_.N(), K = lm_head_.K();
-    STRIX_CHECK(N == dims_.vocab, fn, ": the LM head has ", N, " rows, expected the vocabulary's ", dims_.vocab);
+    // The copy is made from draft_lm(): the LM head at world 1; under tensor parallelism the rows rank 0 holds whole.
+    const QWeightView &src = draft_lm_;
+    STRIX_CHECK(src.bits != 0, fn, ": the LM head isn't loaded");
+    const int64_t N = src.N(), K = src.K();
+    STRIX_CHECK(N == (dims_.tp_world == 1 ? dims_.vocab : draft_rows()), fn, ": the LM head has ", N, " rows, expected ",
+                dims_.tp_world == 1 ? dims_.vocab : draft_rows());
     STRIX_CHECK(rows >= 1 && rows <= N, fn, ": rows ", rows, ", expected 1..", N, " (the LM head's rows)");
     STRIX_CHECK(q4_group_size_supported(G), fn, ": group size ", G, ", expected 32, 64 or 128");
     STRIX_CHECK(K % G == 0, fn, ": the LM head's K = ", K, " is not a multiple of group size ", G);
     STRIX_CHECK(threads >= 1 && threads <= 64, fn, ": threads ", threads, ", expected 1..64");
 
-    if (lm_head_.bits == 4) {  // already Q4: the draft reads the loaded head (a row prefix of it)
-        STRIX_CHECK(lm_head_.q4.G == G, fn, ": the LM head is Q4 with group size ", lm_head_.q4.G, ", asked for ", G,
+    if (src.bits == 4) {  // already Q4: the draft reads the loaded head (a row prefix of it)
+        STRIX_CHECK(src.q4.G == G, fn, ": the LM head is Q4 with group size ", src.q4.G, ", asked for ", G,
                     " - a Q4 head is used as loaded, not requantized");
-        draft_head_ = lm_head_;
+        draft_head_ = src;
         draft_head_.q4.N = rows;
         return;
     }
-    STRIX_CHECK(lm_head_.bits == 8, fn, ": the LM head has ", lm_head_.bits, " bits, expected 8 (requantized) or 4 (used ",
+    STRIX_CHECK(src.bits == 8, fn, ": the LM head has ", src.bits, " bits, expected 8 (requantized) or 4 (used ",
                 "as loaded)");
 
     // Read the Q8 rows back (row-major: the first `rows` rows are a prefix of each array).
-    const Q8DeviceView &v = lm_head_.q8;
+    const Q8DeviceView &v = src.q8;
     STRIX_CHECK(v.q && v.scale && v.minv && v.K == K && v.G >= 1 && K % v.G == 0, fn, ": the Q8 LM head view is ",
                 "incomplete (codes ", (const void *)v.q, ", scales ", (const void *)v.scale, ", mins ",
                 (const void *)v.minv, ", K ", v.K, ", G ", v.G, ")");
@@ -342,7 +380,7 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
                 "Qwen4ExpSession: unknown prefill math ", (int)prefill_math);
     STRIX_CHECK(!mtp || model.has_mtp(), "Qwen4ExpSession: MTP asked for, but the loaded weights have no MTP head "
                 "(no mtp.fc_embedding.weight)");
-    const Qwen4ExpDims &D = m_.dims();
+    const Qwen4ExpDims &D = m_.dims(), &MD = m_.mtp_dims();
     STRIX_CHECK(capacity >= 1 && capacity <= (1ll << 24), "Qwen4ExpSession: capacity = ", capacity, ", expected 1..2^24");
     STRIX_CHECK(capacity <= D.max_positions(), "Qwen4ExpSession: capacity = ", capacity, " is past the model's ",
                 D.max_positions(), " positions (", D.trained_positions, " trained x YaRN factor ", D.yarn_factor,
@@ -374,19 +412,28 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
     auto act_buf = [&](int64_t per_token, const std::string &name) {
         return DeviceBuffer<uint8_t>((size_t)(M * per_token) * e, name);
     };
+    // Buffers sized from both the per-rank dims D and the MTP head's whole dims MD (ST-3; equal at world 1): at least
+    // `bytes`, plus a guard (canaries_ok) past the end.
+    auto guarded = [&](size_t bytes, const std::string &name) {
+        DeviceBuffer<uint8_t> b(bytes + kCanaryBytes, name);
+        canaries_.emplace_back(b.get() + bytes, (size_t)kCanaryBytes);
+        return b;
+    };
     ids_ = DeviceBuffer<int32_t>((size_t)M, "token ids");
     x_ = act_buf(n4, "residual streams");
     u_ = act_buf(D.d, "sublayer input");
     y_ = act_buf(D.d, "sublayer output");
     if (m_.shared_separate()) sh_y_ = act_buf(D.d, "shared expert output");
-    proj_ = act_buf(std::max(D.gstride, D.astride), "projection");
+    // The MTP catch-up projects T rows of the whole head's q|k|v|idx (MD.astride) into proj_ too.
+    proj_ = guarded((size_t)(M * std::max({D.gstride, D.astride, mtp ? MD.astride : (int64_t)0})) * e, "projection");
     qkv_ = act_buf(D.conv_c, "gdn q|k|v");
     STRIX_CHECK(D.gz == D.gv * kHD, "Qwen4ExpSession: GDN z width ", D.gz, " != ", D.gv, " value heads x ", kHD,
                 " (rmsnorm_gated reads z in place as gv heads of kHD a token)");
-    core_ = act_buf(std::max(D.gz, D.hq * D.hd), "mixer core");
+    // A draft's row (T = 1) of the whole head: its attention core MD.hq x hd, its experts' A x MD.inter (gate|up 2x).
+    core_ = guarded((size_t)std::max(M * std::max(D.gz, D.hq * D.hd), mtp ? MD.hq * MD.hd : (int64_t)0) * e, "mixer core");
     gnorm_ = act_buf(D.gz, "gdn normed");
-    gu_ = act_buf(A * 2 * D.inter, "experts gate|up");
-    hh_ = act_buf(A * D.inter, "experts swiglu");
+    gu_ = guarded((size_t)std::max(M * A * 2 * D.inter, mtp ? A * 2 * MD.inter : (int64_t)0) * e, "experts gate|up");
+    hh_ = guarded((size_t)std::max(M * A * D.inter, mtp ? A * MD.inter : (int64_t)0) * e, "experts swiglu");
     h_ = DeviceBuffer<float>((size_t)(M * D.r), "hc low-rank");
     w_in_ = DeviceBuffer<float>((size_t)(M * D.H), "hc w_in");
     inv_ = DeviceBuffer<float>((size_t)(M * D.H), "hc inverse rms");
@@ -432,6 +479,11 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
             if (qsa) attn_ws_bytes_ = std::max(attn_ws_bytes_, kernels::attention_gathered_wmma_workspace_bytes(s, qsa_k));
         }
     }
+    if (mtp) {  // a draft's row through the whole head's attention (T = 1 at any position)
+        const kernels::AttentionShape s{1, capacity - 1, MD.hq, MD.hkv, D.hd, MD.astride, 2 * D.hd};
+        attn_ws_bytes_ = std::max(attn_ws_bytes_, kernels::attention_workspace_bytes(s));
+        if (qsa) attn_ws_bytes_ = std::max(attn_ws_bytes_, kernels::attention_gathered_workspace_bytes(s, qsa_k));
+    }
     if (qsa) {
         qsa_scores_ = DeviceBuffer<float>((size_t)(M * cap_blocks_), "QSA block scores");
         qsa_sel_ = DeviceBuffer<int32_t>((size_t)(M * qsa_k), "QSA kept blocks");
@@ -442,7 +494,8 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
     }
     attn_err_ = DeviceBuffer<uint32_t>(3, "attention error");
     STRIX_HIP_CHECK(hipMemset(attn_err_.get(), 0, 12), "zero attention error");
-    attn_ws_ = DeviceBuffer<float>(attn_ws_bytes_ / 4 + 1, "attention workspace");
+    attn_ws_ = DeviceBuffer<float>(attn_ws_bytes_ / 4 + 1 + kCanaryBytes / 4, "attention workspace");
+    canaries_.emplace_back(reinterpret_cast<const uint8_t *>(attn_ws_.get() + attn_ws_bytes_ / 4 + 1), (size_t)kCanaryBytes);
     expert_err_ = DeviceBuffer<uint32_t>(3, "expert error");
     if (prefill_math_ == PrefillMath::WmmaBf16 && M >= kWmmaMinTokens) {
         hc_ws_bytes_ = kernels::hc_wmma_workspace_bytes(M, D.H, D.r + D.H);
@@ -458,7 +511,7 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
     emb_err_ = DeviceBuffer<kernels::EmbeddingError>(1, "embedding error");
     STRIX_HIP_CHECK(hipMemset(expert_err_.get(), 0, 12), "zero expert error");
     STRIX_HIP_CHECK(hipMemset(router_err_.get(), 0, 12), "zero router error");
-    mtp_vocab_ = D.vocab;
+    mtp_vocab_ = std::min(D.vocab, m_.draft_rows());
     if (mtp_) {
         mtp_emb_ = act_buf(D.d, "MTP embedding");
         mtp_norm_emb_ = act_buf(D.d, "MTP normed embedding");
@@ -466,8 +519,8 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
         mtp_proj_emb_ = act_buf(D.d, "MTP fc_embedding output");
         mtp_x_ = act_buf(n4, "MTP streams");
         mtp_prev_ = DeviceBuffer<uint8_t>((size_t)n4 * e, "MTP previous streams");
-        k_cache_mtp_ = DeviceBuffer<uint8_t>((size_t)(capacity * D.hkv * D.hd) * e, "MTP K cache");
-        v_cache_mtp_ = DeviceBuffer<uint8_t>((size_t)(capacity * D.hkv * D.hd) * e, "MTP V cache");
+        k_cache_mtp_ = guarded((size_t)(capacity * MD.hkv * D.hd) * e, "MTP K cache");
+        v_cache_mtp_ = guarded((size_t)(capacity * MD.hkv * D.hd) * e, "MTP V cache");
         block_keys_mtp_ = DeviceBuffer<uint8_t>((size_t)(cap_blocks_ * D.idx_d) * e, "MTP block keys");
         for (int k = 0; k < 2; ++k)
             tail_mtp_[k] = DeviceBuffer<uint8_t>((size_t)(3 * D.idx_d) * e, "MTP indexer tail " + std::to_string(k));
@@ -479,7 +532,22 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
         mtp_ones_ = DeviceBuffer<float>(ones.size(), "MTP ones");
         STRIX_HIP_CHECK(hipMemcpy(mtp_ones_.get(), ones.data(), ones.size() * 4, hipMemcpyHostToDevice), "MTP ones");
     }
+    for (const auto &[at, n] : canaries_)
+        STRIX_HIP_CHECK(hipMemset(const_cast<uint8_t *>(at), kCanaryByte, n), "Qwen4ExpSession: guard words");
+    STRIX_HIP_CHECK(hipDeviceSynchronize(), "Qwen4ExpSession: guard words");
     reset();
+}
+
+bool Qwen4ExpSession::canaries_ok() const {
+    STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::canaries_ok");
+    std::vector<uint8_t> h;
+    for (const auto &[at, n] : canaries_) {
+        h.resize(n);
+        STRIX_HIP_CHECK(hipMemcpy(h.data(), at, n, hipMemcpyDeviceToHost), "Qwen4ExpSession::canaries_ok");
+        for (uint8_t b : h)
+            if (b != kCanaryByte) return false;
+    }
+    return true;
 }
 
 Qwen4ExpSession::~Qwen4ExpSession() {
@@ -744,7 +812,7 @@ size_t Qwen4ExpSession::state_bytes(int64_t n, int64_t from) const {
             b += conv_state_[l].size() + rec_state_[l].size() * sizeof(float);
     }
     b += ple_state_.size();
-    if (mtp_) b += kv + keys + tail_mtp_[0].size() + mtp_prev_.size();
+    if (mtp_) b += 2 * (size_t)((n - from) * m_.mtp_dims().hkv * D.hd) * e + keys + tail_mtp_[0].size() + mtp_prev_.size();
     return b;
 }
 
@@ -818,7 +886,7 @@ void Qwen4ExpSession::export_state(const Qwen4ExpSnapshot &s, uint8_t *out, size
     }
     host_copy(cur, s.ple_state_.get(), s.ple_state_.size(), true, stream_, "PLE conv state");
     if (mtp_) {
-        const size_t row = (size_t)(D.hkv * D.hd) * e, kv = (size_t)(n - from) * row;
+        const size_t row = (size_t)(m_.mtp_dims().hkv * D.hd) * e, kv = (size_t)(n - from) * row;
         host_copy(cur, k_cache_mtp_.get() + (size_t)from * row, kv, true, stream_, "MTP K cache");
         host_copy(cur, v_cache_mtp_.get() + (size_t)from * row, kv, true, stream_, "MTP V cache");
         block_keys_copy(cur, block_keys_mtp_.get(), b0, b1, cap_blocks_, D.idx_d, e, true, stream_);
@@ -866,7 +934,7 @@ void Qwen4ExpSession::import_state(const uint8_t *in, size_t bytes, int64_t n, i
     }
     host_copy(cur, ple_state_.get(), ple_state_.size(), false, stream_, "PLE conv state");
     if (mtp_) {
-        const size_t row = (size_t)(D.hkv * D.hd) * e, kv = (size_t)(n - from) * row;
+        const size_t row = (size_t)(m_.mtp_dims().hkv * D.hd) * e, kv = (size_t)(n - from) * row;
         host_copy(cur, k_cache_mtp_.get() + (size_t)from * row, kv, false, stream_, "MTP K cache");
         host_copy(cur, v_cache_mtp_.get() + (size_t)from * row, kv, false, stream_, "MTP V cache");
         block_keys_copy(cur, block_keys_mtp_.get(), b0, b1, cap_blocks_, D.idx_d, e, false, stream_);
@@ -1321,31 +1389,89 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
     // Tensor parallelism: the vocabulary shares' candidates gathered and merged on every rank (cand_dev_ in place, global
     // ids). Full logits rows (no candidates) stay this rank's share [n_logits, lm_rows]: the caller gathers them.
     if (cands) tp_exchange(cand_dev_.get(), n_logits, 2);
-    if (mtp_ && mtp_catchup_) {
-        const Qwen4ExpModel::Layer &ml = m_.mtp().layer;
-        mtp_input(T, mtp_prev_.get());
-        hc_mix(ml.hc_attn, true, false, mtp_x_.get());
-        lin(u_.get(), ml.qkv, proj_.get(), T, act);
-        const kernels::NormRopeJob nr[2] = {
-            {at(proj_, D.hq * 2 * hd), D.astride, hd, k_cache_mtp_.get() + (size_t)(pos_ * D.hkv * hd) * e, D.hkv * hd, hd,
-             D.hkv, hd, ml.k_norm},
-            {at(proj_, D.hq * 2 * hd + D.hkv * hd), D.astride, hd, v_cache_mtp_.get() + (size_t)(pos_ * D.hkv * hd) * e,
-             D.hkv * hd, hd, D.hkv, hd, nullptr}};
-        kernels::qk_norm_rope_jobs(nr, 2, T, D.eps, D.rot, pos_, m_.inv_freq(), act, stream_, m_.rope_scale());  // k, v into the MTP cache
-        kernels::qsa_block_keys(at(proj_, D.idx_col + D.idx_h * D.idx_d), D.astride, T, pos_,
-                                pos_ % kernels::kQsaBlock ? tail_mtp_[mtp_tail_cur_].get() : nullptr,
-                                tail_mtp_[1 - mtp_tail_cur_].get(), D.idx_d, ml.idx_k_norm, D.eps, m_.inv_freq(),
-                                D.rot, block_keys_mtp_.get(), cap_blocks_, act, stream_, m_.rope_scale());
-        mtp_tail_cur_ = 1 - mtp_tail_cur_;
-        STRIX_HIP_CHECK(hipMemcpyAsync(mtp_prev_.get(), at(x_, (T - 1) * n4), (size_t)n4 * e, hipMemcpyDeviceToDevice,
-                                       stream_),
-                        "MTP previous streams");
-    }
+    if (mtp_ && mtp_catchup_) mtp_catchup(T);
     std::vector<float> logits = cands ? read_back(0, "", n_logits) : read_back((size_t)(n_logits * D.lm_rows), "");
     pos_ += T;
     broken_ = false;
     mtp_chain_step_ = -1;
     return logits;
+}
+
+void Qwen4ExpSession::mtp_catchup(int64_t T) {
+    const Qwen4ExpDims &D = m_.dims(), &MD = m_.mtp_dims();
+    const Act act = m_.act();
+    const size_t e = es(act);
+    const bool wmma = prefill_math_ == PrefillMath::WmmaBf16;
+    const int64_t n4 = D.H * D.d, hd = D.hd;
+    auto at = [&](const DeviceBuffer<uint8_t> &b, int64_t elem) { return b.get() + (size_t)elem * e; };
+    const Qwen4ExpModel::Layer &ml = m_.mtp().layer;
+    mtp_input(T, mtp_prev_.get());
+    // The layer's attention mix over mtp_x_ (inject: w_in_ for nothing after; the trunk's hc mix, kernels as forward()).
+    const Qwen4ExpModel::Hc &hc = ml.hc_attn;
+    STRIX_CHECK((hc.down.bits == 4 || hc.down.bits == 8) && (hc.up.bits == 4 || hc.up.bits == 8),
+                "Qwen4ExpSession: HC weights not loaded (down Q", hc.down.bits, ", up Q", hc.up.bits, ")");
+    uint8_t *X = mtp_x_.get();
+    if (wmma && T >= kWmmaMinTokens) {
+        float *ws = hc_ws_.get();
+        if (hc.down.bits == 8)
+            kernels::hc_mix_down_wmma(X, hc.down.q8, T, D.H, D.d, D.r, true, D.eps, h_.get(), w_in_.get(), inv_.get(), ws,
+                                      hc_ws_bytes_, act, stream_, false);
+        else
+            kernels::hc_mix_down_wmma(X, hc.down.q4, T, D.H, D.d, D.r, true, D.eps, h_.get(), w_in_.get(), inv_.get(), ws,
+                                      hc_ws_bytes_, act, stream_, false);
+        if (hc.up.bits == 8)
+            kernels::hc_mix_up_wmma(h_.get(), hc.up.q8, X, hc.norm, inv_.get(), T, D.H, D.d, u_.get(), act, stream_);
+        else
+            kernels::hc_mix_up_wmma(h_.get(), hc.up.q4, X, hc.norm, inv_.get(), T, D.H, D.d, u_.get(), act, stream_);
+        kernels::linear_qw_wmma(u_.get(), ml.qkv, proj_.get(), T, act, act, stream_);
+    } else {
+        if (hc.down.bits == 8)
+            kernels::hc_mix_down(X, hc.down.q8, T, D.H, D.d, D.r, true, D.eps, h_.get(), w_in_.get(), inv_.get(), act, stream_);
+        else
+            kernels::hc_mix_down(X, hc.down.q4, T, D.H, D.d, D.r, true, D.eps, h_.get(), w_in_.get(), inv_.get(), act, stream_);
+        if (hc.up.bits == 8)
+            kernels::hc_mix_up(h_.get(), hc.up.q8, X, hc.norm, inv_.get(), T, D.H, D.d, u_.get(), act, stream_);
+        else
+            kernels::hc_mix_up(h_.get(), hc.up.q4, X, hc.norm, inv_.get(), T, D.H, D.d, u_.get(), act, stream_);
+        kernels::linear_qw(u_.get(), ml.qkv, proj_.get(), T, act, act, stream_);
+    }
+    // The whole head's widths (MD; the trunk's D are this rank's share under tensor parallelism).
+    const kernels::NormRopeJob nr[2] = {
+        {at(proj_, MD.hq * 2 * hd), MD.astride, hd, k_cache_mtp_.get() + (size_t)(pos_ * MD.hkv * hd) * e, MD.hkv * hd, hd,
+         MD.hkv, hd, ml.k_norm},
+        {at(proj_, MD.hq * 2 * hd + MD.hkv * hd), MD.astride, hd, v_cache_mtp_.get() + (size_t)(pos_ * MD.hkv * hd) * e,
+         MD.hkv * hd, hd, MD.hkv, hd, nullptr}};
+    kernels::qk_norm_rope_jobs(nr, 2, T, D.eps, D.rot, pos_, m_.inv_freq(), act, stream_, m_.rope_scale());  // k, v into the MTP cache
+    kernels::qsa_block_keys(at(proj_, MD.idx_col + D.idx_h * D.idx_d), MD.astride, T, pos_,
+                            pos_ % kernels::kQsaBlock ? tail_mtp_[mtp_tail_cur_].get() : nullptr,
+                            tail_mtp_[1 - mtp_tail_cur_].get(), D.idx_d, ml.idx_k_norm, D.eps, m_.inv_freq(),
+                            D.rot, block_keys_mtp_.get(), cap_blocks_, act, stream_, m_.rope_scale());
+    mtp_tail_cur_ = 1 - mtp_tail_cur_;
+    STRIX_HIP_CHECK(hipMemcpyAsync(mtp_prev_.get(), at(x_, (T - 1) * n4), (size_t)n4 * e, hipMemcpyDeviceToDevice,
+                                   stream_),
+                    "MTP previous streams");
+}
+
+void Qwen4ExpSession::debug_mtp_feed(const std::vector<int32_t> &ids, const void *x_host, size_t bytes) {
+    STRIX_CHECK(mtp_, "Qwen4ExpSession::debug_mtp_feed: MTP is off");
+    STRIX_CHECK(!broken_ && !verify_pending_, "Qwen4ExpSession::debug_mtp_feed: broken or a verify pending");
+    const Qwen4ExpDims &D = m_.dims();
+    const size_t e = es(m_.act());
+    const int64_t T = (int64_t)ids.size(), n4 = D.H * D.d;
+    STRIX_CHECK(T >= 1 && T <= max_tokens_ && pos_ + T <= capacity_, "Qwen4ExpSession::debug_mtp_feed: ", T,
+                " tokens at ", pos_);
+    STRIX_CHECK(x_host && bytes == (size_t)(T * n4) * e, "Qwen4ExpSession::debug_mtp_feed: ", bytes, " bytes of streams, expected ",
+                (size_t)(T * n4) * e);
+    broken_ = true;
+    STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::debug_mtp_feed");
+    STRIX_HIP_CHECK(hipMemcpy(ids_.get(), ids.data(), (size_t)T * 4, hipMemcpyHostToDevice), "debug_mtp_feed: ids");
+    STRIX_HIP_CHECK(hipMemcpy(x_.get(), x_host, bytes, hipMemcpyHostToDevice), "debug_mtp_feed: streams");
+    kernels::reset_embedding_error(emb_err_.get(), stream_);
+    mtp_catchup(T);
+    read_back(0, " debug_mtp_feed");
+    pos_ += T;
+    mtp_chain_step_ = -1;
+    broken_ = false;
 }
 
 std::vector<float> Qwen4ExpSession::forward_verify(const std::vector<int32_t> &ids, int64_t n_logits,
@@ -1378,6 +1504,7 @@ std::vector<float> Qwen4ExpSession::forward_verify(const std::vector<int32_t> &i
     gdn_to_spare_ = true;
     try {
         std::vector<float> logits = forward(ids, n_logits, probe);
+        verify_caught_up_ = mtp_ && mtp_catchup_;
         gdn_to_spare_ = false;
         verify_pending_ = true;
         return logits;
@@ -1446,8 +1573,13 @@ void Qwen4ExpSession::keep_verify_prefix(int64_t rows) {
     }
     if (mtp_) {
         // The MTP layer's projections are the last thing the verify wrote to proj_; its streams are still in x_.
+        // (Invariant, ST-3 design 1.2: nothing writes proj_ between the verify's catch-up and this keep - drafts come
+        // after it; a verify run with set_mtp_catchup(false) left no projections here.)
+        STRIX_CHECK(verify_caught_up_, "Qwen4ExpSession::keep_verify_prefix: the verify ran without the MTP catch-up "
+                    "(set_mtp_catchup(false)), so there are no MTP projections to keep");
         const Qwen4ExpModel::Layer &ml = m_.mtp().layer;
-        kernels::qsa_block_keys(proj_.get() + (size_t)(D.idx_col + D.idx_h * D.idx_d) * e, D.astride, rows, p0,
+        const Qwen4ExpDims &MD = m_.mtp_dims();
+        kernels::qsa_block_keys(proj_.get() + (size_t)(MD.idx_col + D.idx_h * D.idx_d) * e, MD.astride, rows, p0,
                                 p0 % kernels::kQsaBlock ? tail_mtp_[verify_mtp_tail_cur_].get() : nullptr,
                                 tail_mtp_[1 - verify_mtp_tail_cur_].get(), D.idx_d, ml.idx_k_norm, D.eps, m_.inv_freq(),
                                 D.rot, block_keys_mtp_.get(), cap_blocks_, act, stream_, m_.rope_scale());
@@ -1472,8 +1604,10 @@ void Qwen4ExpSession::keep_verify_prefix(int64_t rows) {
 }
 
 void Qwen4ExpSession::set_mtp_vocab(int64_t n) {
-    STRIX_CHECK(n >= 1 && n <= m_.dims().vocab, "Qwen4ExpSession::set_mtp_vocab: ", n, ", expected 1..",
-                m_.dims().vocab);
+    // The draft scores the LM head's first n rows - under tensor parallelism rank 0's (Qwen4ExpModel::draft_rows).
+    const int64_t rows = std::min(m_.dims().vocab, m_.draft_rows());
+    STRIX_CHECK(n >= 1 && n <= rows, "Qwen4ExpSession::set_mtp_vocab: ", n, ", expected 1..", rows,
+                rows < m_.dims().vocab ? " (the LM head rows this rank holds)" : "");
     mtp_vocab_ = n;
 }
 
@@ -1548,7 +1682,7 @@ void Qwen4ExpSession::run_mtp(int32_t token_id, int64_t step) {
     STRIX_TRACE_RANGE("draft " + std::to_string(step));
     STRIX_CHECK(mtp_, "Qwen4ExpSession::forward_mtp: the session was made without MTP");
     STRIX_CHECK(!broken_, "Qwen4ExpSession::forward_mtp: an earlier call failed midway; reset() the session first");
-    const Qwen4ExpDims &D = m_.dims();
+    const Qwen4ExpDims &D = m_.dims(), &MD = m_.mtp_dims();  // MD: the whole head's widths (ST-3)
     STRIX_CHECK(token_id >= 0 && token_id < D.vocab, "Qwen4ExpSession::forward_mtp: token ", token_id,
                 " outside [0, ", D.vocab, ")");
     STRIX_CHECK(step >= 0, "Qwen4ExpSession::forward_mtp: step ", step, ", expected >= 0");
@@ -1601,25 +1735,25 @@ void Qwen4ExpSession::run_mtp(int32_t token_id, int64_t step) {
     // q, k, v and (past the dense limit) the indexer queries in one launch, as in the trunk's layers.
     const bool qsa_layer = p + T > D.dense_key_limit();
     const kernels::NormRopeJob nr[4] = {
-        {proj_.get(), D.astride, 2 * hd, proj_.get(), D.astride, 2 * hd, D.hq, hd, l.q_norm},
-        {at(proj_, D.hq * 2 * hd), D.astride, hd, kc + (size_t)(p * D.hkv * hd) * e, D.hkv * hd, hd, D.hkv, hd, l.k_norm},
-        {at(proj_, D.hq * 2 * hd + D.hkv * hd), D.astride, hd, vc + (size_t)(p * D.hkv * hd) * e, D.hkv * hd, hd, D.hkv,
+        {proj_.get(), MD.astride, 2 * hd, proj_.get(), MD.astride, 2 * hd, MD.hq, hd, l.q_norm},
+        {at(proj_, MD.hq * 2 * hd), MD.astride, hd, kc + (size_t)(p * MD.hkv * hd) * e, MD.hkv * hd, hd, MD.hkv, hd, l.k_norm},
+        {at(proj_, MD.hq * 2 * hd + MD.hkv * hd), MD.astride, hd, vc + (size_t)(p * MD.hkv * hd) * e, MD.hkv * hd, hd, MD.hkv,
          hd, nullptr},
-        {at(proj_, D.idx_col), D.astride, D.idx_d, at(proj_, D.idx_col), D.astride, D.idx_d, D.idx_h, D.idx_d,
+        {at(proj_, MD.idx_col), MD.astride, D.idx_d, at(proj_, MD.idx_col), MD.astride, D.idx_d, D.idx_h, D.idx_d,
          l.idx_q_norm}};
     kernels::qk_norm_rope_jobs(nr, qsa_layer ? 4 : 3, T, D.eps, D.rot, p, m_.inv_freq(), act, stream_, m_.rope_scale());
-    kernels::qsa_block_keys(at(proj_, D.idx_col + D.idx_h * D.idx_d), D.astride, T, p,
+    kernels::qsa_block_keys(at(proj_, MD.idx_col + D.idx_h * D.idx_d), MD.astride, T, p,
                             p % kernels::kQsaBlock ? tail_in : nullptr, tail_out, D.idx_d, l.idx_k_norm, D.eps, m_.inv_freq(),
                             D.rot, block_keys_mtp_.get(), cap_blocks_, act, stream_, m_.rope_scale());
-    const kernels::AttentionShape as{T, p, D.hq, D.hkv, hd, D.astride, 2 * hd};
+    const kernels::AttentionShape as{T, p, MD.hq, MD.hkv, hd, MD.astride, 2 * hd};
     const float scale = 1.0f / std::sqrt((float)hd);
     if (!qsa_layer) {
         kernels::attention(proj_.get(), at(proj_, hd), kc, vc, capacity_, as, scale, core_.get(), attn_ws_.get(),
                            attn_ws_bytes_, act, stream_);
     } else {
         const int64_t qsa_k = D.qsa_budget / kernels::kQsaBlock;
-        void *iq = at(proj_, D.idx_col);  // normed + roped by the qk_norm_rope_jobs above
-        kernels::qsa_scores(iq, D.astride, D.idx_d, T, p, D.idx_h, D.idx_d, block_keys_mtp_.get(), cap_blocks_,
+        void *iq = at(proj_, MD.idx_col);  // normed + roped by the qk_norm_rope_jobs above
+        kernels::qsa_scores(iq, MD.astride, D.idx_d, T, p, D.idx_h, D.idx_d, block_keys_mtp_.get(), cap_blocks_,
                             qsa_scores_.get(), cap_blocks_, act, stream_);
         kernels::qsa_topk(qsa_scores_.get(), cap_blocks_, T, p, qsa_k, qsa_sel_.get(), qsa_nsel_.get(),
                           qsa_topk_ws_.get(), qsa_topk_ws_bytes_, stream_);
@@ -1642,7 +1776,7 @@ void Qwen4ExpSession::run_mtp(int32_t token_id, int64_t step) {
                                        act, expert_err_.get(), stream_);
     if (sep) {
         kernels::linear_qw(u_.get(), l.shared_gate_up, gu_.get(), T, act, act, stream_);
-        kernels::swiglu(gu_.get(), hh_.get(), T, D.inter, act, stream_);
+        kernels::swiglu(gu_.get(), hh_.get(), T, MD.inter, act, stream_);
         kernels::linear_qw(hh_.get(), l.shared_down, sh_y_.get(), T, act, act, stream_);
         kernels::moe_shared_add_inject(y_.get(), sh_y_.get(), router_logits_.get() + D.experts, D.experts + 1, T, D.d,
                                        (uint32_t)D.experts, mtp_x_.get(), w_in_.get(), D.H, act, router_err_.get(),
@@ -1656,7 +1790,7 @@ void Qwen4ExpSession::run_mtp(int32_t token_id, int64_t step) {
     // else from the LM head as loaded.
     hc_mix(mtp.hc_mixer, false);
     const QWeightView &draft = m_.draft_head_q4();
-    QWeightView head = draft.bits != 0 && mtp_vocab_ <= draft.N() ? draft : m_.lm_head();
+    QWeightView head = draft.bits != 0 && mtp_vocab_ <= draft.N() ? draft : m_.draft_lm();
     STRIX_CHECK(head.K() == m_.lm_head().K() && mtp_vocab_ <= head.N(), "Qwen4ExpSession::forward_mtp: draft head [",
                 head.N(), ", ", head.K(), "] for mtp_vocab ", mtp_vocab_, " and the LM head's K ", m_.lm_head().K());
     switch (head.bits) {
