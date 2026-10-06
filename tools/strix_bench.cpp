@@ -128,6 +128,7 @@ int main(int argc, char **argv) {
         const int64_t ar_steps = a.num("ar-steps", 128), gen_n = a.num("gen", 256), chunk = a.num("chunk", 8192);
         const int64_t mtp_draft = a.num("mtp-draft", 5), mtp_vocab = a.num("mtp-vocab", 65536);
         const double margin = a.real("mtp-margin", 2.0);
+        const bool reject_forward = a.num("mtp-reject-forward", 0) != 0;  // pre-PF-1 path (A/B)
         const int64_t cache_rows = a.num("ngram-cache-rows", 8388608);
         const float yarn = (float)a.real("yarn", 2.0);
         const int tp_world = (int)a.num("tp-world", 1), tp_rank = (int)a.num("tp-rank", 0);
@@ -199,6 +200,7 @@ int main(int argc, char **argv) {
           << ",\"tp_rank\":" << tp_rank << ",\"weights_gib\":" << (double)model.weights().data_bytes() / (1ull << 30)
           << ",\"load_s\":" << load_s << ",\"capacity\":" << capacity << ",\"chunk\":" << chunk << ",\"yarn\":" << yarn
           << ",\"mtp\":" << (model.has_mtp() ? "true" : "false") << ",\"mtp_draft\":" << mtp_draft << ",\"mtp_margin\":" << margin
+          << ",\"mtp_reject_forward\":" << (reject_forward ? "true" : "false")
           << ",\"mtp_vocab\":" << mtp_vocab << ",\"ngram_cache_rows\":" << cache_rows
           << ",\"gpu_mem_free_gib_after_session\":" << (double)free_b / (1ull << 30) << ",\"depths\":{";
 
@@ -343,12 +345,16 @@ int main(int argc, char **argv) {
                     ++rollbacks;
                     ses.keep_verify_prefix(j + 1);
                     const int64_t v = i + j + 1;
-                    ses.prefetch_ple({gen[(size_t)v]}, 0);
-                    const double f0 = now_ms();
-                    greedy({gen[(size_t)v]});
-                    single_ms.push_back(now_ms() - f0);
-                    ++forwards;
-                    i = v + 1;
+                    if (reject_forward) {  // pre-PF-1: forward the rejected position's token alone
+                        ses.prefetch_ple({gen[(size_t)v]}, 0);
+                        const double f0 = now_ms();
+                        greedy({gen[(size_t)v]});
+                        single_ms.push_back(now_ms() - f0);
+                        ++forwards;
+                        i = v + 1;
+                    } else {
+                        i = v;  // PF-1: gen[v] is the next step's first token (known, not yet forwarded)
+                    }
                     step_ms.push_back(now_ms() - st0);
                 }
                 const double dec_ms = now_ms() - r0;
