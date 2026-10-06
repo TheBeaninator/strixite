@@ -241,12 +241,15 @@ __global__ void __launch_bounds__(kThreads)
 // On the matrix units: a tile (up to TR slots of one expert: the R-slot tiles or the RW-slot ones) x 128 expert rows
 // per block, 8 waves each a 16-column strip of up to TR / 16 16x16 WMMA tiles - only the ones holding slots run, so a
 // weight pass serves up to TR slots. K in steps of kWmmaKC over scaled codes (kernels/wmma_gemm.hpp numerics).
+// TAIL (K % kWmmaKC == 32 at G = 32, Q4 only - a TP-4 rank's expert down, K = 160): the last step's missing half
+// fetches as zeros (kernels/wmma_gemm.hpp wmma_kvalid); TAIL = false is the unchanged kernel.
 constexpr int kWmmaBN = 128;
-template <typename T, int G, bool COMBINE, int TR, int HB>
+template <typename T, int G, bool COMBINE, int TR, int HB, bool TAIL = false>
 __global__ void __launch_bounds__(kWmmaThreads)
     grouped_wmma_kernel(const T *x, const uint8_t *q, const uint16_t *scale, const uint16_t *minv, const int32_t *ws,
                         int64_t A, int64_t N, int64_t K, T *y, float *partial) {
     static_assert(TR == R || TR == RW, "the route kernel's tile sizes");
+    static_assert(!TAIL || (G == 32 && HB == 0), "a K tail: Q4 at group size 32");
     constexpr int TM = TR / 16, NSUB = kWmmaKC / wmma_sub<G>();
     __shared__ __attribute__((aligned(16))) uint16_t xs[TR * kWmmaLd], wsm[kWmmaBN * kWmmaLd];
     __shared__ float rs[TR * NSUB];
@@ -283,15 +286,26 @@ __global__ void __launch_bounds__(kWmmaThreads)
     WmmaXTile<T, TR, G> xt;
     WmmaWCodes<BITS, G, kWmmaBN> wt;
     const int64_t wrow = (int64_t)bucket * N + n0;
-    xt.fetch(x, xoff, rows, 0);
-    wt.fetch(q, scale, minv, wrow, rows_w, K, 0);
+    if constexpr (TAIL) {
+        xt.fetch(x, xoff, rows, 0, wmma_kvalid(K, 0));
+        wt.fetch(q, scale, minv, wrow, rows_w, K, 0, 0, wmma_kvalid(K, 0));
+    } else {
+        xt.fetch(x, xoff, rows, 0);
+        wt.fetch(q, scale, minv, wrow, rows_w, K, 0);
+    }
     for (int64_t k0 = 0; k0 < K; k0 += kWmmaKC) {
         xt.stage(xs, rs);
         wt.stage(wsm, sw, mw);
         __syncthreads();
         if (k0 + kWmmaKC < K) {
-            xt.fetch(x, xoff, rows, k0 + kWmmaKC);
-            wt.fetch(q, scale, minv, wrow, rows_w, K, k0 + kWmmaKC);
+            if constexpr (TAIL) {
+                const int kv = wmma_kvalid(K, k0 + kWmmaKC);
+                xt.fetch(x, xoff, rows, k0 + kWmmaKC, kv);
+                wt.fetch(q, scale, minv, wrow, rows_w, K, k0 + kWmmaKC, 0, kv);
+            } else {
+                xt.fetch(x, xoff, rows, k0 + kWmmaKC);
+                wt.fetch(q, scale, minv, wrow, rows_w, K, k0 + kWmmaKC);
+            }
         }
         wmma_step_scaled<TM, 1, G>(xs, wsm, rs, sw, mw, k0, 0, wave * 16, acc, tm);
         __syncthreads();
@@ -318,12 +332,14 @@ using f16x2 = wmma_f16x2;  // kernels/wmma_gemm.hpp's F16 helpers
 __device__ inline void q4_word_to_f16(uint32_t w, f16x2 s, f16x2 m, uint32_t *out) { wmma_q4_word_to_f16(w, s, m, out); }
 __device__ inline f16x2 bf16_bits_to_f16x2(uint16_t b) { return wmma_bf16_bits_to_f16x2(b); }
 
-template <typename T, int G, bool COMBINE, int TR>
+// TAIL: as grouped_wmma_kernel's (G = 32, K % kWmmaKC == 32); the last step also skips its empty half's WMMA work.
+template <typename T, int G, bool COMBINE, int TR, bool TAIL = false>
 __global__ void __launch_bounds__(kWmmaThreads)
     grouped_wmma_f16_kernel(const T *x, const uint8_t *q, const uint16_t *scale, const uint16_t *minv,
                             const int32_t *ws, int64_t A, int64_t N, int64_t K, T *y, float *partial, bool pbf16) {
     static_assert(TR == RW, "the route kernel's WMMA tile size");
     static_assert(G == 32 || G == 64 || G == 128, "group sizes: a 32-code half-step lies in one group");
+    static_assert(!TAIL || G == 32, "a K tail: group size 32");
     constexpr int TM = TR / 16;
     // LDS: x as F16 [TR][kWmmaLd]; the step's codes packed [kWmmaBN rows][2 x 16 bytes + 16 pad] (coalesced global
     // loads, then each wave reads its own rows); scale / min windows of kWin groups per row, refreshed every kWin groups.
@@ -367,7 +383,10 @@ __global__ void __launch_bounds__(kWmmaThreads)
     uint4 cq;
     uint16_t fs[kWinLoads], fm[kWinLoads];
     auto wfetch = [&](int64_t k0) {
-        cq = *reinterpret_cast<const uint4 *>(cptr + k0 / 2);
+        if constexpr (TAIL)  // the tail step's missing half: zero codes (its group's scale / min are zero too)
+            cq = k0 + chalf * 32 < K ? *reinterpret_cast<const uint4 *>(cptr + k0 / 2) : make_uint4(0, 0, 0, 0);
+        else
+            cq = *reinterpret_cast<const uint4 *>(cptr + k0 / 2);
         const int64_t g0 = k0 / G;
         if (k0 % G == 0 && g0 % kWin == 0)
 #pragma unroll
@@ -386,7 +405,8 @@ __global__ void __launch_bounds__(kWmmaThreads)
     auto k_loop = [&](auto tma_c) {
         constexpr int TMA = decltype(tma_c)::value;
         wmma_f32x8 acc[TMA] = {};
-        xt.fetch(x, xoff, rows, 0);
+        if constexpr (TAIL) xt.fetch(x, xoff, rows, 0, wmma_kvalid(K, 0));
+        else xt.fetch(x, xoff, rows, 0);
         wfetch(0);
         for (int64_t k0 = 0; k0 < K; k0 += kWmmaKC) {
             // stage: x as F16 (BF16 -> F16 exact in F16's normal range), the packed codes, a new scale window
@@ -411,7 +431,8 @@ __global__ void __launch_bounds__(kWmmaThreads)
                 }
             __syncthreads();
             if (k0 + kWmmaKC < K) {  // the next step's loads in flight during this one's math
-                xt.fetch(x, xoff, rows, k0 + kWmmaKC);
+                if constexpr (TAIL) xt.fetch(x, xoff, rows, k0 + kWmmaKC, wmma_kvalid(K, k0 + kWmmaKC));
+                else xt.fetch(x, xoff, rows, k0 + kWmmaKC);
                 wfetch(k0 + kWmmaKC);
             }
             const uint4 c0 = cs[wr * kCodeLd], c1 = cs[wr * kCodeLd + 1];
@@ -421,6 +442,8 @@ __global__ void __launch_bounds__(kWmmaThreads)
                         s1 = bf16_bits_to_f16x2(sw[wr * kWin + gb]), m1 = bf16_bits_to_f16x2(mw[wr * kWin + gb]);
 #pragma unroll
             for (int kk = 0; kk < kWmmaKC / 16; ++kk) {
+                if constexpr (TAIL)
+                    if (k0 + 16 * kk >= K) break;  // uniform: the tail step's empty half (zeros) needs no WMMA
                 uint32_t b[8];
                 const f16x2 s = kk < 2 ? s0 : s1, m = kk < 2 ? m0 : m1;
                 q4_word_to_f16(wv[2 * kk], s, m, b);
@@ -512,20 +535,28 @@ void launch_grouped(const T *x, const Q4DeviceView &w, int64_t E, const void *ws
     const auto *wsi = static_cast<const int32_t *>(ws);
     if (math == MoeMath::WmmaF16) {
         STRIX_CHECK(HB == 0, "moe grouped (WMMA F16): Q4 experts only (Q5 runs on MoeMath::WmmaBf16)");
-        STRIX_CHECK(w.K % kWmmaKC == 0, "moe grouped (WMMA F16): K = ", w.K, ", expected a multiple of ", kWmmaKC);
+        // K % kWmmaKC == 32 (G = 32: a TP-4 rank's K = 160) runs the TAIL instantiation
+        STRIX_CHECK(w.K % 32 == 0, "moe grouped (WMMA F16): K = ", w.K, ", expected a multiple of 32");
+        const bool tail = w.K % kWmmaKC != 0;
         STRIX_CHECK(device_warp_size(kWmmaThreads) == 32, "moe grouped (WMMA F16): needs wave32 (gfx11 WMMA)");
         const int64_t tiles = route_layout(M, A, E).WTmax;
         STRIX_CHECK(tiles <= 65535, "moe grouped (WMMA F16): ", tiles, " tile slots exceed the grid");
         dim3 grid((unsigned)((N + kWmmaBN - 1) / kWmmaBN), (unsigned)tiles), block(kWmmaThreads);
         switch (w.G) {
-            case 32: grouped_wmma_f16_kernel<T, 32, COMBINE, RW><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
+            case 32:
+                if (tail) grouped_wmma_f16_kernel<T, 32, COMBINE, RW, true><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE);
+                else grouped_wmma_f16_kernel<T, 32, COMBINE, RW><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE);
+                break;
             case 64: grouped_wmma_f16_kernel<T, 64, COMBINE, RW><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
             default: grouped_wmma_f16_kernel<T, 128, COMBINE, RW><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
         }
         return;
     }
     if (math == MoeMath::WmmaBf16) {
-        STRIX_CHECK(w.K % kWmmaKC == 0, "moe grouped (WMMA): K = ", w.K, ", expected a multiple of ", kWmmaKC);
+        // Q4 at K % kWmmaKC == 32 (G = 32) runs the TAIL instantiation; Q5 rows are K % 128 == 0 anyway
+        STRIX_CHECK(w.K % (HB == 0 ? 32 : kWmmaKC) == 0, "moe grouped (WMMA): K = ", w.K, ", expected a multiple of ",
+                    HB == 0 ? 32 : kWmmaKC);
+        const bool tail = w.K % kWmmaKC != 0;
         STRIX_CHECK(device_warp_size(kWmmaThreads) == 32, "moe grouped (WMMA): needs wave32 (gfx11 WMMA)");
         // Always the RW-slot tiles: on the real model (skewed routing: the shared expert takes every token, popular
         // experts many) they beat 16-slot tiles at both chunk sizes - prefill to 8192 786 vs 748 t/s (T = 512), 908 vs
@@ -535,7 +566,14 @@ void launch_grouped(const T *x, const Q4DeviceView &w, int64_t E, const void *ws
         STRIX_CHECK(tiles <= 65535, "moe grouped (WMMA): ", tiles, " tile slots exceed the grid");
         dim3 grid((unsigned)((N + kWmmaBN - 1) / kWmmaBN), (unsigned)tiles), block(kWmmaThreads);
         switch (w.G) {
-            case 32: grouped_wmma_kernel<T, 32, COMBINE, RW, HB><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial); break;
+            case 32:
+                if constexpr (HB == 0)
+                    if (tail) {
+                        grouped_wmma_kernel<T, 32, COMBINE, RW, HB, true><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial);
+                        break;
+                    }
+                grouped_wmma_kernel<T, 32, COMBINE, RW, HB><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial);
+                break;
             case 64: grouped_wmma_kernel<T, 64, COMBINE, RW, HB><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial); break;
             default: grouped_wmma_kernel<T, 128, COMBINE, RW, HB><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial); break;
         }

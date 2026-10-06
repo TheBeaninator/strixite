@@ -201,6 +201,11 @@ target_link_libraries(strix_kernels PUBLIC strix_rocm strix_formats)
 add_library(strix_model STATIC runtime/qwen3_5.cpp runtime/qwen4exp.cpp runtime/strixw_loader.cpp
     runtime/ngram_rows.cpp runtime/ngram_table.cpp runtime/tp_mirror.cpp)
 target_link_libraries(strix_model PUBLIC strix_kernels strix_formats strix_runtime)
+
+# PF-6: the WMMA kernels at a K tail (K % 64 == 32: a TP-4 rank's expert down, K = 160) against the FP32 kernels.
+add_executable(test_wmma_ktail)
+strix_hip_sources(test_wmma_ktail tools/test_wmma_ktail.cpp)
+target_link_libraries(test_wmma_ktail PRIVATE strix_kernels strix_formats)
 # ROCTX ranges (common/trace.hpp) for profiler timelines - off in every shipping build.
 option(STRIX_ROCTX "Compile in ROCTX ranges (forward / layer / sublayer) for rocprofv3 --marker-trace" OFF)
 if(STRIX_ROCTX)

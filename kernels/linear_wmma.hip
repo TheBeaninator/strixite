@@ -66,7 +66,9 @@ __global__ void __launch_bounds__(kWmmaThreads)
 // once while staged (code * scale + min -> F16 in LDS; the two waves sharing a weight fragment read it decoded) and x
 // is staged as F16, so the K loop is plain matrix work accumulating the whole K extent - no row sums, no per-group
 // accumulator rescale. A step that opens a scale window stages it first and synchronizes before the decode.
-template <typename TX, typename TY, int BITS, int G, int BMT>
+// TAIL (K % kWmmaKC == 32, G = 32: a TP-4 rank's shared expert down, K = 160): the last step's second half fetches as
+// zeros (kernels/wmma_gemm.hpp wmma_kvalid) - the TAIL = false instantiation is the unchanged kernel.
+template <typename TX, typename TY, int BITS, int G, int BMT, bool TAIL = false>
 __global__ void __launch_bounds__(kWmmaThreads)
     linear_wmma_f16_kernel(const TX *x, const uint8_t *q, const uint16_t *scale, const uint16_t *minv, TY *y, int64_t M,
                            int64_t N, int64_t K) {
@@ -84,8 +86,13 @@ __global__ void __launch_bounds__(kWmmaThreads)
     __syncthreads();
     WmmaXTile<TX, BMT, G, false> xt;
     WT wt;
-    xt.fetch(x, xoff, rows_x, 0);
-    wt.fetch(q, scale, minv, n0, rows_w, K, 0);
+    if constexpr (TAIL) {
+        xt.fetch(x, xoff, rows_x, 0, wmma_kvalid(K, 0));
+        wt.fetch(q, scale, minv, n0, rows_w, K, 0, 0, wmma_kvalid(K, 0));
+    } else {
+        xt.fetch(x, xoff, rows_x, 0);
+        wt.fetch(q, scale, minv, n0, rows_w, K, 0);
+    }
     for (int64_t k0 = 0; k0 < K; k0 += kWmmaKC) {
         if (wt.win) {  // uniform: depends on k0 only
             wt.stage_window(sw, mw);
@@ -95,8 +102,14 @@ __global__ void __launch_bounds__(kWmmaThreads)
         wt.stage_f16(ws, sw, mw, k0);
         __syncthreads();
         if (k0 + kWmmaKC < K) {
-            xt.fetch(x, xoff, rows_x, k0 + kWmmaKC);
-            wt.fetch(q, scale, minv, n0, rows_w, K, k0 + kWmmaKC);
+            if constexpr (TAIL) {
+                const int kv = wmma_kvalid(K, k0 + kWmmaKC);
+                xt.fetch(x, xoff, rows_x, k0 + kWmmaKC, kv);
+                wt.fetch(q, scale, minv, n0, rows_w, K, k0 + kWmmaKC, 0, kv);
+            } else {
+                xt.fetch(x, xoff, rows_x, k0 + kWmmaKC);
+                wt.fetch(q, scale, minv, n0, rows_w, K, k0 + kWmmaKC);
+            }
         }
         wmma_step_f16<TM, 2>(xs, ws, wm * (BMT / 2), wn * 32, acc);
         __syncthreads();
@@ -180,7 +193,12 @@ void launch(const TX *x, const View &w, TY *y, int64_t M, hipStream_t stream) {
         // Q4 / Q8 on F16; Q5 / Q6 on BF16 scaled codes until their staging moves over.
         if constexpr (BITS == 4 || BITS == 8) {
             switch (w.G) {
-                case 32: linear_wmma_f16_kernel<TX, TY, BITS, 32, BMT><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, y, M, w.N, w.K); break;
+                case 32:
+                    if (w.K % kWmmaKC != 0)  // the K tail (only G = 32 has one: K % G == 0)
+                        linear_wmma_f16_kernel<TX, TY, BITS, 32, BMT, true><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, y, M, w.N, w.K);
+                    else
+                        linear_wmma_f16_kernel<TX, TY, BITS, 32, BMT><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, y, M, w.N, w.K);
+                    break;
                 case 64: linear_wmma_f16_kernel<TX, TY, BITS, 64, BMT><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, y, M, w.N, w.K); break;
                 default: linear_wmma_f16_kernel<TX, TY, BITS, 128, BMT><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, y, M, w.N, w.K); break;
             }
@@ -204,8 +222,10 @@ void linear_wmma(const char *fn, const void *x, const View &w, void *y, int64_t 
     STRIX_CHECK(w.G == 32 || w.G == 64 || w.G == 128, fn, ": group size ", w.G, " unsupported (32, 64 or 128)");
     STRIX_CHECK(M >= 1 && M <= kMaxM, fn, ": M (rows of x) = ", M, ", expected 1..", kMaxM);
     STRIX_CHECK(w.N >= 1 && w.N <= 0x7fffffff, fn, ": N = ", w.N, ", expected 1..2^31-1");
-    STRIX_CHECK(w.K >= kWmmaKC && w.K % kWmmaKC == 0 && w.K % w.G == 0 && w.K <= (1 << 24), fn, ": K = ", w.K,
-                ", expected a multiple of ", kWmmaKC, " (the K step) and of the group size ", w.G, ", <= 2^24");
+    // Q4 / Q8 (the F16 kernel) also take a K tail of 32 (K % 32 == 0: a TP-4 rank's K = 160 at G = 32).
+    const int64_t kstep = BITS == 4 || BITS == 8 ? 32 : kWmmaKC;
+    STRIX_CHECK(w.K >= kstep && w.K % kstep == 0 && w.K % w.G == 0 && w.K <= (1 << 24), fn, ": K = ", w.K,
+                ", expected a multiple of ", kstep, " (the K step) and of the group size ", w.G, ", <= 2^24");
     STRIX_CHECK(reinterpret_cast<uintptr_t>(w.q) % 16 == 0 && reinterpret_cast<uintptr_t>(x) % 16 == 0, fn,
                 ": code array ", (const void *)w.q, " and x ", x, " must be 16-byte aligned");
     STRIX_CHECK(act == Act::F32 || act == Act::BF16, fn, ": unsupported activation dtype ", (int)act);
