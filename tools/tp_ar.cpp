@@ -41,6 +41,8 @@
 #include "runtime/qwen4exp.hpp"
 #include "runtime/tp_comm.hpp"
 #include "runtime/tp_mirror.hpp"
+#include "serve/qwen4exp_backend.hpp"
+#include "serve/replay.hpp"
 #include "serve/tokenizer.hpp"
 
 #include <algorithm>
@@ -282,7 +284,14 @@ int main(int argc, char **argv) {
         STRIX_CHECK(!ses_mtp || model.has_mtp(), "tp_ar: --mtp 1 but the weights have no MTP head");
         const int64_t cap = shadow ? ((a.num("shadow-prefix", 4096) + a.num("shadow-tokens", 2048) + 1024) / 4096 + 1) * 4096
                                    : capacity + (use_mtp ? ((gen_n + 4095) / 4096) * 4096 : 0);
-        Qwen4ExpSession ses(model, cap, chunk, PrefillMath::WmmaBf16, ses_mtp);
+        // --replay 1 (rank 0): the session is a Qwen4ExpBackend's, driven through TpDriver (set_tp_driver) by
+        // serve/replay's teacher-forced engine loop at the end - the backend-over-TP path.
+        const bool replay = a.num("replay", 0) != 0 && rank == 0 && !shadow;
+        std::unique_ptr<Qwen4ExpBackend> be;
+        std::unique_ptr<Qwen4ExpSession> own;
+        if (replay) be = std::make_unique<Qwen4ExpBackend>(model, cap, chunk, ses_mtp, ses_mtp ? mtp_vocab : 0);
+        else own = std::make_unique<Qwen4ExpSession>(model, cap, chunk, PrefillMath::WmmaBf16, ses_mtp);
+        Qwen4ExpSession &ses = be ? be->session() : *own;
         if (ses_mtp) ses.set_mtp_vocab(mtp_vocab);
         const bool f32_mixer = a.num("tp-f32-mixer", 0) != 0;  // experiment: FP32 mixer partials (ST-2 KL study)
         if (f32_mixer && world > 1) ses.set_tp_f32_mixer(true);
@@ -494,6 +503,9 @@ int main(int argc, char **argv) {
         }
 
         TpDriver drv(ses, comm.get());
+        if (be) be->set_tp_driver(&drv);
+        std::vector<int32_t> last_gen, last_ctx;  // the last depth's continuation and context (for --replay)
+        MtpRun last_mtp;
         std::ostringstream J;
         J << "{\"tool\":\"tp_ar\",\"weights\":\"" << weights << "\",\"ngram\":\"" << ngram << "\",\"tp_world\":" << world
           << ",\"weights_gib\":" << (double)model.weights().data_bytes() / (1ull << 30)
@@ -712,6 +724,8 @@ int main(int argc, char **argv) {
                         gen.push_back(drv.candidates().cand[0].id);
                     }
                     J << ",\"ar_gen_ms\":" << js(stats(gm)) << ",\"ar_gen_tps\":" << 1000.0 / stats(gm).mean;
+                    last_gen = gen;
+                    last_ctx.assign(corpus.begin(), corpus.begin() + D);
                     // the MTP loop: first checked (hashes + state hashes on every rank), then timed
                     if (hash && world > 1) {
                         drv.restore(snap);
@@ -744,6 +758,7 @@ int main(int argc, char **argv) {
                     const MtpRun r = mtp_loop(drv, gen, nv, mtp_draft, margin, reject_forward);
                     const double ept = (double)(exch() - m0) / (double)gen_n;
                     J << ",\"mtp\":" << mtp_json(r, gen_n, ept);
+                    last_mtp = r;
                     std::fprintf(stderr, "tp_ar: depth %lld: MTP %.2f t/s (%lld steps, %lld forwards, %lld drafted, %lld accepted, %lld rollbacks; %.1f exchanges/token)\n",
                                  (long long)D, (double)gen_n / r.decode_ms * 1000, (long long)r.steps, (long long)r.forwards,
                                  (long long)r.drafted, (long long)r.accepted, (long long)r.rollbacks, ept);
@@ -775,6 +790,36 @@ int main(int argc, char **argv) {
                       << esc(vh_total.first_mismatch) << "\",\"first_state_mismatch\":\"" << esc(vh_total.first_state_mismatch)
                       << "\",\"x_hash_equal_verify\":" << (vh_total.mismatched == 0 && vh_total.x_compared > 0 ? "true" : "false") << "}";
             }
+        }
+        if (be && !last_gen.empty()) {
+            // serve/replay over the backend over TpDriver: the same context + continuation as the last depth's MTP
+            // loop, greedy sampled from GPU candidates, with every forward / verify and keep / drop hash-checked.
+            CaptureRecord rec;
+            rec.id = 1, rec.prompt_n = (int64_t)last_ctx.size();
+            rec.tokens = last_ctx;
+            rec.tokens.insert(rec.tokens.end(), last_gen.begin(), last_gen.end());
+            ReplayOptions opt;
+            opt.max_context = rec.prompt_n, opt.max_gen = (int64_t)last_gen.size(), opt.mtp_draft = mtp_draft;
+            opt.mtp_margin = (float)margin;  // the replay takes the carry path (upstream dropped its reject-forward switch)
+            opt.sample = ReplayOptions::Sample::Candidates, opt.sampling.temperature = 0, opt.n_valid = nv;
+            drv.clear_hash_stats();
+            drv.set_hash_check(hash && world > 1);
+            drv.set_state_check(hash && world > 1);
+            const ReplayResult rr = replay_teacher_forced(*be, rec, opt);
+            drv.set_hash_check(false);
+            drv.set_state_check(false);
+            const TpDriver::HashStats rh = drv.hash_stats();
+            const bool same = rr.drafted == last_mtp.drafted && rr.accepted == last_mtp.accepted &&
+                              rr.rollbacks == last_mtp.rollbacks && rr.forwards == last_mtp.forwards;
+            J << ",\"replay\":{\"path\":\"serve/replay over Qwen4ExpBackend over TpDriver (greedy from GPU candidates)\""
+              << ",\"context\":" << rr.context_n << ",\"gen\":" << rr.gen_n << ",\"forwards\":" << rr.forwards
+              << ",\"drafted\":" << rr.drafted << ",\"accepted\":" << rr.accepted << ",\"rollbacks\":" << rr.rollbacks
+              << ",\"sampled\":" << rr.sampled << ",\"decode_ms\":" << rr.decode_ms << ",\"hash_forwards\":" << rh.forwards
+              << ",\"hash_mismatched\":" << rh.mismatched << ",\"state_checks\":" << rh.state_checks
+              << ",\"state_mismatched\":" << rh.state_mismatched << ",\"same_steps_as_mtp_loop\":" << (same ? "true" : "false") << "}";
+            std::fprintf(stderr, "tp_ar: replay over the TP backend: %lld forwards, %lld drafted, %lld accepted, %lld rollbacks; %lld hash mismatches, %lld state mismatches; same as the MTP loop: %s\n",
+                         (long long)rr.forwards, (long long)rr.drafted, (long long)rr.accepted, (long long)rr.rollbacks,
+                         (long long)rh.mismatched, (long long)rh.state_mismatched, same ? "yes" : "no");
         }
         const Qwen4ExpSession::PleStats ps = ses.ple_stats();
         J << ",\"mtp_on\":" << (use_mtp && drv.has_mtp() ? "true" : "false") << ",\"mtp_draft\":" << mtp_draft

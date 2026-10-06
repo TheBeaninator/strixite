@@ -3,6 +3,7 @@
 #include "common/check.hpp"
 #include "formats/strixw.hpp"
 #include "runtime/ngram_table.hpp"
+#include "runtime/tp_mirror.hpp"
 
 #include <cstdio>
 
@@ -28,6 +29,70 @@ const Qwen4ExpSnapshot &Qwen4ExpBackend::snap(int slot) const {
     return snapshots_[slot];
 }
 
+void Qwen4ExpBackend::set_tp_driver(TpDriver *drv) {
+    STRIX_CHECK(!drv || &drv->session() == &session_, "Qwen4ExpBackend::set_tp_driver: the driver drives another session");
+    tp_ = drv;
+    if (tp_)
+        for (int &id : tp_slot_) id = tp_->make_snapshot();
+}
+
+void Qwen4ExpBackend::reset() {
+    if (tp_) tp_->reset();
+    else session_.reset();
+}
+
+void Qwen4ExpBackend::set_lookahead(const std::vector<int32_t> &next_ids) {
+    if (tp_) tp_->set_lookahead(next_ids);
+    else session_.set_lookahead(next_ids);
+}
+
+std::vector<float> Qwen4ExpBackend::forward(const std::vector<int32_t> &ids, int64_t n_logits) {
+    return tp_ ? tp_->forward(ids, n_logits, n_logits > 0) : session_.forward(ids, n_logits);
+}
+
+std::vector<float> Qwen4ExpBackend::forward_verify(const std::vector<int32_t> &ids, int64_t n_logits) {
+    return tp_ ? tp_->forward_verify(ids, n_logits, n_logits > 0) : session_.forward_verify(ids, n_logits);
+}
+
+void Qwen4ExpBackend::keep_verify() {
+    if (tp_) tp_->keep_verify();
+    else session_.keep_verify();
+}
+
+void Qwen4ExpBackend::drop_verify() {
+    if (tp_) tp_->drop_verify();
+    else session_.drop_verify();
+}
+
+void Qwen4ExpBackend::prefetch_ple(const std::vector<int32_t> &ids, int64_t first) {
+    if (tp_) tp_->prefetch_ple(ids, first);
+    else session_.prefetch_ple(ids, first);
+}
+
+void Qwen4ExpBackend::keep_verify_prefix(const std::vector<int32_t> &ids, int64_t rows) {
+    (void)ids;  // the session saved its own
+    if (tp_) tp_->keep_verify_prefix(rows);
+    else session_.keep_verify_prefix(rows);
+}
+
+void Qwen4ExpBackend::save_snapshot(int slot) {
+    if (tp_) tp_->save(tp_id(slot));
+    else session_.save(snap(slot));
+}
+
+int64_t Qwen4ExpBackend::snapshot_pos(int slot) const {
+    return tp_ ? tp_->snapshot(tp_id(slot)).pos() : snap(slot).pos();
+}
+
+bool Qwen4ExpBackend::can_restore_snapshot(int slot) const {
+    return tp_ ? tp_->can_restore(tp_id(slot)) : session_.can_restore(snap(slot));
+}
+
+void Qwen4ExpBackend::restore_snapshot(int slot) {
+    if (tp_) tp_->restore(tp_id(slot));
+    else session_.restore(snap(slot));
+}
+
 BackendStats Qwen4ExpBackend::backend_stats() const {
     BackendStats s;
     const Qwen4ExpSession::PleStats p = session_.ple_stats();
@@ -45,6 +110,7 @@ BackendStats Qwen4ExpBackend::backend_stats() const {
 }
 
 void Qwen4ExpBackend::export_snapshot(int slot, HostBuffer &out, int64_t from) {
+    STRIX_CHECK(!tp_, "Qwen4ExpBackend::export_snapshot: not under tensor parallelism yet (each rank holds its own state; ST-4)");
     const Qwen4ExpSnapshot &s = snap(slot);
     STRIX_CHECK(s.pos() >= 1, "Qwen4ExpBackend::export_snapshot: slot ", slot, " was never saved");
     out.resize(session_.state_bytes(s.pos(), from));
@@ -52,6 +118,7 @@ void Qwen4ExpBackend::export_snapshot(int slot, HostBuffer &out, int64_t from) {
 }
 
 void Qwen4ExpBackend::import_state(const HostBuffer &state, int64_t n, int64_t from) {
+    STRIX_CHECK(!tp_, "Qwen4ExpBackend::import_state: not under tensor parallelism yet (each rank holds its own state; ST-4)");
     session_.import_state(state.data(), state.size(), n, from);
 }
 
@@ -87,11 +154,20 @@ std::string Qwen4ExpBackend::describe() const {
 LogitRows Qwen4ExpBackend::rows_of(const std::vector<int32_t> &ids, int64_t n_logits, bool cands, int64_t n_valid,
                                    const LogitMasks *masks, bool verify) {
     if (masks != nullptr) masks->check(n_logits, logits_row(), "Qwen4ExpBackend::forward_rows");
+    // Tensor parallelism: each rank holds a share of the logits rows - the sampler takes candidates, unmasked.
+    STRIX_CHECK(!tp_ || masks == nullptr, "Qwen4ExpBackend: structured output under tensor parallelism is not supported");
     if (!cands || n_logits == 0) {
-        LogitRows l = LogitRows::from_full(verify ? session_.forward_verify(ids, n_logits) : session_.forward(ids, n_logits),
-                                           logits_row());
+        STRIX_CHECK(!tp_ || n_logits == 0, "Qwen4ExpBackend: under tensor parallelism the sampler must take candidates "
+                    "(greedy or top_k <= ", kernels::kLogitCands, "): each rank holds a share of the logits rows");
+        LogitRows l = LogitRows::from_full(verify ? forward_verify(ids, n_logits) : forward(ids, n_logits), logits_row());
         if (masks != nullptr) apply_masks(l, *masks);
         return l;
+    }
+    if (tp_) {
+        tp_->want_candidates(n_valid);
+        if (verify) tp_->forward_verify(ids, n_logits);
+        else tp_->forward(ids, n_logits);
+        return candidate_rows(n_logits);
     }
     if (masks != nullptr) session_.want_candidates(n_valid, masks->bits.data(), masks->rows, masks->words);
     else session_.want_candidates(n_valid);
