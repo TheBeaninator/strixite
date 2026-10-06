@@ -269,6 +269,9 @@ public:
     // vs 118.4, 40 203.1 vs 109.8 - so 6. A 4-draft MTP verify (5 tokens) stays per-slot. Tool-call turns (12-32 new
     // tokens, OCtest run 4) were paying 40-70 ms each for the old threshold.
     static constexpr int64_t kGroupedMinTokens = 6;
+    // PF-Q1: the grouped MoE path from this many tokens (>= kGroupedMinTokens, whose scratch is what gets allocated);
+    // raising it keeps short MTP verifies on the per-slot kernels.
+    void set_grouped_min_tokens(int64_t n);
     // With PrefillMath::WmmaBf16, forwards of at least this many tokens run the dense Q4 / Q8 linears and the HC
     // mixes on the matrix units (a 64-row tile). Swept on U - gdn_in (git f53fb14, prefill t/s FP32 vs WMMA): T = 16 124 vs 107,
     // 24 131 vs 129, 32 136 vs 144, 48 145 vs 226 - break-even ~24-26, so 32. Re-swept with the experts grouped
@@ -424,6 +427,7 @@ private:
     bool tp_f32_mixer_ = false;
     DeviceBuffer<float> y32_;  // set_tp_f32_mixer / _moe: the FP32 partials [max_tokens, d]
     bool tp_f32_moe_ = false;
+    int64_t grouped_min_tokens_ = kGroupedMinTokens;
     int64_t tp_f32_max_tokens_ = INT64_MAX;
     DeviceBuffer<float> sh_y32_;  // set_tp_f32_moe: the shared expert's FP32 output [max_tokens, d]
     int mtp_tail_cur_ = 0;

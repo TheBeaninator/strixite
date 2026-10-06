@@ -1032,6 +1032,12 @@ void Qwen4ExpSession::set_tp_f32_moe(bool on) {
     tp_f32_moe_ = on;
 }
 
+void Qwen4ExpSession::set_grouped_min_tokens(int64_t n) {
+    STRIX_CHECK(n >= kGroupedMinTokens, "Qwen4ExpSession::set_grouped_min_tokens: ", n, ", expected >= ",
+                kGroupedMinTokens);
+    grouped_min_tokens_ = n;
+}
+
 void Qwen4ExpSession::want_candidates(int64_t n_valid) {
     const Qwen4ExpDims &D = m_.dims();
     STRIX_CHECK(n_valid >= 1 && n_valid <= D.vocab, "Qwen4ExpSession::want_candidates: n_valid = ", n_valid,
@@ -1321,7 +1327,7 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
         show(L + "router_ids", route_ids_.get(), A, ProbeType::I32);
         show(L + "router_coef", route_coef_.get(), A, ProbeType::F32);
         const int64_t Estack = D.experts + (sep ? 0 : 1);
-        if (T >= kGroupedMinTokens) {
+        if (T >= grouped_min_tokens_) {
             // Q4 experts on the matrix units take F16; Q5 stays on BF16 scaled codes
             // until its kernel moves over.
             // The WMMA expert kernels step K by kWmmaKC (64); Q4 experts also take a K tail of 32 (PF-6: a TP-4 rank's
