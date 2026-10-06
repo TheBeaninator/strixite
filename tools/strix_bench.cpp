@@ -11,12 +11,14 @@
 //             "capture" the MTP replay decodes (whole model only)
 //   verify_k  forward_verify(k) + drop for k = 2..6 (catch-up off and on), drafts: forward_mtp_top2 per chained step
 //   mtp       the engine's draft / verify / keep loop over ar_gen's tokens: tokens/s, accepted per step
+// --hash-run 1: instead, one fixed call sequence with every result hashed (two builds compared bit for bit; ST-3).
 // Golden + noise floor (whole model): teacher-forced logits over WikiText-2 test after a prefill in chunks of 8192 vs
 // 4096 (only the arithmetic order differs) -> mean KL, top-1 agreement, NLL; rows saved for later gates.
 // Needles (whole model): 8 passcodes spliced into the context between 4k and 64k, asked for at each depth >= 64k.
 
 #include "common/check.hpp"
 #include "common/hip_check.hpp"
+#include "formats/strixw.hpp"  // strix_hash64
 #include "kernels/linear_q8.hpp"
 #include "runtime/qwen4exp.hpp"
 #include "serve/tokenizer.hpp"
@@ -194,6 +196,107 @@ int main(int argc, char **argv) {
             ses.forward(ids, 1);
             return ses.candidates().cand[0].id;
         };
+
+        // --hash-run 1 (ST-3 step 1's "world 1 bit-identical" check): one fixed sequence of calls, every result hashed -
+        // the prefill's logits, --gen greedy T = 1 forwards (whole rows), then the MTP loop over that continuation twice
+        // (PF-1, then --mtp-reject-forward's path) with whole rows on every verify / single forward and every draft's
+        // top-2, and the whole exported state at the end (trunk + MTP K / V, block keys, tails, streams). Two builds that
+        // print the same hashes ran bit-identical arithmetic on these paths.
+        if (a.num("hash-run", 0) != 0) {
+            const int64_t D = a.num("hash-depth", 4096);
+            STRIX_CHECK(D + gen_n + 64 < capacity, "strix_bench --hash-run: depth ", D, " + ", gen_n, " past the capacity");
+            const int64_t nv = (int64_t)tok.size();
+            uint64_t hl = 0x9e3779b97f4a7c15ull, hd = hl, n_rows = 0, n_drafts = 0;
+            auto mix = [](uint64_t &h, const void *p, size_t n) {
+                const uint64_t x = strix_hash64(p, n);
+                h = (h ^ x) * 0x100000001b3ull + (x >> 29);
+            };
+            auto rows = [&](const std::vector<float> &l) {
+                mix(hl, l.data(), l.size() * 4);
+                n_rows += (int64_t)(l.size() / (size_t)Dm.vocab);
+            };
+            auto best = [&](const float *l) { return (int32_t)argmax(l, nv); };
+            ses.reset();
+            for (int64_t p = 0; p < D;) {
+                const int64_t end = std::min(D, p + chunk);
+                if (end < D) ses.set_lookahead(std::vector<int32_t>(corpus.begin() + end, corpus.begin() + std::min(D, end + chunk)));
+                const std::vector<float> l = ses.forward(std::vector<int32_t>(corpus.begin() + p, corpus.begin() + end), end == D ? 1 : 0);
+                if (end == D) rows(l);
+                p = end;
+            }
+            Qwen4ExpSnapshot hs = ses.make_snapshot();
+            ses.save(hs);
+            std::vector<int32_t> gen{corpus[(size_t)D]};
+            for (int64_t i = 1; i < gen_n; ++i) {
+                const std::vector<float> l = ses.forward({gen.back()}, 1);
+                rows(l);
+                gen.push_back(best(l.data()));
+            }
+            mix(hl, gen.data(), gen.size() * 4);
+            int64_t verifies = 0, rollbacks_h = 0;
+            for (int pass = 0; pass < 2 && model.has_mtp(); ++pass) {
+                ses.restore(hs);
+                for (int64_t i = 0; i < gen_n;) {
+                    std::vector<int32_t> ids{gen[(size_t)i]};
+                    const int64_t nsteps = std::min(mtp_draft, gen_n - 1 - i);
+                    for (int64_t s = 0; s < nsteps; ++s) {
+                        const Qwen4ExpSession::MtpTop2 t = ses.forward_mtp_top2(ids.back(), s);
+                        uint32_t bv, sv;
+                        std::memcpy(&bv, &t.best_v, 4), std::memcpy(&sv, &t.second_v, 4);
+                        const uint32_t ww[4] = {(uint32_t)t.best, bv, sv, t.nan ? 1u : 0u};
+                        mix(hd, ww, sizeof ww);
+                        ++n_drafts;
+                        if (t.best_v - t.second_v < margin) break;
+                        ids.push_back(t.best);
+                    }
+                    const int64_t k = (int64_t)ids.size() - 1;
+                    if (k == 0) {
+                        rows(ses.forward(ids, 1));
+                        i += 1;
+                        continue;
+                    }
+                    rows(ses.forward_verify(ids, k + 1));
+                    ++verifies;
+                    int64_t j = 0;
+                    while (j < k && ids[(size_t)j + 1] == gen[(size_t)(i + 1 + j)]) ++j;
+                    if (j == k) {
+                        ses.keep_verify();
+                        i += k + 1;
+                        continue;
+                    }
+                    ++rollbacks_h;
+                    ses.keep_verify_prefix(j + 1);
+                    const int64_t v = i + j + 1;
+                    if (pass == 1) {
+                        rows(ses.forward({gen[(size_t)v]}, 1));
+                        i = v + 1;
+                    } else {
+                        i = v;
+                    }
+                }
+            }
+            Qwen4ExpSnapshot end = ses.make_snapshot();
+            ses.save(end);
+            std::vector<uint8_t> st(ses.state_bytes(end.pos()));
+            ses.export_state(end, st.data(), st.size());
+            uint64_t hst = strix_hash64(st.data(), st.size());
+            auto hex = [](uint64_t h) {
+                char b[24];
+                std::snprintf(b, sizeof b, "%016llx", (unsigned long long)h);
+                return std::string(b);
+            };
+            std::ofstream o(out);
+            o << "{\"tool\":\"strix_bench\",\"mode\":\"hash-run\",\"weights\":\"" << weights << "\",\"tp_world\":" << tp_world
+              << ",\"mtp\":" << (model.has_mtp() ? "true" : "false") << ",\"depth\":" << D << ",\"gen\":" << gen_n
+              << ",\"mtp_draft\":" << mtp_draft << ",\"mtp_margin\":" << margin << ",\"mtp_vocab\":" << mtp_vocab
+              << ",\"logits_rows\":" << n_rows << ",\"drafts\":" << n_drafts << ",\"verifies\":" << verifies
+              << ",\"rollbacks\":" << rollbacks_h << ",\"state_pos\":" << end.pos() << ",\"state_bytes\":" << st.size()
+              << ",\"logits_hash\":\"" << hex(hl) << "\",\"draft_hash\":\"" << hex(hd) << "\",\"state_hash\":\"" << hex(hst)
+              << "\"}\n";
+            std::fprintf(stderr, "strix_bench: hash-run: %lld rows, %lld drafts, logits %s drafts %s state %s\n",
+                         (long long)n_rows, (long long)n_drafts, hex(hl).c_str(), hex(hd).c_str(), hex(hst).c_str());
+            return 0;
+        }
 
         std::ostringstream J;
         J << "{\"tool\":\"strix_bench\",\"weights\":\"" << weights << "\",\"ngram\":\"" << ngram << "\",\"tp_world\":" << tp_world
