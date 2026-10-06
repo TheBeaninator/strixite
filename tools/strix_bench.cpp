@@ -280,7 +280,9 @@ int main(int argc, char **argv) {
         if (a.num("hash-run", 0) != 0) {
             const int64_t D = a.num("hash-depth", 4096);
             STRIX_CHECK(D + gen_n + 64 < capacity, "strix_bench --hash-run: depth ", D, " + ", gen_n, " past the capacity");
-            const int64_t nv = (int64_t)tok.size();
+            // A rank of N (stubbed) returns its vocabulary share's rows, lm_rows wide (world 1: the whole vocabulary):
+            // rows and greedy picks over that share only, never past the row.
+            const int64_t nv = std::min<int64_t>((int64_t)tok.size(), Dm.lm_rows);
             uint64_t hl = 0x9e3779b97f4a7c15ull, hd = hl, n_rows = 0, n_drafts = 0;
             auto mix = [](uint64_t &h, const void *p, size_t n) {
                 const uint64_t x = strix_hash64(p, n);
@@ -288,7 +290,7 @@ int main(int argc, char **argv) {
             };
             auto rows = [&](const std::vector<float> &l) {
                 mix(hl, l.data(), l.size() * 4);
-                n_rows += (int64_t)(l.size() / (size_t)Dm.vocab);
+                n_rows += (int64_t)(l.size() / (size_t)Dm.lm_rows);
             };
             auto best = [&](const float *l) { return (int32_t)argmax(l, nv); };
             ses.reset();
