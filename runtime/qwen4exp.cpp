@@ -1250,7 +1250,8 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
     return logits;
 }
 
-std::vector<float> Qwen4ExpSession::forward_verify(const std::vector<int32_t> &ids, int64_t n_logits) {
+std::vector<float> Qwen4ExpSession::forward_verify(const std::vector<int32_t> &ids, int64_t n_logits,
+                                                    const Qwen4ExpProbe &probe) {
     STRIX_CHECK(!verify_pending_, "Qwen4ExpSession::forward_verify: the last one awaits keep_verify / drop_verify");
     STRIX_CHECK(!broken_, "Qwen4ExpSession::forward_verify: an earlier call failed midway; reset() the session first");
     if (conv_spare_.empty()) {
@@ -1278,7 +1279,7 @@ std::vector<float> Qwen4ExpSession::forward_verify(const std::vector<int32_t> &i
     verify_ids_ = ids;
     gdn_to_spare_ = true;
     try {
-        std::vector<float> logits = forward(ids, n_logits);
+        std::vector<float> logits = forward(ids, n_logits, probe);
         gdn_to_spare_ = false;
         verify_pending_ = true;
         return logits;
