@@ -117,6 +117,10 @@ strixite runs on **Linux with an AMD Strix Halo (gfx1151) and 128 GB of memory**
 and tested by one person on one machine, so that's the only setup I can promise works; Windows and macOS aren't
 supported, and I don't plan to add them. I can't take on ports to other platforms here, but forks are very welcome.
 
+## Contributing
+
+Pull requests and issues are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for how they land.
+
 ## License
 
 [AGPL-3.0](LICENSE). The model weights are separate and under the Qwen Community License 1.0.
