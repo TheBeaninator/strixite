@@ -298,6 +298,140 @@ int main(int argc, char **argv) {
             return 0;
         }
 
+        // --row-invariance 1 (ST-3 step 0, whole model): is a verify row's arithmetic a T = 1 forward's? Per depth, for
+        // --ri-positions positions q (each from a snapshot of the state at q): T = 1 forwards of ids[q..q+6) (whole rows,
+        // every layer's L<i>.out row hashed), then forward_verify(ids[q..q+T)) + drop for T = 2..6 with the same rows and
+        // hashes, compared bit for bit; and one T = 1 forward at q with the decode linears' split-K x2 - the p99 of
+        // |top-2 gap (x1) - top-2 gap (x2)| is the near-tie eps of the design's 3.1.
+        if (a.num("row-invariance", 0) != 0) {
+            STRIX_CHECK(whole, "strix_bench --row-invariance: whole model only");
+            const int64_t npos = a.num("ri-positions", 64), nv = (int64_t)tok.size(), V = Dm.vocab;
+            constexpr int kMaxT = 6;
+            STRIX_CHECK((int64_t)corpus.size() > maxD + npos + kMaxT + 1, "strix_bench --row-invariance: corpus too short");
+            struct RowHashes {
+                std::vector<std::vector<uint64_t>> h;  // [row][layer]
+                Qwen4ExpProbe probe() {
+                    return [this](const std::string &name, const void *dev, int64_t rows, int64_t cols, ProbeType type) {
+                        if (name.size() < 5 || name.compare(name.size() - 4, 4, ".out") != 0 || name[0] != 'L') return;
+                        const size_t rb = (size_t)cols * (type == ProbeType::BF16 ? 2 : 4);
+                        std::vector<uint8_t> host(rb * (size_t)rows);
+                        STRIX_HIP_CHECK(hipMemcpy(host.data(), dev, host.size(), hipMemcpyDeviceToHost), "row hash probe");
+                        if (h.size() < (size_t)rows) h.resize((size_t)rows);
+                        for (int64_t r = 0; r < rows; ++r) h[(size_t)r].push_back(strix_hash64(host.data() + r * rb, rb));
+                    };
+                }
+            };
+            auto gap = [&](const float *l) {
+                float b1 = -INFINITY, b2 = -INFINITY;
+                for (int64_t i = 0; i < nv; ++i)
+                    if (l[i] > b1) b2 = b1, b1 = l[i];
+                    else if (l[i] > b2) b2 = l[i];
+                return (double)b1 - (double)b2;
+            };
+            struct PerT {
+                int64_t rows = 0, logits_equal = 0, hashes_equal = 0, top1_equal = 0;
+                double max_abs = 0;
+                std::vector<double> dgap;
+            };
+            std::map<int, PerT> perT;
+            std::vector<double> eps_samples;
+            int64_t positions = 0;
+            std::ostringstream dj;
+            Qwen4ExpSnapshot rs = ses.make_snapshot();
+            int64_t pos = 0;
+            const double r0 = now_ms();
+            for (const int64_t D : depths) {
+                while (pos < D) {
+                    const int64_t end = std::min(D, pos + chunk);
+                    if (end < D) ses.set_lookahead(std::vector<int32_t>(corpus.begin() + end, corpus.begin() + std::min(D, end + chunk)));
+                    ses.forward(std::vector<int32_t>(corpus.begin() + pos, corpus.begin() + end), 0);
+                    pos = end;
+                }
+                std::map<int, PerT> here;
+                for (int64_t q = D; q < D + npos; ++q) {
+                    ses.save(rs);  // the state at q
+                    std::vector<std::vector<float>> one;
+                    RowHashes oneh;
+                    for (int t = 0; t < kMaxT; ++t) {
+                        RowHashes h1;
+                        one.push_back(ses.forward({corpus[(size_t)(q + t)]}, 1, h1.probe()));
+                        oneh.h.push_back(h1.h.at(0));
+                    }
+                    ses.restore(rs);
+                    kernels::set_split_k_scale(2);
+                    const std::vector<float> two = ses.forward({corpus[(size_t)q]}, 1);
+                    kernels::set_split_k_scale(1);
+                    eps_samples.push_back(std::fabs(gap(one[0].data()) - gap(two.data())));
+                    for (int T = 2; T <= kMaxT; ++T) {
+                        ses.restore(rs);
+                        RowHashes vh;
+                        const std::vector<float> v =
+                            ses.forward_verify(std::vector<int32_t>(corpus.begin() + q, corpus.begin() + q + T), T, vh.probe());
+                        ses.drop_verify();
+                        for (PerT *pt : {&perT[T], &here[T]})
+                            for (int r = 0; r < T; ++r) {
+                                const float *a1 = one[(size_t)r].data(), *b1 = v.data() + (size_t)r * V;
+                                ++pt->rows;
+                                pt->logits_equal += std::memcmp(a1, b1, (size_t)V * 4) == 0;
+                                pt->hashes_equal += vh.h.at((size_t)r) == oneh.h[(size_t)r];
+                                pt->top1_equal += argmax(a1, nv) == argmax(b1, nv);
+                                double m = 0;
+                                for (int64_t i = 0; i < nv; ++i) m = std::max(m, (double)std::fabs(a1[i] - b1[i]));
+                                pt->max_abs = std::max(pt->max_abs, m);
+                                pt->dgap.push_back(std::fabs(gap(a1) - gap(b1)));
+                            }
+                    }
+                    ses.restore(rs);
+                    ses.forward({corpus[(size_t)q]}, 0);  // on to q + 1
+                    ++positions;
+                }
+                pos = D + npos;  // the context runs on from here for the next depth
+                dj << (dj.tellp() > 0 ? "," : "") << "\"" << D << "\":{";
+                bool f = true;
+                for (auto &[T, p] : here)
+                    dj << (f ? "" : ",") << "\"" << T << "\":{\"rows\":" << p.rows << ",\"logits_bitexact\":" << p.logits_equal
+                       << ",\"out_hashes_equal\":" << p.hashes_equal << "}",
+                        f = false;
+                dj << "}";
+                std::fprintf(stderr, "strix_bench: row-invariance: depth %lld done (%.1f s)\n", (long long)D, (now_ms() - r0) / 1000);
+            }
+            std::sort(eps_samples.begin(), eps_samples.end());
+            auto pct = [](const std::vector<double> &v, double f) {
+                return v.empty() ? 0.0 : v[(size_t)std::min<double>((double)v.size() - 1, std::floor(f * (double)(v.size() - 1) + 0.5))];
+            };
+            const double eps = pct(eps_samples, 0.99);
+            std::ofstream o(out);
+            o << "{\"tool\":\"strix_bench\",\"mode\":\"row-invariance\",\"weights\":\"" << weights << "\",\"positions\":" << positions
+              << ",\"positions_per_depth\":" << npos << ",\"depths\":[";
+            for (size_t i = 0; i < depths.size(); ++i) o << (i ? "," : "") << depths[i];
+            o << "],\"compare\":\"forward_verify(ids[q..q+T)) rows r vs T = 1 forwards of ids[q+r] from the same state: "
+                 "whole logits rows bit for bit, every layer's L<i>.out row hash\",\"bitexact_by_T\":{";
+            bool f = true, all_exact = true;
+            for (auto &[T, p] : perT) {
+                o << (f ? "" : ",") << "\"" << T << "\":" << (p.logits_equal == p.rows && p.hashes_equal == p.rows ? "true" : "false");
+                f = false;
+            }
+            o << "},\"by_T\":{";
+            f = true;
+            for (auto &[T, p] : perT) {
+                std::sort(p.dgap.begin(), p.dgap.end());
+                all_exact = all_exact && p.logits_equal == p.rows && p.hashes_equal == p.rows;
+                o << (f ? "" : ",") << "\"" << T << "\":{\"rows\":" << p.rows << ",\"logits_bitexact\":" << p.logits_equal
+                  << ",\"out_hashes_equal\":" << p.hashes_equal << ",\"top1_equal\":" << p.top1_equal << ",\"max_abs_logit_diff\":"
+                  << p.max_abs << ",\"dgap_p50\":" << pct(p.dgap, 0.5) << ",\"dgap_p99\":" << pct(p.dgap, 0.99)
+                  << ",\"dgap_max\":" << (p.dgap.empty() ? 0.0 : p.dgap.back()) << "}";
+                f = false;
+            }
+            o << "},\"by_depth\":{" << dj.str() << "},\"all_bitexact\":" << (all_exact ? "true" : "false")
+              << ",\"eps_top2_gap_p99\":" << eps << ",\"eps_top2_gap_p50\":" << pct(eps_samples, 0.5)
+              << ",\"eps_top2_gap_max\":" << (eps_samples.empty() ? 0.0 : eps_samples.back())
+              << ",\"eps_settings\":\"|top-2 gap| of T = 1 rows, decode linears split-K x1 vs x2, same positions\""
+              << ",\"seconds\":" << (now_ms() - r0) / 1000 << "}\n";
+            std::fprintf(stderr, "strix_bench: row-invariance: %lld positions, all bit-exact %s, eps p99 %.5g\n",
+                         (long long)positions, all_exact ? "yes" : "no", eps);
+            return 0;
+        }
+
         std::ostringstream J;
         J << "{\"tool\":\"strix_bench\",\"weights\":\"" << weights << "\",\"ngram\":\"" << ngram << "\",\"tp_world\":" << tp_world
           << ",\"tp_rank\":" << tp_rank << ",\"weights_gib\":" << (double)model.weights().data_bytes() / (1ull << 30)

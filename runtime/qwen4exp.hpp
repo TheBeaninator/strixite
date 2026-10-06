@@ -300,8 +300,10 @@ public:
     // Draft verification without a snapshot copy: forward_verify is forward() writing the GDN states into a spare
     // set (the ones before it kept); then exactly one of keep_verify() (the spare set becomes current: as if it were
     // forward()) or drop_verify() (the session is back where it was before the call - position, GDN, PLE, indexer
-    // tails, MTP state), before any other call. The spare set (~110 MiB) is allocated on the first use.
-    std::vector<float> forward_verify(const std::vector<int32_t> &ids, int64_t n_logits);
+    // tails, MTP state), before any other call. The spare set (~110 MiB) is allocated on the first use. probe: as
+    // forward()'s (the verify's T rows).
+    std::vector<float> forward_verify(const std::vector<int32_t> &ids, int64_t n_logits,
+                                      const Qwen4ExpProbe &probe = nullptr);
     void keep_verify();
     void drop_verify();
     // The third way out of a verify: keep only its first `rows` (1 <= rows < its size) - the state as if forward()
