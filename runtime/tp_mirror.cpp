@@ -15,7 +15,7 @@ namespace strix {
 
 namespace {
 
-// v2 (ST-3): + c (the candidate n_valid folded into the forwards), the verify ops, state hash and stats.
+// v2: + c (the candidate n_valid folded into the forwards), the verify ops, state hash and stats.
 constexpr uint32_t kMsgMagic = 0x54503233, kReplyMagic = 0x54503252;
 enum Op : uint32_t {
     kReset = 1,

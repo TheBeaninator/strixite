@@ -202,7 +202,7 @@ add_library(strix_model STATIC runtime/qwen3_5.cpp runtime/qwen4exp.cpp runtime/
     runtime/ngram_rows.cpp runtime/ngram_table.cpp runtime/tp_mirror.cpp)
 target_link_libraries(strix_model PUBLIC strix_kernels strix_formats strix_runtime)
 
-# PF-6: the WMMA kernels at a K tail (K % 64 == 32: a TP-4 rank's expert down, K = 160) against the FP32 kernels.
+# The WMMA kernels at a K tail (K % 64 == 32: a TP-4 rank's expert down, K = 160) against the FP32 kernels.
 add_executable(test_wmma_ktail)
 strix_hip_sources(test_wmma_ktail tools/test_wmma_ktail.cpp)
 target_link_libraries(test_wmma_ktail PRIVATE strix_kernels strix_formats)
@@ -333,14 +333,27 @@ add_executable(nudge_fork tools/nudge_fork.cpp)
 target_link_libraries(nudge_fork PRIVATE strix_serve_model)
 endif()
 
-# strixite-tp2 ST-1 / ST-N1: the decode / prefill exchange microbenchmark over RDMA (rail 0, stock rdma-core mlx5).
-find_library(STRIX_IBVERBS_LIB ibverbs)
-if(STRIX_IBVERBS_LIB)
+# strix_bench: single-stream decode timing at depth, MTP replay, golden logits + noise floor, needles;
+# --tp-world / --tp-rank load one rank's share with every exchange stubbed (tools/strix_bench.cpp).
+add_executable(strix_bench tools/strix_bench.cpp)
+target_link_libraries(strix_bench PRIVATE strix_serve_model)
+
+# Tensor parallelism over RDMA (docs/tp-rdma.md): the decode / prefill exchange microbenchmark (RoCE v2, stock
+# rdma-core mlx5), the TP-N communicator and tools/tp_ar. Optional: needs libibverbs; the engine and the server never
+# link it.
+option(STRIX_TP_RDMA "Build the RDMA tensor-parallel library and tools (needs libibverbs)" ON)
+if(STRIX_TP_RDMA)
+    find_library(STRIX_IBVERBS_LIB ibverbs)
+    if(NOT STRIX_IBVERBS_LIB)
+        message(STATUS "strixite: libibverbs not found - tp_exchange_bench / strix_tp / tp_ar skipped")
+    endif()
+endif()
+if(STRIX_TP_RDMA AND STRIX_IBVERBS_LIB)
 add_executable(tp_exchange_bench)
 strix_hip_sources(tp_exchange_bench tools/tp_exchange_bench.cpp)
 target_link_libraries(tp_exchange_bench PRIVATE strix_rocm ${STRIX_IBVERBS_LIB} Threads::Threads)
 
-# strixite-tp2 ST-2: the TP-N communicator (runtime/tp_comm) and rank 0's driver / the executors (runtime/tp_mirror);
+# The TP-N communicator (runtime/tp_comm) and rank 0's driver / the executors (runtime/tp_mirror);
 # tools/tp_ar checks and times the TP forward against the whole model.
 # (TpDriver / tp_executor / TpLoopback - runtime/tp_mirror.cpp - are in strix_model: no RDMA; tp_attach joins a session
 # to the communicator.)
@@ -355,11 +368,6 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/tests/CMakeLists.txt")
     enable_testing()
     add_subdirectory(tests)
 endif()
-
-# strixite-tp2 (ST-0a / ST-0b): single-stream decode timing at depth, MTP replay, golden logits + noise floor, needles;
-# --tp-world / --tp-rank load one rank's share with every exchange stubbed (tools/strix_bench.cpp).
-add_executable(strix_bench tools/strix_bench.cpp)
-target_link_libraries(strix_bench PRIVATE strix_serve_model)
 
 # The tutorials live in the public repo only; built when present.
 if(EXISTS "${CMAKE_SOURCE_DIR}/tutorial/CMakeLists.txt")

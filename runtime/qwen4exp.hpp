@@ -66,7 +66,7 @@ struct Qwen4ExpDims {
     // Positions: the checkpoint is trained for 262,144 (config max_position_embeddings, rope_type default). YaRN
     // (kernels/rope.hpp rope_yarn) stretches that by yarn_factor (1 = plain RoPE, as trained); rope_scale is its
     // attention factor on cos/sin (1 without YaRN). Set by Qwen4ExpModel from its yarn_factor argument.
-    // Tensor parallelism (strixite-tp2, plan v3): this rank's share of a world of tp_world ranks. Split: GDN key /
+    // Tensor parallelism: this rank's share of a world of tp_world ranks. Split: GDN key /
     // value heads (gk, gv and the widths derived from them), attention query heads (hq) and KV heads (hkv: 2 / N,
     // at least 1 - duplicated on the ranks that share one at N = 4), the experts' and the shared expert's
     // intermediate (inter), the LM head's vocabulary rows (lm_rows). Replicated: embedding, HC mixes, norms, router,
@@ -81,9 +81,9 @@ struct Qwen4ExpDims {
 
 struct TpConfig {
     int world = 1, rank = 0;
-    // Rank 0 holds the MTP draft head whole (ST-3, phase 1) and drafts over the LM head's first rows: its LM head share
+    // Rank 0 holds the MTP draft head whole and drafts over the LM head's first rows: its LM head share
     // is rows [0, max(vocab / N, draft_rows)) - the trunk uses the first vocab / N (a prefix view), the draft up to
-    // draft_rows (at N = 4: 62,080 < 65,536, the served mtp-vocab; design 1.3 item 4, option 2).
+    // draft_rows (at N = 4: 62,080 < 65,536, the served mtp-vocab).
     int64_t draft_rows = 65536;
 };
 
@@ -288,7 +288,7 @@ public:
     // vs 118.4, 40 203.1 vs 109.8 - so 6. A 4-draft MTP verify (5 tokens) stays per-slot. Tool-call turns (12-32 new
     // tokens, OCtest run 4) were paying 40-70 ms each for the old threshold.
     static constexpr int64_t kGroupedMinTokens = 6;
-    // PF-Q1: the grouped MoE path from this many tokens (>= kGroupedMinTokens, whose scratch is what gets allocated);
+    // The grouped MoE path from this many tokens (>= kGroupedMinTokens, whose scratch is what gets allocated);
     // raising it keeps short MTP verifies on the per-slot kernels.
     void set_grouped_min_tokens(int64_t n);
     // With PrefillMath::WmmaBf16, forwards of at least this many tokens run the dense Q4 / Q8 linears and the HC
@@ -377,7 +377,7 @@ public:
     void set_mtp_draft_q4(bool on);
     bool mtp_draft_q4() const { return mtp_draft_q4_; }
     int64_t mtp_vocab() const { return mtp_vocab_; }
-    // ST-3 test hooks. debug_mtp_feed: the MTP catch-up for ids at pos().. from the given trunk streams X [T, H * d]
+    // Test hooks. debug_mtp_feed: the MTP catch-up for ids at pos().. from the given trunk streams X [T, H * d]
     // (activation dtype, host) instead of a trunk forward - pos() advances by T, mtp_prev_ = X's last row; the trunk's
     // own state is NOT advanced (garbage for the trunk: reset() after). With the same ids + X a world-1 session (after
     // its trunk forward) and a rank-0 TP session hold the same MTP state, so their drafts must agree bit for bit.
@@ -385,7 +385,7 @@ public:
     // Guard words written past the end of the buffers sized from mixed whole / per-rank dims (proj_, core_, gu_, hh_,
     // attn_ws_, the MTP K / V caches) at construction; false if any was overwritten since.
     bool canaries_ok() const;
-    // ST-3 kStateHash (runtime/tp_mirror): a hash of the state every rank of a TP group holds identically - the
+    // kStateHash (runtime/tp_mirror): a hash of the state every rank of a TP group holds identically - the
     // position (and whether a verify is pending), the n-gram history, the PLE conv state, and per attention layer the
     // indexer tail's valid rows and the newest complete block's keys. Synchronizes the stream.
     uint64_t state_hash() const;
@@ -395,18 +395,18 @@ public:
     // summed in place over the ranks - and kind 2 the LM head's candidates (only when the forward wants candidates):
     // buf = this rank's logits_topk output (elems rows of kLogitCands LogitCand with ids local to its vocabulary share,
     // then the rows' NaN words), to be replaced by the merge over the ranks (global ids; runtime/tp_comm.hpp
-    // tp_merge_candidates). On stream. Unset: every exchange is a no-op (the stubbed exchanges of ST-0b; counted).
+    // tp_merge_candidates). On stream. Unset: every exchange is a no-op (the stubbed exchanges of strix_bench --tp-world; counted).
     // want_candidates(n_valid) takes the whole vocabulary's n_valid on every rank.
     // Kind 3 (set_tp_f32_mixer): buf holds the mixer's FP32 partials [T, d]; their sum, rounded once, goes to out
     // (activations; the other kinds pass out = nullptr and work in place).
     using Exchange = std::function<void(void *buf, int64_t elems, int kind, hipStream_t stream, void *out)>;
     void set_exchange(Exchange fn) { exchange_ = std::move(fn); }
     int64_t exchanges() const { return exchanges_; }
-    // Experiment knob (ST-2): the mixer's row-parallel partials (o_proj / out_proj) exchanged in FP32 (the linears'
+    // The mixer's row-parallel partials (o_proj / out_proj) exchanged in FP32 (the linears'
     // unrounded accumulators) and rounded once after the sum - the whole model's arithmetic up to summation order -
-    // instead of BF16 partials. The MoE partials stay BF16 (their kernels write the activation dtype). Default off.
+    // instead of BF16 partials. On by default under TP with BF16 activations (with the MoE partials below).
     void set_tp_f32_mixer(bool on);
-    // FP32 MoE partials (strixite-tp2 f32moe): the routed experts' combine, the shared expert's down projection and
+    // FP32 MoE partials: the routed experts' combine, the shared expert's down projection and
     // its gated add stay FP32 on each rank; the exchange (kind 3, as the mixer's) sums them and rounds once.
     void set_tp_f32_moe(bool on);
     bool tp_f32_partials() const { return tp_f32_mixer_ || tp_f32_moe_; }  // the communicator's rows are 4 bytes
@@ -485,7 +485,7 @@ private:
     static constexpr uint8_t kCanaryByte = 0xa5;
     std::vector<std::pair<const uint8_t *, size_t>> canaries_;
     // The pending verify ran the MTP catch-up (so proj_ holds its projections for keep_verify_prefix): set by
-    // forward_verify. Invariant (ST-3 design 1.2): no kernel writes proj_ between a verify's catch-up and its keep.
+    // forward_verify. Invariant: no kernel writes proj_ between a verify's catch-up and its keep.
     bool verify_caught_up_ = false;
     // forward_mtp / forward_mtp_top2's shared body: the head's layer and the LM head's logits into logits_ (queued on
     // stream_; broken_ set until the caller's read-back succeeds, which then calls mtp_done(step)).

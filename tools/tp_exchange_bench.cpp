@@ -1,4 +1,4 @@
-// tp_exchange_bench: strixite-tp2 ST-1 / ST-N1 exchange microbenchmark (HIP + ibverbs over rail 0, RoCE v2, stock mlx5).
+// tp_exchange_bench: the TP exchange microbenchmark (HIP + ibverbs, RoCE v2, stock mlx5).
 //
 // Models the TP-N decode exchange: per forward, E (default 96) all-reduces of a BF16 partial of S bytes. Each exchange:
 //   produce kernel  writes the rank's partial into send slot e%3, __threadfence_system, publishes ready_seq = e+1
@@ -14,6 +14,7 @@
 // WRITE_WITH_IMM when it got no chunk), so arrival = min over the peer's QPs of that QP's immediates.
 //
 // usage: tp_exchange_bench --rank R --peers 192.0.2.1,192.0.2.2[,..] [--dev DEVICE] [--gid-index auto|N]
+//          (no --dev: the mlx5 device with a RoCE v2 GID for this rank's address)
 //          [--port 18515] [--sizes 5120,10240,30720,61440] [--chunks 0,16384,32768,65536] [--inlines 0,220]
 //          [--loads off,inline,inline+stream] [--load-bytes 67108864] [--qps-per-peer 1] [--exchanges 96]
 //          [--forwards 200] [--warmup 20] [--mem host|device] [--prefill] [--timeout 120]
@@ -278,12 +279,12 @@ struct Peer {
     std::vector<uint64_t> since_sig;
 };
 
-int pick_gid(const std::string &dev, const std::string &ip) {
+// The RoCE v2 GID index of ip on dev's port 1, or -1.
+int find_gid(const std::string &dev, const std::string &ip, char *want, size_t want_n) {
     in_addr a;
     inet_pton(AF_INET, ip.c_str(), &a);
     const uint8_t *b = (const uint8_t *)&a;
-    char want[64];
-    snprintf(want, sizeof want, "0000:0000:0000:0000:0000:ffff:%02x%02x:%02x%02x", b[0], b[1], b[2], b[3]);
+    snprintf(want, want_n, "0000:0000:0000:0000:0000:ffff:%02x%02x:%02x%02x", b[0], b[1], b[2], b[3]);
     for (int i = 0; i < 256; ++i) {
         std::ifstream g("/sys/class/infiniband/" + dev + "/ports/1/gids/" + std::to_string(i));
         std::ifstream t("/sys/class/infiniband/" + dev + "/ports/1/gid_attrs/types/" + std::to_string(i));
@@ -292,6 +293,13 @@ int pick_gid(const std::string &dev, const std::string &ip) {
         std::getline(t, ts);
         if (gs == want && ts.find("v2") != std::string::npos) return i;
     }
+    return -1;
+}
+
+int pick_gid(const std::string &dev, const std::string &ip) {
+    char want[64];
+    const int i = find_gid(dev, ip, want, sizeof want);
+    if (i >= 0) return i;
     DIE("no RoCE v2 GID for %s on %s (wanted %s)", ip.c_str(), dev.c_str(), want);
 }
 
@@ -307,7 +315,7 @@ void pct(std::vector<double> v, double *p50, double *p90, double *p99, double *m
 }  // namespace
 
 int main(int argc, char **argv) {
-    std::string dev = "mlx5_0", peers_s, gid_s = "auto", mem = "host";
+    std::string dev, peers_s, gid_s = "auto", mem = "host";
     std::string sizes_s = "5120,10240,30720,61440", chunks_s = "0,16384,32768,65536", inl_s = "0,220",
                 loads_s = "off,inline,inline+stream";
     int rank = -1, port = 18515, Q = 1;
@@ -383,6 +391,14 @@ int main(int argc, char **argv) {
     int ndev = 0;
     ibv_device **dl = ibv_get_device_list(&ndev);
     ibv_context *ctx = nullptr;
+    if (dev.empty()) {  // by driver (mlx5) and address: device names follow the PCI address
+        char want[64];
+        for (int i = 0; i < ndev && dev.empty(); ++i) {
+            const std::string name = ibv_get_device_name(dl[i]);
+            if (name.rfind("mlx5", 0) == 0 && find_gid(name, peers[rank], want, sizeof want) >= 0) dev = name;
+        }
+        if (dev.empty()) DIE("no mlx5 RDMA device with a RoCE v2 GID for %s (%d devices); pass --dev", peers[rank].c_str(), ndev);
+    }
     for (int i = 0; i < ndev; ++i)
         if (dev == ibv_get_device_name(dl[i])) ctx = ibv_open_device(dl[i]);
     if (!ctx) DIE("RDMA device %s not found (%d devices; is the stock mlx5 provider on the path?)", dev.c_str(), ndev);
@@ -436,7 +452,7 @@ int main(int argc, char **argv) {
         }
         P[p].imm_count.assign(Q, 0), P[p].outstanding.assign(Q, 0), P[p].since_sig.assign(Q, 0);
     }
-    // TCP mesh: listen on my rail-0 address, connect to lower ranks, accept higher ones
+    // TCP mesh: listen on my address, connect to lower ranks, accept higher ones
     int ls = tcp_listen(peers[rank], port);
     for (int p = 0; p < rank; ++p) {
         P[p].fd = tcp_connect(peers[p], port, deadline);

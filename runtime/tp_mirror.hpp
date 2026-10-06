@@ -1,6 +1,6 @@
 #pragma once
 
-// strixite-tp2: rank 0 drives, ranks 1..N-1 execute (plan v1 "Control", v3 "rank 0 + N-1 executors").
+// Tensor parallelism: rank 0 drives, ranks 1..N-1 execute.
 //
 // TpDriver (rank 0) has the state-changing calls of Qwen4ExpSession that serving and the benches use; each one is sent
 // to every executor over the control channel (TpControl: the communicator's TCP mesh, runtime/tp_comm.hpp, or an
@@ -9,7 +9,7 @@
 // control channel (world 1) the driver is a pass-through, so tools run the whole model and a TP group through one code
 // path.
 //
-// MTP (ST-3, design 2026-10-06 sections 1-2): the draft head lives on rank 0 only, whole (Qwen4ExpModel::mtp_dims);
+// MTP: the draft head lives on rank 0 only, whole (Qwen4ExpModel::mtp_dims);
 // drafts (forward_mtp_top2) and the catch-up at the end of each forward run there and need no exchange, so they are
 // not mirrored. Executors mirror only the trunk's state machine: forward / forward_verify (the candidate n_valid
 // folded into the message - a forgotten want_candidates can't leave a rank one exchange short), keep_verify,
@@ -43,7 +43,7 @@ namespace strix {
 void tp_attach(Qwen4ExpSession &ses, const Qwen4ExpModel &model, TpComm &comm);
 
 // An in-process control channel between ranks 0 and 1 of a world of 2 (byte queues): the mirror-shadow test runs
-// TpDriver and tp_executor in one process over it (ST-3 design 3.2 check 1).
+// TpDriver and tp_executor in one process over it.
 class TpLoopback {
 public:
     TpLoopback();

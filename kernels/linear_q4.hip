@@ -237,7 +237,7 @@ __global__ void __launch_bounds__(kThreads)
 // Combine: y[m, :] = sum_a coef[m, a] * h[m, a, :] * W[ids[m, a]]^T - one
 // output row is a single A*K-long reduction; lanes walk its chunks flattened
 // across experts, so short expert rows (K=640 is 20 chunks) still fill a wave.
-// TY: the output dtype - T, or FP32 from BF16 h (a TP rank's unrounded expert partials, strixite-tp2 f32moe).
+// TY: the output dtype - T, or FP32 from BF16 h (a TP rank's unrounded expert partials).
 template <typename T, int G, int HB, typename TY = T>
 __global__ void __launch_bounds__(kThreads)
     linear_q4_experts_combine_kernel(const T *h, const uint8_t *q, const uint16_t *scale, const uint16_t *minv,

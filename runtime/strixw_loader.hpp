@@ -26,7 +26,7 @@
 
 namespace strix {
 
-// Tensor parallelism (strixite-tp2): which part of a tensor one rank loads. rows: [begin, end) ranges of the tensor's
+// Tensor parallelism: which part of a tensor one rank loads. rows: [begin, end) ranges of the tensor's
 // first dimension, concatenated in order (empty: every row); [k0, k1): a row-major Q4 / Q8 tensor's K (the input
 // dimension) on whole quantization groups (k1 == 0: every column). A tensor the plan returns nullopt for is loaded
 // whole; skip drops it (e.g. the MTP head on a rank that never drafts).
@@ -43,7 +43,7 @@ public:
     // hashes aren't re-checked (inspect_strixw --verify does that); the header and index hashes are.
     explicit StrixwDevice(const std::string &path, int read_threads = 8);
     // A rank's share (tensor parallelism): every tensor sliced per plan into one device allocation; tensor() then
-    // reports the sliced shapes. Row slices read only their rows (ST-2: over a network filesystem,
+    // reports the sliced shapes. Row slices read only their rows (over a network filesystem,
     // so bytes read are the load time); column (K) slices read the component whole and slice on the host.
     StrixwDevice(const std::string &path, const StrixwSlicePlan &plan, int read_threads = 8);
 
