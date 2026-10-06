@@ -261,6 +261,8 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir, in
         // opencode turns vs 4.
         {"mtp-draft", K::Int, 1, 15, "5", "MTP: most drafts per verify (the head chained)"},
         {"mtp-margin", K::Number, 0, 100, "2", "MTP: draft only while the top-1 logit margin is at least this"},
+        {"mtp-reject-forward", K::OnOff, 0, 0, "off",
+         "MTP: after a rejected draft, forward its position's token alone (the pre-PF-1 path; A/B only)"},
         {"mtp-vocab", K::Int, 0, 1 << 30, "65536", "MTP: drafts are scored over token ids [0, N); 0 = the whole vocabulary"},
         {"ngram-cache-rows", K::Int, 0, 1 << 26, std::to_string(ngram_cache_rows_default),
          "the n-gram table's LRU row cache in rows (320 B each, plus index); 0 = none"},

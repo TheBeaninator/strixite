@@ -94,14 +94,19 @@ ReplayResult replay_teacher_forced(LmBackend &be, const CaptureRecord &rec, cons
             i += k + 1;
             continue;
         }
-        // Draft j rejected: keep id + the j accepted drafts, then forward the captured token in its place.
+        // Draft j rejected: keep id + the j accepted drafts. The captured token at v is then "known, not yet
+        // forwarded" - the next step starts from it (PF-1); the old path forwarded it alone first.
         ++r.rollbacks;
         be.keep_verify_prefix(ids, j + 1);
         const int64_t v = i + j + 1;  // < G: drafts only reach tokens that exist
-        be.prefetch_ple({gen[v]}, 0);
-        fwd({gen[v]}, true);
-        ++r.forwards;
-        i = v + 1;
+        if (opt.mtp_reject_forward) {
+            be.prefetch_ple({gen[v]}, 0);
+            fwd({gen[v]}, true);
+            ++r.forwards;
+            i = v + 1;
+        } else {
+            i = v;
+        }
     }
     r.decode_ms = now_ms() - t0;
     const BackendStats s1 = be.backend_stats();

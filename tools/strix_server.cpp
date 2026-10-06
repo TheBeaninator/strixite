@@ -127,6 +127,7 @@ int run(int argc, char **argv) {
     Engine::Options eng_opts;
     eng_opts.cache = cache.get();
     eng_opts.mtp_margin = mtp_margin;
+    eng_opts.mtp_reject_forward = settings.on("mtp-reject-forward");
     eng_opts.mtp_draft = mtp_draft;
     eng_opts.think_nudge = think_nudge;
     slog(LogLevel::Info, "startup: thinking nudge %s", think_nudge ? "on" : "off");

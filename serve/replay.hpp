@@ -24,6 +24,7 @@ struct ReplayOptions {
     int64_t max_gen = 512;        // generated tokens replayed at most (0 = all)
     int64_t mtp_draft = 4;        // drafts per verify at most (0 = MTP off: plain forwards only)
     float mtp_margin = 2.0f;      // the head's top-1 margin a draft needs
+    bool mtp_reject_forward = false;  // pre-PF-1 path: forward a rejected position's token alone (A/B only)
     // Called between the prefill and the decode, if set (bench_replay --ple-after-prefill: empty the PLE row cache, as
     // a turn resumed from the prompt cache after a restart finds it - the prefill that would have filled it is
     // skipped).

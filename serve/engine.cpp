@@ -380,13 +380,16 @@ void Engine::run(Job &job) {
             if (!options_.capture_dir.empty())
                 steps.push_back({(uint8_t)drafted, (uint8_t)accepted, (uint8_t)emitted});
         };
+        // PF-1: a token sampled at a rejected draft's position, already counted and fed to the parser but not yet
+        // forwarded - the next step starts from it (drafts from it, then verifies it as row 0).
+        int32_t carry = -1;
         for (;;) {
             if (sink.cancelled()) {
                 reason = "cancelled";
                 break;
             }
             // Thinking budget spent: the engine closes the think block itself (fed, not sampled); sampling goes on.
-            if (req.thinking_budget >= 0 && !res.thinking_budget_hit && parser.in_reasoning() &&
+            if (carry < 0 && req.thinking_budget >= 0 && !res.thinking_budget_hit && parser.in_reasoning() &&
                 parser.reasoning_tokens() >= req.thinking_budget) {
                 const int64_t n = (int64_t)thinking_stop_.size();
                 if (res.completion_tokens + n >= req.max_tokens) {  // no room left for it and an answer
@@ -403,7 +406,7 @@ void Engine::run(Job &job) {
                 continue;
             }
             // Thinking going in circles: feed a nudge into the think block (never a </think>), then go on sampling.
-            if (options_.think_nudge && parser.in_reasoning()) {
+            if (carry < 0 && options_.think_nudge && parser.in_reasoning()) {  // injections wait until carry is forwarded
                 if (const int d = watch.due()) {
                     const std::vector<int32_t> &nt = nudge_[d - 1];
                     const int64_t n = (int64_t)nt.size();
@@ -423,22 +426,28 @@ void Engine::run(Job &job) {
                     }
                 }
             }
-            const int32_t id = sampler.sample(logits, 0);
-            ++res.completion_tokens;
-            if (id == im_end_ || id == eot_) {
-                reason = "stop";
-                break;
-            }
-            const bool stopped = parser.feed(id, events);
-            watch_tok(id);
-            if (!events.empty()) sink.on_events(events), events.clear();
-            if (stopped) {
-                reason = "stop";
-                break;
-            }
-            if (res.completion_tokens >= req.max_tokens) {
-                reason = "length";
-                break;
+            int32_t id;
+            if (carry >= 0) {  // sampled, counted and parsed at the rejected position: straight to drafting
+                id = carry;
+                carry = -1;
+            } else {
+                id = sampler.sample(logits, 0);
+                ++res.completion_tokens;
+                if (id == im_end_ || id == eot_) {
+                    reason = "stop";
+                    break;
+                }
+                const bool stopped = parser.feed(id, events);
+                watch_tok(id);
+                if (!events.empty()) sink.on_events(events), events.clear();
+                if (stopped) {
+                    reason = "stop";
+                    break;
+                }
+                if (res.completion_tokens >= req.max_tokens) {
+                    reason = "length";
+                    break;
+                }
             }
 
             // MTP: up to mtp_draft greedy drafts from the head (chained), each while its top-1 margin reaches
@@ -498,8 +507,9 @@ void Engine::run(Job &job) {
                         continue;
                     }
                     // Draft j rejected; v is this position's sampled token. Keep id and the j accepted drafts from the
-                    // verify (the backend doesn't run them again - keep_verify_prefix), then forward v alone for the
-                    // next logits.
+                    // verify (the backend doesn't run them again - keep_verify_prefix). The session's state is then
+                    // "after ids[j]", exactly what a step's drafting starts from, so v carries into the next step
+                    // (PF-1) instead of a forward of its own (mtp_reject_forward: the old path).
                     ++res.mtp_rollbacks, ++res.completion_tokens, ++res.mtp_reject_at[std::min<int64_t>(j, kMtpMaxDraft - 1)];
                     {  // v's PLE rows load while the prefix is kept (its forward comes right after)
                         std::vector<int32_t> next(ids.begin(), ids.begin() + j + 1);
@@ -516,13 +526,18 @@ void Engine::run(Job &job) {
                     const bool st = parser.feed(v, events);
                     watch_tok(v);
                     if (!events.empty()) sink.on_events(events), events.clear();
-                    logits = be_.forward_rows({v}, 1, cands, n_valid);
-                    seq_.push_back(v);
-                    step(k, j, j + 2);
+                    if (options_.mtp_reject_forward) {
+                        logits = be_.forward_rows({v}, 1, cands, n_valid);
+                        seq_.push_back(v);
+                        step(k, j, j + 2);
+                    } else {
+                        step(k, j, j + 1);  // v is emitted by the next step
+                    }
                     if (st || res.completion_tokens >= req.max_tokens) {
                         reason = st ? "stop" : "length";
                         break;
                     }
+                    if (!options_.mtp_reject_forward) carry = v;
                     continue;
                 }
             }
