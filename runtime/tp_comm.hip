@@ -34,6 +34,14 @@ constexpr uint64_t kRing = 1u << 16;  // queued exchange sizes the comm thread h
 constexpr int kSqDepth = 4096, kRqDepth = 1024;
 constexpr uint32_t kPoisonImm = 0xffffffffu;  // a zero-length WRITE_WITH_IMM carrying it poisons the receiver
 
+// The immediate of exchange seq of `bytes`: seq's low 20 bits, then a 12-bit tag of the size (never the poison word).
+uint32_t exchange_imm(uint64_t seq, uint64_t bytes) {
+    const uint32_t tag = (uint32_t)(((bytes >> 2) ^ (bytes >> 14) ^ (bytes >> 26)) & 0xfffu);
+    uint32_t imm = ((uint32_t)(seq & 0xfffffu) << 12) | tag;
+    if (imm == 0xffffffffu) imm ^= 1u;
+    return imm;
+}
+
 double now_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
 __device__ inline float bf2f(uint16_t b) { return __uint_as_float((uint32_t)b << 16); }
@@ -177,7 +185,7 @@ void xfer(int fd, void *p, size_t n, bool out, double deadline) {
     }
 }
 
-int pick_gid(const std::string &dev, const std::string &ip) {
+int find_gid(const std::string &dev, const std::string &ip) {
     in_addr a;
     inet_pton(AF_INET, ip.c_str(), &a);
     const uint8_t *b = (const uint8_t *)&a;
@@ -191,7 +199,12 @@ int pick_gid(const std::string &dev, const std::string &ip) {
         std::getline(t, ts);
         if (gs == want && ts.find("v2") != std::string::npos) return i;
     }
-    STRIX_FAIL("TpComm: no RoCE v2 GID for ", ip, " on ", dev, " (wanted ", want, ")");
+    return -1;
+}
+int pick_gid(const std::string &dev, const std::string &ip) {
+    const int g = find_gid(dev, ip);
+    STRIX_CHECK(g >= 0, "TpComm: no RoCE v2 GID for ", ip, " on ", dev);
+    return g;
 }
 
 struct PairInfo {
@@ -205,6 +218,30 @@ struct PairInfo {
 constexpr uint32_t kMagic = 0x54503243;  // "TP2C"
 
 }  // namespace
+
+std::string tp_pick_device(const std::string &dev, const std::string &ip) {
+    if (!dev.empty()) return dev;
+    // By driver (mlx5; the USB4 / Thunderbolt RDMA devices are others) and address: device names follow the PCI
+    // address and change on a renumber (e.g. rocep195s0).
+    std::vector<std::string> seen;
+    int ndev = 0;
+    ibv_device **dl = ibv_get_device_list(&ndev);
+    std::string found;
+    for (int i = 0; dl && i < ndev; ++i) {
+        const std::string name = ibv_get_device_name(dl[i]);
+        char drv[512] = {0};
+        const ssize_t n = readlink(("/sys/class/infiniband/" + name + "/device/driver").c_str(), drv, sizeof drv - 1);
+        const std::string d = n > 0 ? std::string(drv, (size_t)n) : std::string();
+        const std::string base = d.substr(d.find_last_of('/') + 1);
+        seen.push_back(name + " (" + base + ")");
+        if (found.empty() && base.rfind("mlx5", 0) == 0 && find_gid(name, ip) >= 0) found = name;
+    }
+    if (dl) ibv_free_device_list(dl);
+    std::string all;
+    for (const std::string &x : seen) all += (all.empty() ? "" : ", ") + x;
+    STRIX_CHECK(!found.empty(), "TpComm: no mlx5 RDMA device with a RoCE v2 GID for ", ip, " (devices: ", all, ")");
+    return found;
+}
 
 struct TpComm::Impl {
     TpCommConfig cfg;
@@ -221,6 +258,8 @@ struct TpComm::Impl {
         ibv_qp *qp = nullptr;
         PairInfo remote{};
         uint64_t imms = 0, outstanding = 0, since_sig = 0;
+        uint64_t checked = 0;  // exchanges from this peer whose size tag matched this rank's (arrival published)
+        std::vector<uint16_t> tags = std::vector<uint16_t>(kRing);  // received size tags by seq % kRing
     };
     std::vector<Peer> P;
     std::vector<uint64_t> ring = std::vector<uint64_t>(kRing);
@@ -304,7 +343,7 @@ void TpComm::Impl::loop() {
                     ibv_send_wr wr{}, *bad = nullptr;
                     wr.sg_list = len ? &sg : nullptr, wr.num_sge = len ? 1 : 0;
                     wr.opcode = last ? IBV_WR_RDMA_WRITE_WITH_IMM : IBV_WR_RDMA_WRITE;
-                    wr.imm_data = htonl((uint32_t)next);
+                    wr.imm_data = htonl(exchange_imm(next, bytes));
                     wr.wr.rdma.remote_addr = pr.remote.region + ((uint64_t)rank * kWindows + w) * slot + off;
                     wr.wr.rdma.rkey = pr.remote.rkey;
                     ++pr.since_sig, ++pr.outstanding;
@@ -335,16 +374,38 @@ void TpComm::Impl::loop() {
                 set_poison(cat("TpComm: rank ", p, " failed and poisoned the communicator"));
                 return;
             }
-            if (ntohl(wc[k].imm_data) != (uint32_t)pr.imms) {
-                set_poison(cat("TpComm: immediate ", ntohl(wc[k].imm_data), " from rank ", p, ", expected ",
-                               (uint32_t)pr.imms, " (the ranks ran different calls)"));
+            const uint32_t imm = ntohl(wc[k].imm_data);
+            if ((imm >> 12) != (uint32_t)(pr.imms & 0xfffffu)) {
+                set_poison(cat("TpComm: immediate for exchange ", imm >> 12, " (mod 2^20) from rank ", p, ", expected ",
+                               pr.imms & 0xfffffu, " (the ranks ran different calls)"));
                 return;
             }
+            pr.tags[pr.imms % kRing] = (uint16_t)(imm & 0xfffu);
             ++pr.imms;
             ibv_recv_wr rw{}, *bad = nullptr;
             ibv_post_recv(pr.qp, &rw, &bad);
-            __atomic_store_n(flags_h + 8 + p, pr.imms, __ATOMIC_SEQ_CST);
             did = true;
+        }
+        // Arrivals are published once this rank has queued the same exchange and its size tag agrees.
+        const uint64_t q = queued.load(std::memory_order_acquire);
+        for (int p = 0; p < N; ++p) {
+            if (p == rank) continue;
+            Peer &pr = P[p];
+            const uint64_t c0 = pr.checked;
+            while (pr.checked < pr.imms && pr.checked < q) {
+                const uint64_t s = pr.checked, bytes = ring[s % kRing];
+                const uint32_t want = exchange_imm(s, bytes) & 0xfffu;
+                if (pr.tags[s % kRing] != want) {
+                    set_poison(cat("TpComm: exchange ", s, ": rank ", p, "'s payload size tag ", pr.tags[s % kRing],
+                                   " != this rank's ", want, " (", bytes, " bytes) - the ranks ran different shapes"));
+                    return;
+                }
+                ++pr.checked;
+            }
+            if (pr.checked != c0) {
+                __atomic_store_n(flags_h + 8 + p, pr.checked, __ATOMIC_SEQ_CST);
+                did = true;
+            }
         }
         if (!reap_send()) return;
         const double t = now_s();
@@ -355,7 +416,7 @@ void TpComm::Impl::loop() {
         // waiting on a peer for an exchange we posted: the watchdog
         bool behind = false;
         for (int p = 0; p < N; ++p)
-            if (p != rank && P[p].imms < next) behind = true;
+            if (p != rank && P[p].checked < next) behind = true;
         if (!behind) last_progress = t;
         else if (t - last_progress > cfg.exchange_timeout_s) {
             set_poison(cat("TpComm: no data from a peer for ", cfg.exchange_timeout_s, " s at exchange ", next));
@@ -387,15 +448,16 @@ TpComm::TpComm(const TpCommConfig &cfg) : impl_(std::make_unique<Impl>()) {
     STRIX_HIP_CHECK(hipHostGetDevicePointer((void **)&I.send_d, I.send_h, 0), "TpComm send windows");
     STRIX_HIP_CHECK(hipHostGetDevicePointer((void **)&I.recv_d, I.recv_h, 0), "TpComm receive windows");
 
+    dev_ = I.cfg.dev = tp_pick_device(cfg.dev, cfg.peers[(size_t)rank_]);
     int ndev = 0;
     ibv_device **dl = ibv_get_device_list(&ndev);
     for (int i = 0; dl && i < ndev; ++i)
-        if (cfg.dev == ibv_get_device_name(dl[i])) I.ctx = ibv_open_device(dl[i]);
+        if (dev_ == ibv_get_device_name(dl[i])) I.ctx = ibv_open_device(dl[i]);
     if (dl) ibv_free_device_list(dl);
-    STRIX_CHECK(I.ctx, "TpComm: RDMA device ", cfg.dev, " not found (", ndev, " devices; stock mlx5 provider?)");
+    STRIX_CHECK(I.ctx, "TpComm: RDMA device ", dev_, " not found (", ndev, " devices; stock mlx5 provider?)");
     ibv_port_attr pa;
     STRIX_CHECK(ibv_query_port(I.ctx, 1, &pa) == 0, "TpComm: ibv_query_port");
-    const int gidx = pick_gid(cfg.dev, cfg.peers[(size_t)rank_]);
+    const int gidx = pick_gid(dev_, cfg.peers[(size_t)rank_]);
     ibv_gid my_gid;
     STRIX_CHECK(ibv_query_gid(I.ctx, 1, gidx, &my_gid) == 0, "TpComm: ibv_query_gid ", gidx);
     I.pd = ibv_alloc_pd(I.ctx);
@@ -423,9 +485,9 @@ TpComm::TpComm(const TpCommConfig &cfg) : impl_(std::make_unique<Impl>()) {
         I.P[(size_t)p].qp = qp;
     }
     // TCP mesh on the rail-0 addresses: connect to lower ranks, accept higher ones.
-    const int ls = tcp_listen(cfg.peers[(size_t)rank_], cfg.port);
+    const int ls = tcp_listen(cfg.peers[(size_t)rank_], cfg.port + rank_);
     for (int p = 0; p < rank_; ++p) {
-        I.P[(size_t)p].fd = tcp_connect(cfg.peers[(size_t)p], cfg.port, deadline);
+        I.P[(size_t)p].fd = tcp_connect(cfg.peers[(size_t)p], cfg.port + p, deadline);
         int32_t me = rank_;
         xfer(I.P[(size_t)p].fd, &me, 4, true, deadline);
     }

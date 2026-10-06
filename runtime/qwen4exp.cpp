@@ -1,6 +1,7 @@
 #include "runtime/qwen4exp.hpp"
 
 #include "runtime/ngram_table.hpp"
+#include "formats/strixw.hpp"  // strix_hash64
 
 #include "common/hip_check.hpp"
 #include "common/trace.hpp"
@@ -475,6 +476,37 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
         STRIX_HIP_CHECK(hipMemset(const_cast<uint8_t *>(at), kCanaryByte, n), "Qwen4ExpSession: guard words");
     STRIX_HIP_CHECK(hipDeviceSynchronize(), "Qwen4ExpSession: guard words");
     reset();
+}
+
+uint64_t Qwen4ExpSession::state_hash() const {
+    STRIX_HIP_CHECK(hipStreamSynchronize(stream_), "Qwen4ExpSession::state_hash");
+    const Qwen4ExpDims &D = m_.dims();
+    const size_t e = es(m_.act());
+    std::vector<uint64_t> parts;
+    const int64_t head[2] = {pos_, verify_pending_ ? 1 : 0};
+    parts.push_back(strix_hash64(head, sizeof head));
+    parts.push_back(strix_hash64(&ple_hist_, sizeof ple_hist_));
+    std::vector<uint8_t> h;
+    auto dev = [&](const void *p, size_t n) {
+        h.resize(n);
+        if (n) STRIX_HIP_CHECK(hipMemcpy(h.data(), p, n, hipMemcpyDeviceToHost), "Qwen4ExpSession::state_hash");
+        parts.push_back(strix_hash64(h.data(), n));
+    };
+    dev(ple_state_.get(), ple_state_.size());
+    const int64_t b = pos_ / kernels::kQsaBlock - 1;
+    for (size_t l = 0; l < conv_state_.size(); ++l) {
+        if (!D.is_attention[l]) continue;
+        dev(tail_[tail_cur_][l].get(), (size_t)((pos_ % kernels::kQsaBlock) * D.idx_d) * e);
+        if (b >= 0) {  // block b's keys: idx_d / 8 strided rows of 8 (chunk-major, kernels/qsa.hpp)
+            const size_t row = 8 * e, pitch = (size_t)(cap_blocks_ * 8) * e, rows = (size_t)(D.idx_d / 8);
+            h.resize(row * rows);
+            STRIX_HIP_CHECK(hipMemcpy2D(h.data(), row, block_keys_[l].get() + (size_t)(b * 8) * e, pitch, row, rows,
+                                        hipMemcpyDeviceToHost),
+                            "Qwen4ExpSession::state_hash: block keys");
+            parts.push_back(strix_hash64(h.data(), h.size()));
+        }
+    }
+    return strix_hash64(parts.data(), parts.size() * 8);
 }
 
 bool Qwen4ExpSession::canaries_ok() const {

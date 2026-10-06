@@ -348,6 +348,10 @@ public:
     // Guard words written past the end of the buffers sized from mixed whole / per-rank dims (proj_, core_, gu_, hh_,
     // attn_ws_, the MTP K / V caches) at construction; false if any was overwritten since.
     bool canaries_ok() const;
+    // ST-3 kStateHash (runtime/tp_mirror): a hash of the state every rank of a TP group holds identically - the
+    // position (and whether a verify is pending), the n-gram history, the PLE conv state, and per attention layer the
+    // indexer tail's valid rows and the newest complete block's keys. Synchronizes the stream.
+    uint64_t state_hash() const;
 
     // Tensor parallelism (dims().tp_world > 1): the all-reduce of a partial sum at a row-parallel output - kind 0 the
     // mixer's (o_proj / GDN out_proj), 1 the MoE's (routed + gated shared expert): elems activations [T, d] in buf,
