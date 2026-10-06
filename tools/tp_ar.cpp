@@ -382,6 +382,9 @@ int main(int argc, char **argv) {
         // PF-5: the Q4 draft head (rank 0 / world 1 only: executors never draft)
         const bool draft_q4 = onoff_arg(a.get("mtp-draft-q4", "off"), "tp_ar --mtp-draft-q4");
         const bool free_q4 = a.num("mtp-free-q4", 0) != 0;
+        // control for free_q4: the same free-running decode with the Q8 head under another policy (MARGINxDRAFTS):
+        // how far any change of the drafts moves the verify-decided tokens
+        const std::string free_alt = a.get("mtp-free-alt");
         struct SweepCell {
             std::string key;
             double margin;
@@ -1173,6 +1176,23 @@ int main(int argc, char **argv) {
                         if (d >= 0)
                             J << ",\"q8_gap\":" << fr[0].gap[(size_t)d] << ",\"q4_gap\":" << fr[1].gap[(size_t)d]
                               << ",\"near_tie\":" << (std::min(fr[0].gap[(size_t)d], fr[1].gap[(size_t)d]) < eps ? "true" : "false");
+                        if (!free_alt.empty()) {
+                            const size_t x = free_alt.find('x');
+                            STRIX_CHECK(x != std::string::npos, "tp_ar --mtp-free-alt: '", free_alt, "', expected MARGINxDRAFTS");
+                            ses.set_mtp_draft_q4(false);
+                            drv.restore(snap);
+                            const FreeRun fa = mtp_free(drv, gen[0], gen_n, nv, std::stoll(free_alt.substr(x + 1)),
+                                                        std::stod(free_alt.substr(0, x)));
+                            ses.set_mtp_draft_q4(draft_q4);
+                            int64_t da = -1;
+                            for (int64_t t = 0; t < gen_n && da < 0; ++t)
+                                if (fa.seq[(size_t)t] != fr[0].seq[(size_t)t]) da = t;
+                            J << ",\"alt\":{\"policy\":\"" << free_alt << "\",\"first_divergence_vs_q8\":" << da;
+                            if (da >= 0) J << ",\"q8_gap\":" << fr[0].gap[(size_t)da] << ",\"alt_gap\":" << fa.gap[(size_t)da];
+                            J << "}";
+                            std::fprintf(stderr, "tp_ar: depth %lld: free-running MTP Q8 %s vs Q8 main policy: first divergence %lld\n",
+                                         (long long)D, free_alt.c_str(), (long long)da);
+                        }
                         J << "}";
                         std::fprintf(stderr, "tp_ar: depth %lld: free-running MTP Q8 vs Q4 draft head: %s (first divergence %lld, %lld/%lld equal)\n",
                                      (long long)D, d < 0 ? "identical" : "DIFFERENT", (long long)d, (long long)same, (long long)gen_n);
