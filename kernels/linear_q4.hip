@@ -237,10 +237,11 @@ __global__ void __launch_bounds__(kThreads)
 // Combine: y[m, :] = sum_a coef[m, a] * h[m, a, :] * W[ids[m, a]]^T - one
 // output row is a single A*K-long reduction; lanes walk its chunks flattened
 // across experts, so short expert rows (K=640 is 20 chunks) still fill a wave.
-template <typename T, int G, int HB>
+// TY: the output dtype - T, or FP32 from BF16 h (a TP rank's unrounded expert partials, strixite-tp2 f32moe).
+template <typename T, int G, int HB, typename TY = T>
 __global__ void __launch_bounds__(kThreads)
     linear_q4_experts_combine_kernel(const T *h, const uint8_t *q, const uint16_t *scale, const uint16_t *minv,
-                                     const int32_t *ids, const float *coef, int64_t E, int64_t A, T *y, int64_t N,
+                                     const int32_t *ids, const float *coef, int64_t E, int64_t A, TY *y, int64_t N,
                                      int64_t K, int KS, uint32_t *err) {
     __shared__ float part[kThreads / 32];
     const int lane = threadIdx.x % warpSize, wave = threadIdx.x / warpSize, ks = wave % KS;
@@ -352,6 +353,25 @@ void launch_experts(const T *x, const Q4DeviceView &w, int64_t E, const int32_t 
 #undef STRIX_Q4_EXPERTS
 }
 
+// The combine from BF16 h into FP32 y: launch_experts' combine with the output left unrounded.
+template <int HB>
+void launch_experts_combine_f32(const uint16_t *h, const Q4DeviceView &w, int64_t E, const int32_t *ids,
+                                const float *coef, int64_t M, int64_t A, float *y, uint32_t *err, hipStream_t stream) {
+    const int64_t N = w.N / E;
+    const int KS = split_k(w.K);
+    const int waves = kThreads / device_warp_size();
+    STRIX_CHECK(waves % KS == 0, "linear_q4 experts: split-K factor ", KS, " must divide the ", waves, " waves");
+    const int64_t rows_per_block = waves / KS;
+    const unsigned bx = (unsigned)((N + rows_per_block - 1) / rows_per_block);
+    dim3 grid(bx, (unsigned)M), block(kThreads);
+    switch (w.G) {
+        case 32: linear_q4_experts_combine_kernel<uint16_t, 32, HB, float><<<grid, block, 0, stream>>>(h, w.q, w.scale, w.minv, ids, coef, E, A, y, N, w.K, KS, err); break;
+        case 64: linear_q4_experts_combine_kernel<uint16_t, 64, HB, float><<<grid, block, 0, stream>>>(h, w.q, w.scale, w.minv, ids, coef, E, A, y, N, w.K, KS, err); break;
+        case 128: linear_q4_experts_combine_kernel<uint16_t, 128, HB, float><<<grid, block, 0, stream>>>(h, w.q, w.scale, w.minv, ids, coef, E, A, y, N, w.K, KS, err); break;
+        default: STRIX_FAIL("linear_q4 experts: group size ", w.G, " unsupported (32, 64 or 128)");
+    }
+}
+
 void check_weight_view(const char *fn, const Q4DeviceView &w) {
     STRIX_CHECK(w.q != nullptr && w.scale != nullptr && w.minv != nullptr, fn, ": null weight pointer (q=",
                 (const void *)w.q, ", scale=", w.scale, ", min=", w.minv, ")");
@@ -374,7 +394,7 @@ void check_no_overlap(const char *fn, const void *in, int64_t in_bytes, const vo
 // swiglu (gathers only): W holds [gate | up] rows per expert and y gets h = silu(gate) * up, [M, A, N/2].
 void linear_q4_experts(const char *fn, const void *x, const Q4DeviceView &w, int64_t E, const int32_t *ids,
                        const float *coef, int64_t M, int64_t A, void *y, Act act, uint32_t *err, hipStream_t stream,
-                       int hb = 0, bool swiglu = false) {
+                       int hb = 0, bool swiglu = false, bool f32_out = false) {
     STRIX_CHECK(x != nullptr && y != nullptr && ids != nullptr && err != nullptr, fn, ": null pointer (x=", x,
                 ", y=", y, ", ids=", (const void *)ids, ", err=", (const void *)err, ")");
     check_weight_view(fn, w);
@@ -391,9 +411,16 @@ void linear_q4_experts(const char *fn, const void *x, const Q4DeviceView &w, int
     STRIX_CHECK(!(swiglu && combine), fn, ": the SwiGLU epilogue is for gathers only");
     STRIX_CHECK(!swiglu || N % 2 == 0, fn, ": SwiGLU gather needs an even row count per expert ([gate | up]), got ",
                 N);
-    check_no_overlap(fn, x, (combine ? M * A : M) * w.K * es, y, (combine ? M : M * A) * (swiglu ? N / 2 : N) * es);
+    STRIX_CHECK(!f32_out || (combine && act == Act::BF16), fn, ": FP32 output is for a combine from BF16 only");
+    check_no_overlap(fn, x, (combine ? M * A : M) * w.K * es, y,
+                     (combine ? M : M * A) * (swiglu ? N / 2 : N) * (f32_out ? 4 : es));
     auto go = [&](auto hbc) {
         constexpr int HB = decltype(hbc)::value;
+        if (f32_out) {
+            launch_experts_combine_f32<HB>(static_cast<const uint16_t *>(x), w, E, ids, coef, M, A,
+                                           static_cast<float *>(y), err, stream);
+            return;
+        }
         if (act == Act::F32)
             launch_experts<float, HB>(static_cast<const float *>(x), w, E, ids, coef, M, A, static_cast<float *>(y),
                                       err, stream, swiglu);
@@ -472,6 +499,22 @@ void linear_q5_experts_gather(const void *x, const Q5DeviceView &w, int64_t E, c
                               int64_t A, void *y, Act act, uint32_t *err, hipStream_t stream) {
     linear_q4_experts("linear_q5_experts_gather", x, {w.q, w.scale, w.minv, w.N, w.K, w.G}, E, ids, nullptr, M, A, y,
                       act, err, stream, 1);
+}
+
+void linear_q4_experts_combine_f32(const void *h, const Q4DeviceView &w, int64_t E, const int32_t *ids,
+                                   const float *coef, int64_t M, int64_t A, float *y, uint32_t *err,
+                                   hipStream_t stream) {
+    STRIX_CHECK(coef != nullptr, "linear_q4_experts_combine_f32: null coef");
+    linear_q4_experts("linear_q4_experts_combine_f32", h, w, E, ids, coef, M, A, y, Act::BF16, err, stream, 0, false,
+                      true);
+}
+
+void linear_q5_experts_combine_f32(const void *h, const Q5DeviceView &w, int64_t E, const int32_t *ids,
+                                   const float *coef, int64_t M, int64_t A, float *y, uint32_t *err,
+                                   hipStream_t stream) {
+    STRIX_CHECK(coef != nullptr, "linear_q5_experts_combine_f32: null coef");
+    linear_q4_experts("linear_q5_experts_combine_f32", h, {w.q, w.scale, w.minv, w.N, w.K, w.G}, E, ids, coef, M, A,
+                      y, Act::BF16, err, stream, 1, false, true);
 }
 
 void linear_q5_experts_combine(const void *h, const Q5DeviceView &w, int64_t E, const int32_t *ids,

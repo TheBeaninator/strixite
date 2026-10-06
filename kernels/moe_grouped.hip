@@ -638,14 +638,15 @@ void experts_gather_grouped(const char *fn, const void *x, const Q4DeviceView &w
 template <int HB>
 void experts_combine_grouped(const char *fn, const void *h, const Q4DeviceView &w, int64_t E, const int32_t *ids,
                              const float *coef, const void *ws, size_t ws_bytes, float *partial, int64_t M, int64_t A,
-                             void *y, Act act, MoeMath math, hipStream_t stream) {
+                             void *y, Act act, MoeMath math, hipStream_t stream, bool f32_out = false) {
     STRIX_CHECK(HB == 0 || w.K % 128 == 0, fn, ": Q5 K = ", w.K, " is not a multiple of 128 (the layout's)");
     check_common(fn, h, w, E, M, A, ws, ws_bytes, y, act);
+    STRIX_CHECK(!f32_out || act == Act::BF16, fn, ": FP32 output is for BF16 activations only");
     STRIX_CHECK(ids != nullptr && coef != nullptr && partial != nullptr, fn, ": null pointer (ids=",
                 (const void *)ids, ", coef=", (const void *)coef, ", partial=", (const void *)partial, ")");
-    const int64_t es = act == Act::F32 ? 4 : 2, N = w.N / E;
-    check_no_overlap(fn, "y", y, M * N * es, "h", h, M * A * w.K * es);
-    check_no_overlap(fn, "y", y, M * N * es, "partial", partial, M * A * N * 4);
+    const int64_t es = act == Act::F32 ? 4 : 2, N = w.N / E, yes = f32_out ? 4 : es;
+    check_no_overlap(fn, "y", y, M * N * yes, "h", h, M * A * w.K * es);
+    check_no_overlap(fn, "y", y, M * N * yes, "partial", partial, M * A * N * 4);
     check_no_overlap(fn, "partial", partial, M * A * N * 4, "h", h, M * A * w.K * es);
     const unsigned blocks = (unsigned)((M * N + kThreads - 1) / kThreads);
     const bool pbf16 = math == MoeMath::WmmaF16;  // the F16 kernel writes BF16 partials (put_partial), the others FP32
@@ -655,8 +656,12 @@ void experts_combine_grouped(const char *fn, const void *h, const Q4DeviceView &
                                                                       static_cast<float *>(y), pbf16);
     } else {
         launch_grouped<uint16_t, true, HB>(static_cast<const uint16_t *>(h), w, E, ws, M, A, nullptr, partial, math, stream);
-        combine_reduce_kernel<uint16_t><<<blocks, kThreads, 0, stream>>>(partial, ids, coef, M, A, E, N,
-                                                                         static_cast<uint16_t *>(y), pbf16);
+        if (f32_out)
+            combine_reduce_kernel<float><<<blocks, kThreads, 0, stream>>>(partial, ids, coef, M, A, E, N,
+                                                                          static_cast<float *>(y), pbf16);
+        else
+            combine_reduce_kernel<uint16_t><<<blocks, kThreads, 0, stream>>>(partial, ids, coef, M, A, E, N,
+                                                                             static_cast<uint16_t *>(y), pbf16);
     }
     STRIX_HIP_CHECK_LAUNCH(fn, " ", act_name(act), math == MoeMath::WmmaBf16 ? " wmma" : math == MoeMath::WmmaF16 ? " wmma-f16" : "", " M=", M, " A=", A, " E=",
                            E, " N=", N, " K=", w.K, " G=", w.G);
@@ -682,6 +687,20 @@ void linear_q5_experts_gather_grouped(const void *x, const Q5DeviceView &w, int6
                                       hipStream_t stream) {
     experts_gather_grouped<1>("linear_q5_experts_gather_grouped", x, {w.q, w.scale, w.minv, w.N, w.K, w.G}, E, ws,
                               ws_bytes, M, A, y, act, math, stream);
+}
+
+void linear_q4_experts_combine_grouped_f32(const void *h, const Q4DeviceView &w, int64_t E, const int32_t *ids,
+                                           const float *coef, const void *ws, size_t ws_bytes, float *partial,
+                                           int64_t M, int64_t A, float *y, MoeMath math, hipStream_t stream) {
+    experts_combine_grouped<0>("linear_q4_experts_combine_grouped_f32", h, w, E, ids, coef, ws, ws_bytes, partial, M,
+                               A, y, Act::BF16, math, stream, true);
+}
+
+void linear_q5_experts_combine_grouped_f32(const void *h, const Q5DeviceView &w, int64_t E, const int32_t *ids,
+                                           const float *coef, const void *ws, size_t ws_bytes, float *partial,
+                                           int64_t M, int64_t A, float *y, MoeMath math, hipStream_t stream) {
+    experts_combine_grouped<1>("linear_q5_experts_combine_grouped_f32", h, {w.q, w.scale, w.minv, w.N, w.K, w.G}, E,
+                               ids, coef, ws, ws_bytes, partial, M, A, y, Act::BF16, math, stream, true);
 }
 
 void linear_q5_experts_combine_grouped(const void *h, const Q5DeviceView &w, int64_t E, const int32_t *ids,

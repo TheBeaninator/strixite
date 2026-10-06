@@ -100,6 +100,25 @@ inline void linear_qw_experts_combine(const void *h, const QWeightView &w, int64
         default: STRIX_FAIL("linear_qw_experts_combine: experts have ", w.bits, " bits, expected 4 or 5");
     }
 }
+inline void linear_qw_experts_combine_f32(const void *h, const QWeightView &w, int64_t E, const int32_t *ids,
+                                          const float *coef, int64_t M, int64_t A, float *y, uint32_t *err,
+                                          hipStream_t stream) {
+    switch (w.bits) {
+        case 4: linear_q4_experts_combine_f32(h, w.q4, E, ids, coef, M, A, y, err, stream); return;
+        case 5: linear_q5_experts_combine_f32(h, w.q5, E, ids, coef, M, A, y, err, stream); return;
+        default: STRIX_FAIL("linear_qw_experts_combine_f32: experts have ", w.bits, " bits, expected 4 or 5");
+    }
+}
+inline void linear_qw_experts_combine_grouped_f32(const void *h, const QWeightView &w, int64_t E,
+                                                  const int32_t *ids, const float *coef, const void *ws,
+                                                  size_t ws_bytes, float *partial, int64_t M, int64_t A, float *y,
+                                                  MoeMath math, hipStream_t stream) {
+    switch (w.bits) {
+        case 4: linear_q4_experts_combine_grouped_f32(h, w.q4, E, ids, coef, ws, ws_bytes, partial, M, A, y, math, stream); return;
+        case 5: linear_q5_experts_combine_grouped_f32(h, w.q5, E, ids, coef, ws, ws_bytes, partial, M, A, y, math, stream); return;
+        default: STRIX_FAIL("linear_qw_experts_combine_grouped_f32: experts have ", w.bits, " bits, expected 4 or 5");
+    }
+}
 inline void linear_qw_experts_gather_grouped(const void *x, const QWeightView &w, int64_t E, const void *ws,
                                              size_t ws_bytes, int64_t M, int64_t A, void *y, Act act, MoeMath math,
                                              hipStream_t stream) {

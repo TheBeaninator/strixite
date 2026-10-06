@@ -403,6 +403,9 @@ public:
     // unrounded accumulators) and rounded once after the sum - the whole model's arithmetic up to summation order -
     // instead of BF16 partials. The MoE partials stay BF16 (their kernels write the activation dtype). Default off.
     void set_tp_f32_mixer(bool on);
+    // FP32 MoE partials (strixite-tp2 f32moe): the routed experts' combine, the shared expert's down projection and
+    // its gated add stay FP32 on each rank; the exchange (kind 3, as the mixer's) sums them and rounds once.
+    void set_tp_f32_moe(bool on);
     // Bench knob (tools/strix_bench): with MTP on, skip the MTP layer's catch-up in forward() (its K / V rows for the
     // forwarded positions) - a plain AR forward's cost. The MTP state is then stale past the position it was paused
     // at: restore a snapshot from before before drafting again.
@@ -437,7 +440,9 @@ private:
     Exchange exchange_;
     int64_t exchanges_ = 0;
     bool tp_f32_mixer_ = false;
-    DeviceBuffer<float> y32_;  // set_tp_f32_mixer: the mixer's FP32 partials [max_tokens, d]
+    DeviceBuffer<float> y32_;  // set_tp_f32_mixer / _moe: the FP32 partials [max_tokens, d]
+    bool tp_f32_moe_ = false;
+    DeviceBuffer<float> sh_y32_;  // set_tp_f32_moe: the shared expert's FP32 output [max_tokens, d]
     int mtp_tail_cur_ = 0;
     int64_t mtp_vocab_ = 0;  // set to the vocabulary by the constructor
     bool mtp_draft_q4_ = true;

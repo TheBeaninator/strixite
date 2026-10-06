@@ -61,6 +61,14 @@ void linear_q4_experts_combine_grouped(const void *h, const Q4DeviceView &w, int
                                        const float *coef, const void *ws, size_t ws_bytes, float *partial, int64_t M,
                                        int64_t A, void *y, Act act, MoeMath math, hipStream_t stream);
 
+// The same from BF16 h into FP32 y, unrounded (a TP rank's expert partials, summed across ranks in FP32).
+void linear_q4_experts_combine_grouped_f32(const void *h, const Q4DeviceView &w, int64_t E, const int32_t *ids,
+                                           const float *coef, const void *ws, size_t ws_bytes, float *partial,
+                                           int64_t M, int64_t A, float *y, MoeMath math, hipStream_t stream);
+void linear_q5_experts_combine_grouped_f32(const void *h, const Q5DeviceView &w, int64_t E, const int32_t *ids,
+                                           const float *coef, const void *ws, size_t ws_bytes, float *partial,
+                                           int64_t M, int64_t A, float *y, MoeMath math, hipStream_t stream);
+
 // The same with Q5 experts (formats/q5.hpp rows, K % 128 == 0) - one kernel template with the Q4 ones.
 void linear_q5_experts_gather_grouped(const void *x, const Q5DeviceView &w, int64_t E, const void *ws,
                                       size_t ws_bytes, int64_t M, int64_t A, void *y, Act act, MoeMath math,
