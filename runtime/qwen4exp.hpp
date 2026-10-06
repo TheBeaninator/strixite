@@ -155,6 +155,13 @@ public:
     // trunk's lm_head() is its first lm_rows), the vocabulary at world 1.
     const QWeightView &draft_head() const { return draft_head_; }
     int64_t draft_rows() const { return draft_head_.N(); }
+    // PF-5: a Q4 copy (group G: 32 / 64 / 128) of draft_head()'s first rows, re-quantized once from the loaded
+    // weights (a Q8 head is dequantized exactly, then quantized as formats/q4 quantize_q4; a Q4 head is aliased). Used
+    // only by the draft (Qwen4ExpSession::set_mtp_draft_q4): the trunk's lm_head() never changes, and every drafted
+    // token is still decided by the trunk's verify, so outputs move only where a different draft changes the verify's
+    // rows. 65,536 rows at G = 64: 178 -> 94 MB per draft call. Call before any session drafts with it.
+    void make_draft_head_q4(int64_t rows, int64_t G = 64);
+    const QWeightView &draft_head_q4() const { return draft_head_q4_; }  // bits == 0 until made
 
 private:
     Qwen4ExpDims dims_, mtp_dims_;
@@ -164,7 +171,8 @@ private:
     std::vector<Layer> layers_;
     const uint16_t *embed_ = nullptr;
     Q8DeviceView embed_q8_{};
-    QWeightView lm_head_, draft_head_;
+    QWeightView lm_head_, draft_head_, draft_head_q4_;
+    std::unique_ptr<Q4Device> draft_q4_;
     bool truncated_ = false, shared_separate_ = false, has_mtp_ = false;
     MtpHead mtp_;
     Hc final_;
@@ -339,6 +347,10 @@ public:
     // by frequency) and returns n logits. Default: the whole vocabulary. 1..vocab.
     // n <= model().draft_rows() (under tensor parallelism: the LM head rows rank 0 holds).
     void set_mtp_vocab(int64_t n);
+    // PF-5: draft over the model's Q4 copy of the draft head (Qwen4ExpModel::make_draft_head_q4; it must cover
+    // mtp_vocab() rows) instead of the head as loaded. Off by default; switchable between calls (A/B in one process).
+    void set_mtp_draft_q4(bool on);
+    bool mtp_draft_q4() const { return mtp_draft_q4_; }
     int64_t mtp_vocab() const { return mtp_vocab_; }
     // ST-3 test hooks. debug_mtp_feed: the MTP catch-up for ids at pos().. from the given trunk streams X [T, H * d]
     // (activation dtype, host) instead of a trunk forward - pos() advances by T, mtp_prev_ = X's last row; the trunk's
@@ -406,6 +418,7 @@ private:
     DeviceBuffer<float> y32_;  // set_tp_f32_mixer: the mixer's FP32 partials [max_tokens, d]
     int mtp_tail_cur_ = 0;
     int64_t mtp_vocab_ = 0;  // set to the vocabulary by the constructor
+    bool mtp_draft_q4_ = false;
     DeviceBuffer<uint8_t> mtp_emb_, mtp_norm_emb_, mtp_norm_hid_, mtp_proj_emb_, mtp_x_, mtp_prev_;
     DeviceBuffer<uint8_t> k_cache_mtp_, v_cache_mtp_, block_keys_mtp_, tail_mtp_[2];
     DeviceBuffer<float> mtp_ones_;

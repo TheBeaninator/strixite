@@ -105,7 +105,7 @@ int run(int argc, char **argv) {
     cfg.defaults = sampling_defaults(gen_config);
     const Tokenizer tok(tokenizer);
     slog(LogLevel::Info, "startup: tokenizer %s (%d tokens)", tokenizer.c_str(), tok.size());
-    const Qwen4ExpModel model(weights, ngram, kernels::Act::BF16, /*allow_truncated=*/false, ngram_cache_rows,
+    Qwen4ExpModel model(weights, ngram, kernels::Act::BF16, /*allow_truncated=*/false, ngram_cache_rows,
                               yarn_factor);
     if (yarn_factor > 1.0f)
         slog(LogLevel::Info, "startup: YaRN factor %g: %lld positions (%lld trained), cos/sin factor %.4f",
@@ -114,6 +114,12 @@ int run(int argc, char **argv) {
     slog(LogLevel::Info, "startup: %.1f GiB of weights loaded in %.1f s",
                  (double)model.weights().data_bytes() / (1ull << 30), model.weights().load_seconds());
     Qwen4ExpBackend backend(model, capacity, chunk, use_mtp, mtp_vocab);
+    if (use_mtp && settings.on("mtp-draft-q4") && backend.has_mtp()) {
+        model.make_draft_head_q4(backend.session().mtp_vocab());
+        backend.session().set_mtp_draft_q4(true);
+        slog(LogLevel::Info, "startup: MTP drafts over a Q4 copy of the first %lld LM head rows (PF-5)",
+             (long long)model.draft_head_q4().N());
+    }
     std::unique_ptr<PromptCache> cache;
     if (cache_gib > 0) {
         cache = std::make_unique<PromptCache>(cache_dir, (uint64_t)cache_gib << 30, backend.state_fingerprint(), cache_opts);
