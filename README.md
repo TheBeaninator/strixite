@@ -25,6 +25,12 @@ measured in real agentic coding sessions, not a synthetic benchmark.
 > [How strixite got fast](docs/how-it-got-fast.md) explains it in five simple ideas - smaller handwriting, guessing
 > ahead, and not reading the same book twice - then goes as deep as you want to follow.
 
+> [!NOTE]
+> **This is a fork.** It adds tensor parallelism across 2 or 4 Strix Halo machines over 100 GbE RDMA (RoCE v2): up to
+> 1.77x plain and 1.73x MTP decode speed on four machines, about 109 tokens/s with MTP at 64k context. See
+> [docs/tp-rdma.md](docs/tp-rdma.md). The single-machine engine is unchanged. Upstream:
+> [shawnshekari/strixite](https://github.com/shawnshekari/strixite).
+
 ## What it is
 
 strixite is an LLM inference engine I wrote from scratch in HIP for exactly one chip and one model:
