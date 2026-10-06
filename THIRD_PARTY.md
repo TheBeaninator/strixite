@@ -72,3 +72,7 @@ checkpoint.
 
 Not shipped here; each is installed by whoever builds strixite, under its own license: AMD's ROCm (TheRock) toolchain
 and HIP runtime, CMake, Ninja, and a GCC C++ standard library.
+
+Optional, for the tensor-parallel tools of this fork only (`-DSTRIX_TP_RDMA`, on by default when found):
+libibverbs from rdma-core (dual-licensed GPL-2.0 / BSD-2-Clause), linked dynamically by `tp_exchange_bench`,
+`strix_tp` and `tp_ar`. It is not distributed here, and the engine and the server do not link it.
