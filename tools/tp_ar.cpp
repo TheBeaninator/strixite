@@ -36,6 +36,7 @@
 
 #include "common/check.hpp"
 #include "common/hip_check.hpp"
+#include "formats/strixw.hpp"  // strix_hash64
 #include "kernels/linear_q8.hpp"
 #include "kernels/logits_topk.hpp"
 #include "runtime/qwen4exp.hpp"
@@ -222,6 +223,77 @@ MtpRun mtp_loop(TpDriver &drv, const std::vector<int32_t> &gen, int64_t n_valid,
     return r;
 }
 
+// Per-row hashes of a forward's L<i>.out rows (every layer, combined): rank 0's local probe (TpDriver::set_probe) -
+// the cross-run row-hash check (design 3.2 check 4).
+struct RowHashes {
+    std::vector<uint64_t> h;  // [rows] of the last forward
+    std::vector<uint8_t> host;
+    Qwen4ExpProbe probe() {
+        return [this](const std::string &name, const void *dev, int64_t rows, int64_t cols, ProbeType type) {
+            if (rows > Qwen4ExpSession::kMaxLogits) return;  // prefill chunks: not compared
+            if (name.size() < 5 || name[0] != 'L' || name.compare(name.size() - 4, 4, ".out") != 0) return;
+            if (name == "L0.out") h.assign((size_t)rows, 0x9e3779b97f4a7c15ull);
+            const size_t rb = (size_t)cols * (type == ProbeType::BF16 ? 2 : 4);
+            host.resize(rb * (size_t)rows);
+            STRIX_HIP_CHECK(hipMemcpy(host.data(), dev, host.size(), hipMemcpyDeviceToHost), "row hash probe");
+            for (int64_t r = 0; r < rows && (size_t)r < h.size(); ++r) {
+                const uint64_t x = strix_hash64(host.data() + (size_t)r * rb, rb);
+                h[(size_t)r] = (h[(size_t)r] ^ x) * 0x100000001b3ull + (x >> 29);
+            }
+        };
+    }
+};
+
+double cand_gap(const Qwen4ExpSession::Candidates &c, int64_t row) {
+    const kernels::LogitCand *x = c.cand.data() + row * kernels::kLogitCands;
+    return (double)x[0].v - (double)x[1].v;
+}
+
+// Free-running greedy decode with MTP, as the engine runs it at temperature 0 (drafts accepted while they equal the
+// verify rows' greedy picks; PF-1: the first rejected row's pick is the next step's known token). From the state
+// before `first` (known, not yet forwarded): n tokens (first included) and, per token t >= 1, the top-2 gap of the
+// row that chose it.
+struct FreeRun {
+    std::vector<int32_t> seq;
+    std::vector<double> gap;
+};
+FreeRun mtp_free(TpDriver &drv, int32_t first, int64_t n, int64_t n_valid, int64_t draft, double margin) {
+    FreeRun f;
+    f.seq.push_back(first), f.gap.push_back(0);
+    while ((int64_t)f.seq.size() < n) {
+        std::vector<int32_t> ids{f.seq.back()};
+        const int64_t left = n - (int64_t)f.seq.size();
+        const int64_t nsteps = std::min(draft, left - 1);
+        if (nsteps > 0) drv.prefetch_ple(ids, 0);
+        for (int64_t s = 0; s < nsteps; ++s) {
+            const Qwen4ExpSession::MtpTop2 t = drv.forward_mtp_top2(ids.back(), s);
+            if (t.nan || t.best_v - t.second_v < margin) break;
+            ids.push_back(t.best);
+            if (s + 1 < nsteps) drv.prefetch_ple(ids, (int64_t)ids.size() - 1);
+        }
+        const int64_t k = (int64_t)ids.size() - 1;
+        drv.want_candidates(n_valid);
+        if (k == 0) {
+            drv.forward(ids, 1);
+            const Qwen4ExpSession::Candidates &c = drv.candidates();
+            f.seq.push_back(c.cand[0].id), f.gap.push_back(cand_gap(c, 0));
+            continue;
+        }
+        drv.forward_verify(ids, k + 1);
+        const Qwen4ExpSession::Candidates c = drv.candidates();
+        int64_t j = 0;
+        while (j < k && ids[(size_t)j + 1] == c.cand[(size_t)(j * kernels::kLogitCands)].id) {
+            f.seq.push_back(ids[(size_t)j + 1]), f.gap.push_back(cand_gap(c, j));
+            ++j;
+        }
+        f.seq.push_back(c.cand[(size_t)(j * kernels::kLogitCands)].id), f.gap.push_back(cand_gap(c, j));
+        if (j == k) drv.keep_verify();
+        else drv.keep_verify_prefix(j + 1);
+    }
+    f.seq.resize((size_t)n), f.gap.resize((size_t)n);
+    return f;
+}
+
 std::string mtp_json(const MtpRun &r, int64_t G, double exch_per_token) {
     std::ostringstream o;
     o << "{\"gen_n\":" << G << ",\"decode_ms\":" << r.decode_ms << ",\"tps\":" << (double)G / r.decode_ms * 1000
@@ -354,6 +426,8 @@ int main(int argc, char **argv) {
             const double p_drop = a.real("shadow-p-drop", 0.08), p_restore = a.real("shadow-p-restore", 0.04),
                          p_fail = a.real("shadow-p-fail", 0.006);
             const int64_t max_fail = a.num("shadow-max-fail", 3);
+            const bool plant = a.num("shadow-plant", 0) != 0;  // negative control: one mis-mirrored keep_verify_prefix
+            if (plant) drv.debug_plant_prefix_bug();
             std::map<std::string, int64_t> cases;
             std::vector<int32_t> seq(corpus.begin(), corpus.begin() + P);  // every token the state has run so far
             auto prefill = [&](int64_t n) {  // reset, then the state after seq[0, n) by chunked forwards
@@ -481,6 +555,8 @@ int main(int argc, char **argv) {
             S << "{\"tool\":\"tp_ar\",\"mode\":\"shadow\",\"weights\":\"" << weights << "\",\"prefix\":" << P
               << ",\"tokens\":" << done << ",\"rounds\":" << round << ",\"gen_per_round\":" << G << ",\"mtp_draft\":" << mtp_draft
               << ",\"mtp_margin\":" << margin << ",\"mtp_vocab\":" << mtp_vocab
+              << ",\"planted_bug\":" << (plant ? "true" : "false")
+              << ",\"planted_caught\":" << (plant && (hs.mismatched > 0 || hs.state_mismatched > 0) ? "true" : "false")
               << ",\"forwards\":" << hs.forwards << ",\"verify_forwards\":" << hs.verify_forwards << ",\"compared\":" << hs.compared
               << ",\"mismatched\":" << hs.mismatched << ",\"verify_mismatched\":" << hs.verify_mismatched
               << ",\"x_compared\":" << hs.x_compared << ",\"first_mismatch\":\"" << esc(hs.first_mismatch)
@@ -499,7 +575,7 @@ int main(int argc, char **argv) {
             o << S.str();
             std::fprintf(stderr, "tp_ar: shadow: %lld forwards, %lld mismatched, %lld state mismatched; wrote %s\n",
                          (long long)hs.forwards, (long long)hs.mismatched, (long long)hs.state_mismatched, out.c_str());
-            return exe_err.empty() ? 0 : 1;
+            return exe_err.empty() || plant ? 0 : 1;
         }
 
         TpDriver drv(ses, comm.get());
@@ -573,7 +649,17 @@ int main(int argc, char **argv) {
             std::vector<double> kls;
             int64_t agree = 0;
             double nll = 0, nll_g = 0;
+            // ST-3 check 4: rank 0's per-position L<i>.out row hashes of this AR pass, for the MTP pass below
+            const bool mtp_q = use_mtp && drv.has_mtp() && a.num("mtp-quality", 1) != 0;
+            RowHashes rhp;
+            std::vector<uint64_t> ar_rows;
+            if (mtp_q)
+                drv.set_probe([&, p = rhp.probe()](const std::string &n, const void *d, int64_t r, int64_t c, ProbeType t) {
+                    p(n, d, r, c, t);
+                    if (r == 1 && n == "L" + std::to_string(Dm.layers - 1) + ".out") ar_rows.push_back(rhp.h.at(0));
+                });
             pass(true, kls, agree, nll, nll_g);
+            drv.set_probe(nullptr);
             if (gout && gout != stdout) std::fclose(gout);
             if (gout == stdout) std::fflush(stdout);
             if (gin) std::fclose(gin);
@@ -635,6 +721,132 @@ int main(int argc, char **argv) {
                   << ",\"first\":\"" << esc(first_bad) << "\"}";
                 std::fprintf(stderr, "tp_ar: candidate check: %lld / %lld mismatched\n", (long long)bad, (long long)cand_check);
             }
+            if (mtp_q) {
+                // ST-3 check 5 (+ 4): the same 5120 positions teacher-forced through the MTP loop (PF-1 / reject path as
+                // set): every position gets exactly one logits row - a verify row (row 0: the step's known token; rows
+                // >= 1: accepted drafts) or a single forward - scored against the goldens; each row's L<i>.out hash
+                // compared with the AR pass's at the same position (a rate: verify rows are not bit-equal, step 0).
+                FILE *g2 = golden_in.empty() ? nullptr : std::fopen(golden_in.c_str(), "rb");
+                drv.clear_hash_stats();
+                drv.set_hash_check(hash && world > 1);
+                drv.reset();
+                for (int64_t p = 0; p < kl_prefix; p += chunk)
+                    drv.forward(std::vector<int32_t>(kt.begin() + p, kt.begin() + std::min(kl_prefix, p + chunk)), 0);
+                RowHashes mh;
+                drv.set_probe(mh.probe());
+                struct Acc {
+                    int64_t n = 0, agree = 0, hash_eq = 0;
+                    double kl = 0, nll = 0;
+                };
+                std::map<std::string, Acc> by;  // "verify_row0", "verify_draft_rows", "single"
+                std::vector<double> mkls;
+                std::vector<float> g((size_t)V);
+                const std::vector<int32_t> seq(kt.begin() + kl_prefix, kt.begin() + kl_prefix + kl_n);
+                int64_t steps = 0, verifies = 0;
+                const double q0 = now_ms();
+                auto score = [&](const float *l, int64_t posn, const char *type) {
+                    const int32_t nxt = kt[(size_t)(kl_prefix + posn + 1)];
+                    Acc &A = by[type];
+                    ++A.n;
+                    A.nll += lse(l, nv) - (double)l[(size_t)nxt];
+                    if (g2) {
+                        STRIX_CHECK(std::fread(g.data(), 4, (size_t)V, g2) == (size_t)V, "tp_ar: golden row ", posn, " short");
+                        const double k = kl_rows(g.data(), l, nv);
+                        mkls.push_back(k);
+                        A.kl += k;
+                        A.agree += argmax(g.data(), nv) == argmax(l, nv);
+                    }
+                };
+                int64_t next_pos = 0;
+                for (int64_t i = 0; i < kl_n;) {
+                    std::vector<int32_t> ids{seq[(size_t)i]};
+                    const int64_t nsteps = std::min(mtp_draft, kl_n - 1 - i);
+                    if (nsteps > 0) drv.prefetch_ple(ids, 0);
+                    for (int64_t st = 0; st < nsteps; ++st) {
+                        const Qwen4ExpSession::MtpTop2 t = drv.forward_mtp_top2(ids.back(), st);
+                        if (t.nan || t.best_v - t.second_v < margin) break;
+                        ids.push_back(t.best);
+                        if (st + 1 < nsteps) drv.prefetch_ple(ids, (int64_t)ids.size() - 1);
+                    }
+                    const int64_t k = (int64_t)ids.size() - 1;
+                    ++steps;
+                    if (k == 0) {
+                        const std::vector<float> l = drv.forward(ids, 1, true);
+                        STRIX_CHECK(next_pos == i, "tp_ar: MTP quality: position ", i, " after ", next_pos);
+                        score(l.data(), i, "single");
+                        by["single"].hash_eq += mh.h.at(0) == ar_rows.at((size_t)i);
+                        ++next_pos, i += 1;
+                        continue;
+                    }
+                    const std::vector<float> l = drv.forward_verify(ids, k + 1, true);
+                    ++verifies;
+                    const std::vector<uint64_t> rh = mh.h;
+                    int64_t j = 0;
+                    while (j < k && ids[(size_t)j + 1] == seq[(size_t)(i + 1 + j)]) ++j;
+                    for (int64_t r = 0; r <= j; ++r) {  // rows 0..j are positions i..i+j
+                        const char *type = r == 0 ? "verify_row0" : "verify_draft_rows";
+                        STRIX_CHECK(next_pos == i + r, "tp_ar: MTP quality: position ", i + r, " after ", next_pos);
+                        score(l.data() + (size_t)(r * V), i + r, type);
+                        by[type].hash_eq += rh.at((size_t)r) == ar_rows.at((size_t)(i + r));
+                        ++next_pos;
+                    }
+                    if (j == k) {
+                        drv.keep_verify();
+                        i += k + 1;
+                        continue;
+                    }
+                    drv.keep_verify_prefix(j + 1);
+                    const int64_t v = i + j + 1;
+                    if (reject_forward) {
+                        const std::vector<float> l1 = drv.forward({seq[(size_t)v]}, 1, true);
+                        STRIX_CHECK(next_pos == v, "tp_ar: MTP quality: position ", v, " after ", next_pos);
+                        score(l1.data(), v, "single");
+                        by["single"].hash_eq += mh.h.at(0) == ar_rows.at((size_t)v);
+                        ++next_pos;
+                        i = v + 1;
+                    } else {
+                        i = v;
+                    }
+                    if (next_pos / 512 != (next_pos - j - 1) / 512)
+                        std::fprintf(stderr, "tp_ar: MTP quality: %lld / %lld positions (%.1f s)\n", (long long)next_pos,
+                                     (long long)kl_n, (now_ms() - q0) / 1000);
+                }
+                drv.set_probe(nullptr);
+                drv.set_hash_check(false);
+                if (g2) std::fclose(g2);
+                const TpDriver::HashStats qh = drv.hash_stats();
+                Acc all;
+                for (auto &[k, A] : by) all.n += A.n, all.agree += A.agree, all.hash_eq += A.hash_eq, all.kl += A.kl, all.nll += A.nll;
+                J << ",\"quality_mtp\":{\"positions\":" << all.n << ",\"steps\":" << steps << ",\"verifies\":" << verifies
+                  << ",\"nll\":" << all.nll / (double)all.n << ",\"ppl\":" << std::exp(all.nll / (double)all.n);
+                if (!mkls.empty())
+                    J << ",\"vs_golden\":{\"golden\":\"" << golden_in << "\",\"kl_mean\":" << all.kl / (double)all.n
+                      << ",\"kl\":" << js(stats(mkls)) << ",\"top1_agree\":" << (double)all.agree / (double)all.n
+                      << ",\"top1_agree_n\":" << all.agree << "}";
+                J << ",\"row_hash\":{\"compared\":" << all.n << ",\"equal\":" << all.hash_eq << ",\"rate\":"
+                  << (double)all.hash_eq / (double)all.n << ",\"what\":\"rank 0's L0..L47.out row hash of each position's row "
+                     "in this pass vs the AR pass's at the same position\"}";
+                J << ",\"by_row_type\":{";
+                bool f = true;
+                for (auto &[k, A] : by) {
+                    J << (f ? "" : ",") << "\"" << k << "\":{\"n\":" << A.n << ",\"ppl\":" << std::exp(A.nll / (double)A.n)
+                      << ",\"row_hash_equal\":" << A.hash_eq;
+                    if (!mkls.empty()) J << ",\"kl_mean\":" << A.kl / (double)A.n << ",\"top1_agree\":" << (double)A.agree / (double)A.n;
+                    J << "}";
+                    f = false;
+                }
+                J << "}";
+                if (world > 1 && hash)
+                    J << ",\"hash\":{\"forwards\":" << qh.forwards << ",\"verify_forwards\":" << qh.verify_forwards
+                      << ",\"compared\":" << qh.compared << ",\"mismatched\":" << qh.mismatched << ",\"x_compared\":" << qh.x_compared
+                      << ",\"x_mismatched\":" << qh.x_mismatched << ",\"first_mismatch\":\"" << esc(qh.first_mismatch)
+                      << "\",\"x_hash_equal\":" << (qh.mismatched == 0 && qh.x_compared > 0 ? "true" : "false") << "}";
+                J << "}";
+                std::fprintf(stderr, "tp_ar: MTP quality: %lld positions, KL %.5f, top-1 %.4f, ppl %.5f, row hashes equal %lld / %lld, hashes mismatched %lld\n",
+                             (long long)all.n, mkls.empty() ? 0.0 : all.kl / (double)all.n,
+                             (double)all.agree / (double)all.n, std::exp(all.nll / (double)all.n), (long long)all.hash_eq,
+                             (long long)all.n, (long long)qh.mismatched);
+            }
             if (noise_k > 0 && world == 1) {
                 kernels::set_split_k_scale(noise_k);
                 std::vector<double> nk;
@@ -655,9 +867,37 @@ int main(int argc, char **argv) {
 
         // ---- speed ----
         if (!depths.empty() && ar_steps > 0) {
-            const std::vector<int32_t> corpus = corpus_ids();
-            STRIX_CHECK((int64_t)corpus.size() > maxD + ar_steps + 64, "tp_ar: corpus has ", corpus.size(), " tokens");
+            std::vector<int32_t> corpus = corpus_ids();
+            STRIX_CHECK((int64_t)corpus.size() > maxD + ar_steps + gen_n + 64, "tp_ar: corpus has ", corpus.size(), " tokens");
             const bool mtp_on = use_mtp && drv.has_mtp();
+            // Needles (strix_bench's): 8 passcodes spliced into [4096, 65536) of a chat turn, asked for at each depth
+            // >= 64k; with MTP on the answer is decoded free-running with drafts.
+            struct Needle {
+                std::string key, code;
+                int64_t at;
+            };
+            std::vector<Needle> needles;
+            if (maxD >= 65536 && a.num("needles", 1) != 0) {
+                const char *colors[] = {"crimson", "amber", "cobalt", "violet", "emerald", "silver", "ochre", "teal"};
+                const char *animals[] = {"heron", "lynx", "otter", "falcon", "badger", "gecko", "marten", "ibis"};
+                const int64_t need = maxD + ar_steps + gen_n + 64;
+                std::vector<int32_t> ctx = tok.encode("<|im_start|>user\n");
+                ctx.insert(ctx.end(), corpus.begin(), corpus.begin() + need);
+                for (int i = 7; i >= 0; --i) {
+                    char code[16];
+                    std::snprintf(code, sizeof code, "%06d", (int)((i * 7919 + 104729) * 37 % 1000000));
+                    Needle n{std::string(colors[i]) + " " + animals[i], code, 4096 + 2000 + i * 7400};
+                    const std::vector<int32_t> sp = tok.encode(" The secret passcode of the " + n.key + " is " + n.code + ". ");
+                    ctx.insert(ctx.begin() + n.at, sp.begin(), sp.end());
+                    needles.insert(needles.begin(), n);
+                }
+                ctx.resize((size_t)need);
+                std::copy(ctx.begin(), ctx.end(), corpus.begin());
+            }
+            const double eps = a.real("near-tie-eps", 1.7155);  // p99 top-2 logit gap (strix_bench --row-invariance)
+            int64_t needles_found_total = 0, needles_asked_total = 0;
+            std::ostringstream divj;
+            int64_t div_runs = 0, div_diverged = 0, div_not_near_tie = 0;
             TpDriver::HashStats vh_total;
             MtpRun mtp_total;
             int64_t mtp_gen_total = 0;
@@ -715,13 +955,62 @@ int main(int argc, char **argv) {
                     // ar_gen: the greedy continuation (gen[0] = the corpus token at D, teacher-forced)
                     drv.restore(snap);
                     std::vector<int32_t> gen{corpus[(size_t)D]};
-                    std::vector<double> gm;
+                    std::vector<double> gm, ar_gap{0};
                     for (int64_t i = 1; i < gen_n; ++i) {
                         drv.want_candidates(nv);
                         const double s0 = now_ms();
                         drv.forward({gen.back()}, 1);
                         gm.push_back(now_ms() - s0);
                         gen.push_back(drv.candidates().cand[0].id);
+                        ar_gap.push_back(cand_gap(drv.candidates(), 0));
+                    }
+                    // check 6: free-running greedy with MTP vs this AR greedy - the first divergence and its top-2 gaps
+                    {
+                        drv.restore(snap);
+                        const FreeRun fr = mtp_free(drv, gen[0], gen_n, nv, mtp_draft, margin);
+                        int64_t d = -1;
+                        for (int64_t t = 0; t < gen_n && d < 0; ++t)
+                            if (fr.seq[(size_t)t] != gen[(size_t)t]) d = t;
+                        ++div_runs;
+                        J << ",\"free_run\":{\"tokens\":" << gen_n << ",\"first_divergence\":" << d;
+                        if (d >= 0) {
+                            const bool near = ar_gap[(size_t)d] < eps;
+                            ++div_diverged, div_not_near_tie += !near;
+                            J << ",\"ar_top2_gap\":" << ar_gap[(size_t)d] << ",\"mtp_top2_gap\":" << fr.gap[(size_t)d]
+                              << ",\"near_tie\":" << (near ? "true" : "false") << ",\"ar_token\":" << gen[(size_t)d]
+                              << ",\"mtp_token\":" << fr.seq[(size_t)d];
+                        }
+                        J << ",\"eps\":" << eps << "}";
+                        divj << (div_runs > 1 ? "," : "") << "\"" << D << "\":{\"first_divergence\":" << d;
+                        if (d >= 0)
+                            divj << ",\"ar_top2_gap\":" << ar_gap[(size_t)d] << ",\"mtp_top2_gap\":" << fr.gap[(size_t)d]
+                                 << ",\"near_tie\":" << (ar_gap[(size_t)d] < eps ? "true" : "false");
+                        divj << "}";
+                        std::fprintf(stderr, "tp_ar: depth %lld: free-running MTP vs AR greedy: first divergence %lld%s\n",
+                                     (long long)D, (long long)d,
+                                     d >= 0 ? cat(" (AR top-2 gap ", ar_gap[(size_t)d], ", MTP ", fr.gap[(size_t)d], ")").c_str() : "");
+                    }
+                    if (!needles.empty() && D >= 65536) {
+                        int found = 0;
+                        J << ",\"needles\":[";
+                        for (size_t ni = 0; ni < needles.size(); ++ni) {
+                            drv.restore(snap);
+                            const std::vector<int32_t> q = tok.encode(
+                                "\n\nQuestion: What is the secret passcode of the " + needles[ni].key +
+                                "?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nThe secret passcode of the " +
+                                needles[ni].key + " is");
+                            drv.want_candidates(nv);
+                            drv.forward(q, 1);
+                            const FreeRun ans = mtp_free(drv, drv.candidates().cand[0].id, 7, nv, mtp_draft, margin);
+                            const std::string at = tok.decode(ans.seq);
+                            const bool ok = at.find(needles[ni].code) != std::string::npos;
+                            found += ok;
+                            J << (ni ? "," : "") << "{\"key\":\"" << needles[ni].key << "\",\"code\":\"" << needles[ni].code
+                              << "\",\"answer\":\"" << esc(at) << "\",\"ok\":" << (ok ? "true" : "false") << "}";
+                        }
+                        J << "],\"needles_found\":" << found << ",\"needles_n\":" << needles.size();
+                        needles_found_total += found, needles_asked_total += (int64_t)needles.size();
+                        std::fprintf(stderr, "tp_ar: depth %lld: needles with MTP %d / %zu\n", (long long)D, found, needles.size());
                     }
                     J << ",\"ar_gen_ms\":" << js(stats(gm)) << ",\"ar_gen_tps\":" << 1000.0 / stats(gm).mean;
                     last_gen = gen;
@@ -779,6 +1068,10 @@ int main(int argc, char **argv) {
                              (long long)D, s.p50, 1000.0 / s.mean, epf, pf / 1000);
             }
             J << "}";
+            if (mtp_on)
+                J << ",\"free_run\":{\"eps\":" << eps << ",\"runs\":" << div_runs << ",\"diverged\":" << div_diverged
+                  << ",\"diverged_not_near_tie\":" << div_not_near_tie << ",\"by_depth\":{" << divj.str() << "}}"
+                  << ",\"needles_found\":" << needles_found_total << ",\"needles_n\":" << needles_asked_total;
             if (mtp_on) {  // over every depth (the per-depth numbers are under speed)
                 J << ",\"mtp\":" << mtp_json(mtp_total, mtp_gen_total, mtp_exch_total / (double)std::max<int64_t>(1, mtp_gen_total));
                 if (hash && world > 1)

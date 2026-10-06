@@ -196,7 +196,18 @@ std::vector<float> TpDriver::run_forward(bool verify, const std::vector<int32_t>
     Hasher hasher;
     std::vector<float> out;
     try {
-        const Qwen4ExpProbe probe = hash_ ? hasher.probe() : Qwen4ExpProbe{};
+        Qwen4ExpProbe probe = hash_ ? hasher.probe() : Qwen4ExpProbe{};
+        if (probe_) {
+            if (probe) {
+                Qwen4ExpProbe a = std::move(probe), b = probe_;
+                probe = [a, b](const std::string &n, const void *d, int64_t r, int64_t c, ProbeType t) {
+                    a(n, d, r, c, t);
+                    b(n, d, r, c, t);
+                };
+            } else {
+                probe = probe_;
+            }
+        }
         out = verify ? ses_.forward_verify(ids, n_logits, probe) : ses_.forward(ids, n_logits, probe);
     } catch (...) {
         if (ctl_) ctl_->poison(verify ? "rank 0's forward_verify failed" : "rank 0's forward failed");
@@ -298,7 +309,9 @@ void TpDriver::keep_verify() {
 
 void TpDriver::keep_verify_prefix(int64_t rows) {
     ++ops_["keep_verify_prefix"];
-    send_all(kKeepVerifyPrefix, rows);
+    const bool plant = plant_ && rows >= 2;
+    if (plant) plant_ = false, ++ops_["planted_bug"];
+    send_all(kKeepVerifyPrefix, plant ? rows - 1 : rows);
     try {
         ses_.keep_verify_prefix(rows);
     } catch (...) {

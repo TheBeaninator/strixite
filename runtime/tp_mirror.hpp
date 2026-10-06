@@ -90,6 +90,11 @@ public:
     void set_hash_check(bool on) { hash_ = on; }
     void set_state_check(bool on) { state_check_ = on; }
     void set_shadow(bool on) { shadow_ = on; }
+    // A local probe on rank 0's forwards / verifies too (alongside the hash check's), e.g. per-row hashes. Not mirrored.
+    void set_probe(Qwen4ExpProbe p) { probe_ = std::move(p); }
+    // Negative control for the shadow test: the next keep_verify_prefix(rows >= 2) tells the executors rows - 1 - a
+    // planted mirror bug the state check must catch. Tests only.
+    void debug_plant_prefix_bug() { plant_ = true; }
     // Every executor's PLE stats (kStats), in rank order 1..N-1.
     std::vector<Qwen4ExpSession::PleStats> executor_stats();
     void finish();  // the executors leave their loop (also on destruction)
@@ -110,7 +115,8 @@ public:
 private:
     Qwen4ExpSession &ses_;
     TpControl *ctl_;
-    bool hash_ = false, state_check_ = false, shadow_ = false, finished_ = false;
+    bool hash_ = false, state_check_ = false, shadow_ = false, finished_ = false, plant_ = false;
+    Qwen4ExpProbe probe_;
     int64_t cand_ = 0;  // want_candidates' n_valid for the next forward
     uint64_t seq_ = 0;
     std::map<int, Qwen4ExpSnapshot> snaps_;
