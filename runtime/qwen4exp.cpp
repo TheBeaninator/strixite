@@ -1018,6 +1018,14 @@ void Qwen4ExpSession::set_tp_f32_mixer(bool on) {
     tp_f32_mixer_ = on;
 }
 
+void Qwen4ExpSession::set_tp_f32_moe(bool on) {
+    STRIX_CHECK(!on || m_.act() == Act::BF16, "Qwen4ExpSession::set_tp_f32_moe: needs BF16 activations");
+    const size_t n = (size_t)(max_tokens_ * m_.dims().d);
+    if (on && y32_.size() == 0) y32_ = DeviceBuffer<float>(n, "FP32 partials");
+    if (on && m_.shared_separate() && sh_y32_.size() == 0) sh_y32_ = DeviceBuffer<float>(n, "shared expert FP32 output");
+    tp_f32_moe_ = on;
+}
+
 void Qwen4ExpSession::want_candidates(int64_t n_valid) {
     const Qwen4ExpDims &D = m_.dims();
     STRIX_CHECK(n_valid >= 1 && n_valid <= D.vocab, "Qwen4ExpSession::want_candidates: n_valid = ", n_valid,
@@ -1065,6 +1073,7 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
         if (exchange_) exchange_(buf, elems, kind, stream_, out);
     };
     const bool f32_mixer = tp && tp_f32_mixer_;
+    const bool f32_moe = tp && tp_f32_moe_;  // y32_ is free again by the MoE: the mixer's exchange consumed it
     cand_n_valid_ = 0;
     broken_ = true;
     const bool fresh = pos_ == 0;
@@ -1321,21 +1330,31 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
             kernels::linear_qw_experts_gather_grouped(u_.get(), l.gate_up, Estack, group_ws_.get(), group_ws_bytes_, T,
                                                       A, gu_.get(), act, em, stream_);
             kernels::swiglu(gu_.get(), hh_.get(), T * A, D.inter, act, stream_);
-            kernels::linear_qw_experts_combine_grouped(hh_.get(), l.down, Estack, route_ids_.get(), route_coef_.get(),
-                                                       group_ws_.get(), group_ws_bytes_, group_partial_.get(), T, A,
-                                                       y_.get(), act, em, stream_);
+            if (f32_moe)
+                kernels::linear_qw_experts_combine_grouped_f32(hh_.get(), l.down, Estack, route_ids_.get(),
+                                                               route_coef_.get(), group_ws_.get(), group_ws_bytes_,
+                                                               group_partial_.get(), T, A, y32_.get(), em, stream_);
+            else
+                kernels::linear_qw_experts_combine_grouped(hh_.get(), l.down, Estack, route_ids_.get(),
+                                                           route_coef_.get(), group_ws_.get(), group_ws_bytes_,
+                                                           group_partial_.get(), T, A, y_.get(), act, em, stream_);
         } else {
             kernels::linear_qw_experts_gather_swiglu(u_.get(), l.gate_up, Estack, route_ids_.get(), T, A, hh_.get(),
                                                      act, expert_err_.get(), stream_);
-            kernels::linear_qw_experts_combine(hh_.get(), l.down, Estack, route_ids_.get(), route_coef_.get(), T, A,
-                                               y_.get(), act, expert_err_.get(), stream_);
+            if (f32_moe)
+                kernels::linear_qw_experts_combine_f32(hh_.get(), l.down, Estack, route_ids_.get(), route_coef_.get(),
+                                                       T, A, y32_.get(), expert_err_.get(), stream_);
+            else
+                kernels::linear_qw_experts_combine(hh_.get(), l.down, Estack, route_ids_.get(), route_coef_.get(), T,
+                                                   A, y_.get(), act, expert_err_.get(), stream_);
         }
         show(L + "experts_h", hh_.get(), A * D.inter, pt);  // the routed experts' down input, T rows of A slots
         if (sep) {  // the shared expert as dense projections, then y += sigmoid(its gate logit) * its output
             lin(u_.get(), l.shared_gate_up, gu_.get(), T, act);
             kernels::swiglu(gu_.get(), hh_.get(), T, D.inter, act, stream_);
             show(L + "shared_h", hh_.get(), D.inter, pt);
-            lin(hh_.get(), l.shared_down, sh_y_.get(), T, act);
+            if (f32_moe) lin(hh_.get(), l.shared_down, sh_y32_.get(), T, Act::F32);
+            else lin(hh_.get(), l.shared_down, sh_y_.get(), T, act);
         }
         if (sep && !fuse_inv && !tp) {  // decode / verify: the gated add and the injection in one launch (bit-identical)
             kernels::moe_shared_add_inject(y_.get(), sh_y_.get(), router_logits_.get() + D.experts, D.experts + 1, T,
@@ -1344,10 +1363,15 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
             show(L + "moe", y_.get(), D.d, pt);
             inv_ready = false;
         } else {
-            if (sep)
+            if (sep && f32_moe)
+                kernels::moe_shared_add(y32_.get(), sh_y32_.get(), router_logits_.get() + D.experts, D.experts + 1,
+                                        T, D.d, (uint32_t)D.experts, Act::F32, router_err_.get(), stream_);
+            else if (sep)
                 kernels::moe_shared_add(y_.get(), sh_y_.get(), router_logits_.get() + D.experts, D.experts + 1, T,
                                         D.d, (uint32_t)D.experts, act, router_err_.get(), stream_);
-            tp_exchange(y_.get(), T * D.d, 1);  // the experts' down partials (+ the gated shared expert's)
+            // the experts' down partials (+ the gated shared expert's)
+            if (f32_moe) tp_exchange(y32_.get(), T * D.d, 3, y_.get());
+            else tp_exchange(y_.get(), T * D.d, 1);
             show(L + "moe", y_.get(), D.d, pt);
             inv_ready = inject_y();
         }

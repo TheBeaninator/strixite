@@ -410,6 +410,8 @@ int main(int argc, char **argv) {
         if (ses_mtp) ses.set_mtp_draft_q4(draft_q4);
         const bool f32_mixer = a.num("tp-f32-mixer", 0) != 0;  // experiment: FP32 mixer partials (ST-2 KL study)
         if (f32_mixer && world > 1) ses.set_tp_f32_mixer(true);
+        const bool f32_moe = a.num("tp-f32-moe", 0) != 0;  // FP32 MoE partials (ST-N2 perplexity study)
+        if (f32_moe && world > 1) ses.set_tp_f32_moe(true);
         std::unique_ptr<TpComm> comm;
         if (world > 1) {
             TpCommConfig cc;
@@ -418,7 +420,7 @@ int main(int argc, char **argv) {
             STRIX_CHECK((int)cc.peers.size() == world, "tp_ar: --tp-peers lists ", cc.peers.size(), " addresses for world ", world);
             cc.dev = a.get("tp-dev", "");  // empty: the mlx5 device with a RoCE v2 GID for this rank's rail-0 address
             cc.port = (int)a.num("tp-port", 18600);
-            cc.max_bytes = (size_t)(chunk * Dm.d * (f32_mixer ? 4 : 2));
+            cc.max_bytes = (size_t)(chunk * Dm.d * (f32_mixer || f32_moe ? 4 : 2));
             cc.exchange_timeout_s = a.real("tp-timeout", 900);
             t0 = now_ms();
             comm = std::make_unique<TpComm>(cc);
@@ -632,6 +634,8 @@ int main(int argc, char **argv) {
           << ",\"capacity\":" << cap << ",\"chunk\":" << chunk << ",\"yarn\":" << yarn
           << ",\"activations\":\"BF16\",\"partials\":\""
           << (world == 1 ? "n/a"
+              : f32_mixer && f32_moe ? "mixer and MoE FP32 (unrounded accumulators); summed in FP32 in rank order, rounded once (RNE)"
+              : f32_moe ? "MoE FP32 (unrounded accumulators), mixer BF16; summed in FP32 in rank order, rounded once (RNE)"
               : f32_mixer ? "mixer FP32 (unrounded accumulators), MoE BF16; summed in FP32 in rank order, rounded once (RNE)"
                           : "BF16, summed in FP32 in rank order, rounded once (RNE)")
           << "\"";
