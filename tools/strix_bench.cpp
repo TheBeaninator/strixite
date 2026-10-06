@@ -179,7 +179,8 @@ int main(int argc, char **argv) {
         }
 
         t0 = now_ms();
-        const Qwen4ExpModel model(weights, ngram, kernels::Act::BF16, false, cache_rows, yarn, TpConfig{tp_world, tp_rank});
+        const Qwen4ExpModel model(weights, ngram, kernels::Act::BF16, false, cache_rows, yarn,
+                                  TpConfig{tp_world, tp_rank, std::max<int64_t>(1, mtp_vocab)});
         const double load_s = (now_ms() - t0) / 1000;
         const Qwen4ExpDims &Dm = model.dims();
         std::fprintf(stderr, "strix_bench: %.1f GiB of weights (rank %d of %d) loaded in %.1f s\n",
@@ -187,6 +188,80 @@ int main(int argc, char **argv) {
         const int64_t capacity = ((maxD + gen_n + 4096) / 4096 + 1) * 4096;
         Qwen4ExpSession ses(model, capacity, chunk, PrefillMath::WmmaBf16, model.has_mtp());
         if (model.has_mtp()) ses.set_mtp_vocab(mtp_vocab);
+        // ST-3 step 1 draft equivalence: --mtp-equiv-out FILE (whole model) runs one forward of --equiv-n corpus tokens,
+        // keeps the trunk's streams after the last layer (L<last>.out) and the head's 5 chained drafts from the
+        // forward's greedy token; --mtp-equiv-in FILE (rank 0 of a TP group) feeds the same ids + streams to its MTP
+        // catch-up (Qwen4ExpSession::debug_mtp_feed) and drafts the same chain: the top-2s must be bit-equal.
+        std::string equiv_json;
+        const std::string equiv_out = a.get("mtp-equiv-out"), equiv_in = a.get("mtp-equiv-in");
+        if (!equiv_out.empty() || !equiv_in.empty()) {
+            STRIX_CHECK(model.has_mtp(), "strix_bench: --mtp-equiv-* needs the MTP head");
+            const int64_t Q = a.num("equiv-n", 4096), n4 = Dm.H * Dm.d, nvq = (int64_t)tok.size();
+            STRIX_CHECK(Q >= 1 && Q <= chunk, "strix_bench: --equiv-n ", Q, " vs --chunk ", chunk);
+            std::vector<int32_t> ids(corpus.begin(), corpus.begin() + Q);
+            std::vector<uint8_t> X((size_t)(Q * n4) * 2);
+            int32_t first = 0;
+            struct Draft {
+                int32_t best;
+                float bv, sv;
+                int32_t nan;
+            };
+            std::vector<Draft> want(5), got(5);
+            const std::string last = "L" + std::to_string(Dm.layers - 1) + ".out";
+            ses.reset();
+            if (!equiv_out.empty()) {
+                bool seen = false;
+                const std::vector<float> l = ses.forward(ids, 1, [&](const std::string &name, const void *dev, int64_t rows,
+                                                                      int64_t cols, ProbeType type) {
+                    if (name != last) return;
+                    STRIX_CHECK(type == ProbeType::BF16 && rows == Q && cols == n4, "strix_bench: ", name, " probe shape");
+                    STRIX_HIP_CHECK(hipMemcpy(X.data(), dev, X.size(), hipMemcpyDeviceToHost), "equiv probe");
+                    seen = true;
+                });
+                STRIX_CHECK(seen, "strix_bench: no ", last, " probe");
+                first = (int32_t)argmax(l.data(), nvq);
+            } else {
+                std::ifstream f(equiv_in, std::ios::binary);
+                int64_t hdr[3];
+                f.read(reinterpret_cast<char *>(hdr), sizeof hdr);
+                STRIX_CHECK(f.good() && hdr[0] == Q && hdr[1] == n4, "strix_bench: ", equiv_in, " is for ", hdr[0], " x ", hdr[1]);
+                f.read(reinterpret_cast<char *>(ids.data()), (std::streamsize)(ids.size() * 4));
+                f.read(reinterpret_cast<char *>(X.data()), (std::streamsize)X.size());
+                f.read(reinterpret_cast<char *>(&first), 4);
+                f.read(reinterpret_cast<char *>(want.data()), (std::streamsize)(want.size() * sizeof(Draft)));
+                STRIX_CHECK(f.good(), "strix_bench: ", equiv_in, " short");
+                ses.debug_mtp_feed(ids, X.data(), X.size());
+            }
+            int32_t t = first;
+            for (int s2 = 0; s2 < 5; ++s2) {
+                const Qwen4ExpSession::MtpTop2 p = ses.forward_mtp_top2(t, s2);
+                got[(size_t)s2] = {p.best, p.best_v, p.second_v, p.nan ? 1 : 0};
+                t = p.best;
+            }
+            if (!equiv_out.empty()) {
+                std::ofstream f(equiv_out, std::ios::binary);
+                const int64_t hdr[3] = {Q, n4, 2};
+                f.write(reinterpret_cast<const char *>(hdr), sizeof hdr);
+                f.write(reinterpret_cast<const char *>(ids.data()), (std::streamsize)(ids.size() * 4));
+                f.write(reinterpret_cast<const char *>(X.data()), (std::streamsize)X.size());
+                f.write(reinterpret_cast<const char *>(&first), 4);
+                f.write(reinterpret_cast<const char *>(got.data()), (std::streamsize)(got.size() * sizeof(Draft)));
+                STRIX_CHECK(f.good(), "strix_bench: cannot write ", equiv_out);
+                equiv_json = ",\"mtp_equiv\":{\"role\":\"reference\",\"file\":\"" + equiv_out + "\"}";
+            } else {
+                const bool eq = std::memcmp(want.data(), got.data(), want.size() * sizeof(Draft)) == 0;
+                std::ostringstream ej;
+                ej << ",\"mtp_equiv\":{\"role\":\"check\",\"file\":\"" << equiv_in << "\",\"positions\":" << Q
+                   << ",\"first_token\":" << first << ",\"drafts_top2_equal\":" << (eq ? "true" : "false") << ",\"drafts\":[";
+                for (size_t k = 0; k < got.size(); ++k)
+                    ej << (k ? "," : "") << "{\"want\":[" << want[k].best << "," << want[k].bv << "," << want[k].sv << "],\"got\":["
+                       << got[k].best << "," << got[k].bv << "," << got[k].sv << "]}";
+                ej << "]}";
+                equiv_json = ej.str();
+                std::fprintf(stderr, "strix_bench: MTP draft equivalence vs %s: %s\n", equiv_in.c_str(), eq ? "bit-equal" : "DIFFERENT");
+            }
+            ses.reset();
+        }
         const int64_t n_valid = whole ? (int64_t)tok.size() : Dm.lm_rows;
         size_t free_b = 0, total_b = 0;
         STRIX_HIP_CHECK(hipMemGetInfo(&free_b, &total_b), "hipMemGetInfo");
@@ -292,7 +367,7 @@ int main(int argc, char **argv) {
               << ",\"logits_rows\":" << n_rows << ",\"drafts\":" << n_drafts << ",\"verifies\":" << verifies
               << ",\"rollbacks\":" << rollbacks_h << ",\"state_pos\":" << end.pos() << ",\"state_bytes\":" << st.size()
               << ",\"logits_hash\":\"" << hex(hl) << "\",\"draft_hash\":\"" << hex(hd) << "\",\"state_hash\":\"" << hex(hst)
-              << "\"}\n";
+              << "\"" << equiv_json << ",\"canaries_ok\":" << (ses.canaries_ok() ? "true" : "false") << "}\n";
             std::fprintf(stderr, "strix_bench: hash-run: %lld rows, %lld drafts, logits %s drafts %s state %s\n",
                          (long long)n_rows, (long long)n_drafts, hex(hl).c_str(), hex(hd).c_str(), hex(hst).c_str());
             return 0;
@@ -728,7 +803,7 @@ int main(int argc, char **argv) {
                 J << ",\"golden\":\"" << gp << ".f32\"";
             }
         }
-        J << ",\"exchanges_total\":" << ses.exchanges() << "}\n";
+        J << equiv_json << ",\"canaries_ok\":" << (ses.canaries_ok() ? "true" : "false") << ",\"exchanges_total\":" << ses.exchanges() << "}\n";
         std::ofstream o(out);
         o << J.str();
         std::fprintf(stderr, "strix_bench: wrote %s\n", out.c_str());
