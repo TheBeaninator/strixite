@@ -2,11 +2,20 @@
 
 // LmBackend on the real model: one Qwen4ExpSession (BF16 activations, WMMA prefill - the shipping settings) and one
 // Qwen4ExpSnapshot slot.
+//
+// Tensor parallelism (ST-3; rank 0 of a TP group): set_tp_driver(drv) routes every call that changes the trunk's state
+// (forwards, verifies and their keeps / drops, resets, snapshots, PLE hints) through drv - mirrored to the executors
+// (runtime/tp_mirror.hpp) - and the MTP calls (drafts) to the session, as before: the head lives on rank 0 only.
+// Under TP a forward's logits are rank 0's vocabulary share, so forward_rows / forward_verify_rows refuse samplers that
+// need whole rows (the served defaults - greedy, top_k <= 20 - take candidates); forward / forward_verify gather whole
+// rows over the control channel (slow: quality runs). The prompt cache's export / import is not mirrored yet (ST-4).
 
 #include "runtime/qwen4exp.hpp"
 #include "serve/engine.hpp"
 
 namespace strix {
+
+class TpDriver;
 
 class Qwen4ExpBackend : public LmBackend {
 public:
@@ -17,14 +26,12 @@ public:
     int64_t max_chunk() const override { return session_.max_tokens(); }
     int64_t logits_row() const override { return model_.dims().vocab; }
     int64_t pos() const override { return session_.pos(); }
-    void reset() override { session_.reset(); }
+    void reset() override;
     std::vector<float> forward(const std::vector<int32_t> &ids, bool want_logits) override {
-        return session_.forward(ids, want_logits ? 1 : 0);
+        return forward(ids, (int64_t)(want_logits ? 1 : 0));
     }
-    void set_lookahead(const std::vector<int32_t> &next_ids) override { session_.set_lookahead(next_ids); }
-    std::vector<float> forward(const std::vector<int32_t> &ids, int64_t n_logits) override {
-        return session_.forward(ids, n_logits);
-    }
+    void set_lookahead(const std::vector<int32_t> &next_ids) override;
+    std::vector<float> forward(const std::vector<int32_t> &ids, int64_t n_logits) override;
     bool has_mtp() const override { return session_.has_mtp(); }
     std::vector<float> forward_mtp(int32_t token_id, int64_t step) override {
         return session_.forward_mtp(token_id, step);
@@ -35,37 +42,26 @@ public:
         t.best = p.best, t.best_v = p.best_v, t.second_v = p.second_v, t.nan = p.nan;
         return t;
     }
-    std::vector<float> forward_verify(const std::vector<int32_t> &ids, int64_t n_logits) override {
-        return session_.forward_verify(ids, n_logits);
-    }
-    LogitRows forward_rows(const std::vector<int32_t> &ids, int64_t n_logits, bool cands, int64_t n_valid) override {
-        if (!cands || n_logits == 0) return LogitRows::from_full(session_.forward(ids, n_logits), logits_row());
-        session_.want_candidates(n_valid);
-        session_.forward(ids, n_logits);
-        return candidate_rows(n_logits);
-    }
-    LogitRows forward_verify_rows(const std::vector<int32_t> &ids, int64_t n_logits, bool cands, int64_t n_valid) override {
-        if (!cands || n_logits == 0) return LogitRows::from_full(session_.forward_verify(ids, n_logits), logits_row());
-        session_.want_candidates(n_valid);
-        session_.forward_verify(ids, n_logits);
-        return candidate_rows(n_logits);
-    }
-    void keep_verify() override { session_.keep_verify(); }
-    void drop_verify() override { session_.drop_verify(); }
+    std::vector<float> forward_verify(const std::vector<int32_t> &ids, int64_t n_logits) override;
+    LogitRows forward_rows(const std::vector<int32_t> &ids, int64_t n_logits, bool cands, int64_t n_valid) override;
+    LogitRows forward_verify_rows(const std::vector<int32_t> &ids, int64_t n_logits, bool cands, int64_t n_valid) override;
+    void keep_verify() override;
+    void drop_verify() override;
     BackendStats backend_stats() const override;
-    void prefetch_ple(const std::vector<int32_t> &ids, int64_t first) override { session_.prefetch_ple(ids, first); }
-    void keep_verify_prefix(const std::vector<int32_t> &ids, int64_t rows) override {
-        (void)ids;  // the session saved its own
-        session_.keep_verify_prefix(rows);
-    }
-    void save_snapshot(int slot) override { session_.save(snap(slot)); }
-    int64_t snapshot_pos(int slot) const override { return snap(slot).pos(); }
-    bool can_restore_snapshot(int slot) const override { return session_.can_restore(snap(slot)); }
-    void restore_snapshot(int slot) override { session_.restore(snap(slot)); }
+    void prefetch_ple(const std::vector<int32_t> &ids, int64_t first) override;
+    void keep_verify_prefix(const std::vector<int32_t> &ids, int64_t rows) override;
+    void save_snapshot(int slot) override;
+    int64_t snapshot_pos(int slot) const override;
+    bool can_restore_snapshot(int slot) const override;
+    void restore_snapshot(int slot) override;
     void export_snapshot(int slot, HostBuffer &out, int64_t from = 0) override;
     void import_state(const HostBuffer &state, int64_t n, int64_t from = 0) override;
     std::string state_fingerprint() const override;
     std::string describe() const override;
+
+    // Tensor parallelism: drv drives session() (rank 0); null = world 1 (the default). Allocates drv's 4 slots.
+    void set_tp_driver(TpDriver *drv);
+    Qwen4ExpSession &session() { return session_; }
 
 private:
     LogitRows candidate_rows(int64_t rows) const;  // session_.candidates() of the last forward, checked
@@ -74,6 +70,12 @@ private:
     Qwen4ExpSnapshot snapshots_[4];
     Qwen4ExpSnapshot &snap(int slot);
     const Qwen4ExpSnapshot &snap(int slot) const;
+    TpDriver *tp_ = nullptr;
+    int tp_slot_[4] = {-1, -1, -1, -1};  // the driver's snapshot ids for slots 0..3
+    int tp_id(int slot) const {
+        (void)snap(slot);  // checks the slot
+        return tp_slot_[slot];
+    }
 };
 
 }  // namespace strix
