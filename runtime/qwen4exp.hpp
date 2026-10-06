@@ -406,6 +406,10 @@ public:
     // FP32 MoE partials (strixite-tp2 f32moe): the routed experts' combine, the shared expert's down projection and
     // its gated add stay FP32 on each rank; the exchange (kind 3, as the mixer's) sums them and rounds once.
     void set_tp_f32_moe(bool on);
+    bool tp_f32_partials() const { return tp_f32_mixer_ || tp_f32_moe_; }  // the communicator's rows are 4 bytes
+    // FP32 partials (mixer and / or MoE, as switched on above) only for forwards of at most n tokens: decode and MTP
+    // verifies; larger forwards (prefill chunks) exchange BF16 partials, half the bytes. Default: every forward.
+    void set_tp_f32_max_tokens(int64_t n) { tp_f32_max_tokens_ = n; }
     // Bench knob (tools/strix_bench): with MTP on, skip the MTP layer's catch-up in forward() (its K / V rows for the
     // forwarded positions) - a plain AR forward's cost. The MTP state is then stale past the position it was paused
     // at: restore a snapshot from before before drafting again.
@@ -442,6 +446,7 @@ private:
     bool tp_f32_mixer_ = false;
     DeviceBuffer<float> y32_;  // set_tp_f32_mixer / _moe: the FP32 partials [max_tokens, d]
     bool tp_f32_moe_ = false;
+    int64_t tp_f32_max_tokens_ = INT64_MAX;
     DeviceBuffer<float> sh_y32_;  // set_tp_f32_moe: the shared expert's FP32 output [max_tokens, d]
     int mtp_tail_cur_ = 0;
     int64_t mtp_vocab_ = 0;  // set to the vocabulary by the constructor
