@@ -10,7 +10,10 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -26,8 +29,23 @@ std::string shape_str(const std::vector<int64_t> &s) {
     return r + "]";
 }
 
+// STRIX_READ_LOG=<file>: append "<offset> <length>" for every byte range the loader reads (the per-rank
+// extents of a .strixw: a rank of N pulls only these bytes). Off when unset; the reads themselves are unchanged.
+void log_read(uint64_t off, uint64_t len) {
+    static std::mutex mu;
+    static FILE *f = [] {
+        const char *p = std::getenv("STRIX_READ_LOG");
+        return p && *p ? std::fopen(p, "a") : nullptr;
+    }();
+    if (!f || len == 0) return;
+    std::lock_guard<std::mutex> lock(mu);
+    std::fprintf(f, "%llu %llu\n", (unsigned long long)off, (unsigned long long)len);
+    std::fflush(f);
+}
+
 // n bytes at file offset off into dst, split over `threads` concurrent preads (NVMe queue depth).
 void pread_parallel(int fd, void *dst, size_t n, uint64_t off, int threads, const std::string &path) {
+    log_read(off, n);
     std::vector<std::thread> pool;
     std::vector<std::string> errs((size_t)threads);
     const size_t per = (n + (size_t)threads - 1) / (size_t)threads;
@@ -58,6 +76,7 @@ struct ReadRange {
 void pread_ranges(int fd, uint8_t *dst, const std::vector<ReadRange> &ranges, int threads, const std::string &path) {
     constexpr uint64_t kPiece = 4ull << 20;
     std::vector<ReadRange> pieces;
+    for (const ReadRange &r : ranges) log_read(r.off, r.len);
     for (const ReadRange &r : ranges)
         for (uint64_t a = 0; a < r.len; a += kPiece) pieces.push_back({r.off + a, std::min(kPiece, r.len - a), r.dst + a});
     std::atomic<size_t> next{0};

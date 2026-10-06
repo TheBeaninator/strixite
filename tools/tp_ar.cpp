@@ -411,6 +411,7 @@ int main(int argc, char **argv) {
         // FP32 partials are the session's default under TP (ST-N2); 0 switches them off (the BF16 A/B).
         const bool f32_mixer = world > 1 && a.num("tp-f32-mixer", 1) != 0;
         const bool f32_moe = world > 1 && a.num("tp-f32-moe", 1) != 0;
+        ses.set_grouped_min_tokens(a.num("grouped-min-tokens", Qwen4ExpSession::kGroupedMinTokens));  // PF-Q1 A/B
         if (world > 1) {
             ses.set_tp_f32_mixer(f32_mixer);
             ses.set_tp_f32_moe(f32_moe);
