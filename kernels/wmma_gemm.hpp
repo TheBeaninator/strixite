@@ -21,6 +21,10 @@
 namespace strix::kernels {
 
 constexpr int kWmmaKC = 64;             // K per step (a multiple of every group size's 32-code chunk)
+// A K that is a multiple of 32 but not of kWmmaKC (a TP-4 rank's expert intermediate 640 / 4 = 160, group size 32)
+// runs the same steps with the last one half empty: its missing 32 codes / values fetch as zeros (kvalid below).
+// Only the kernels' TAIL instantiations do; K % kWmmaKC == 0 runs exactly the code it ran before.
+__host__ __device__ constexpr int wmma_kvalid(int64_t K, int64_t k0) { return K - k0 < kWmmaKC ? (int)(K - k0) : kWmmaKC; }
 constexpr int kWmmaLd = kWmmaKC + 8;    // LDS row stride in BF16 elements (padding against bank conflicts)
 static_assert(kWmmaLd * 2 % 16 == 0, "rows 16-byte aligned: fragments load with 128-bit reads (wmma_load_rows_a16)");
 constexpr int kWmmaThreads = 256;       // 8 waves of 32
@@ -181,14 +185,18 @@ struct WmmaWCodes {
     __device__ static bool opens_window(int64_t k0) { return k0 % G == 0 && (k0 / G) % kWin == 0; }
 
     // k0: the step's K offset from k_base (a multiple of G) - the GEMM's K range starts there (hc_wmma: a stream's).
+    // kvalid: codes of the step that exist (a K tail: K % kWmmaKC == 32 at G = 32, the last step holds 32); the loads
+    // past it read zeros - with the zero scale / min of their groups (g >= K / G) and zero x (WmmaXTile kvalid) they add
+    // exactly nothing. The default (a whole step) is what every K % kWmmaKC == 0 caller passes.
     __device__ void fetch(const uint8_t *codes, const uint16_t *scale, const uint16_t *minv, int64_t row_base,
-                          int rows_valid, int64_t K, int64_t k0, int64_t k_base = 0) {
+                          int rows_valid, int64_t K, int64_t k0, int64_t k_base = 0, int kvalid = kWmmaKC) {
 #pragma unroll
         for (int i = 0; i < kLoads; ++i) {
             const int l = (int)threadIdx.x + i * kWmmaThreads, r = l / kLoadsPerRow;
             const int64_t k = k_base + k0 + (l % kLoadsPerRow) * kCodesPerLoad;
-            q[i] = r < rows_valid ? *reinterpret_cast<const uint4 *>(codes + (row_base + r) * (K * BITS / 8) + k * BITS / 8)
-                                  : make_uint4(0, 0, 0, 0);
+            q[i] = r < rows_valid && (l % kLoadsPerRow) * kCodesPerLoad < kvalid
+                       ? *reinterpret_cast<const uint4 *>(codes + (row_base + r) * (K * BITS / 8) + k * BITS / 8)
+                       : make_uint4(0, 0, 0, 0);
         }
         win = opens_window(k0);
         if (win) {
@@ -349,12 +357,13 @@ struct WmmaXTile {
     static_assert((BM * kSegs) % 32 == 0, "whole waves per pass: the row sums shuffle across a segment's lanes");
     uint32_t b[kPasses][4];  // 8 BF16 values per pass, pairs little-endian
 
-    __device__ void fetch(const T *x, const int64_t *xoff, int rows_valid, int64_t k0) {
+    // kvalid: the step's values that exist (a K tail, see WmmaWCodes::fetch); the rest stage as zeros.
+    __device__ void fetch(const T *x, const int64_t *xoff, int rows_valid, int64_t k0, int kvalid = kWmmaKC) {
 #pragma unroll
         for (int p = 0; p < kPasses; ++p) {
             const int seg = (int)threadIdx.x + p * kWmmaThreads, r = seg / kSegs;
             b[p][0] = b[p][1] = b[p][2] = b[p][3] = 0;
-            if (seg >= BM * kSegs || r >= rows_valid) continue;
+            if (seg >= BM * kSegs || r >= rows_valid || (seg % kSegs) * 8 >= kvalid) continue;
             const T *src = x + xoff[r] + k0 + (seg % kSegs) * 8;
             if constexpr (sizeof(T) == 2) {
                 const uint4 u = *reinterpret_cast<const uint4 *>(src);

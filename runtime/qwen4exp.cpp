@@ -992,10 +992,12 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
                       std::to_string(ids.size()));
     STRIX_TRACE_STAGE(stage);
     STRIX_TRACE_SET(stage, "embed");
-    // Dense Q4 / Q8 projection: on the matrix units for large enough forwards when switched on - and when K is a
-    // multiple of their K step (kernels/wmma_gemm.hpp kWmmaKC = 64; not a TP-4 rank's shared expert down, K = 160).
+    // Dense Q4 / Q8 projection: on the matrix units for large enough forwards when switched on - and when the kernel
+    // takes its K: a multiple of the K step (kernels/wmma_gemm.hpp kWmmaKC = 64), or of 32 for Q4 / Q8 (PF-6: a TP-4
+    // rank's shared expert down, K = 160, runs the K-tail instantiation).
     auto lin = [&](const void *x, const QWeightView &w, void *y, int64_t M, Act out_act) {
-        if (wmma && M >= kWmmaMinTokens && w.K() % 64 == 0) kernels::linear_qw_wmma(x, w, y, M, act, out_act, stream_);
+        const bool wmma_k = w.K() % 64 == 0 || ((w.bits == 4 || w.bits == 8) && w.K() % 32 == 0);
+        if (wmma && M >= kWmmaMinTokens && wmma_k) kernels::linear_qw_wmma(x, w, y, M, act, out_act, stream_);
         else kernels::linear_qw(x, w, y, M, act, out_act, stream_);
     };
     const kernels::MoeMath moe_math = wmma ? kernels::MoeMath::WmmaBf16 : kernels::MoeMath::F32;
@@ -1258,9 +1260,9 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
         if (T >= kGroupedMinTokens) {
             // Q4 experts on the matrix units take F16; Q5 stays on BF16 scaled codes
             // until its kernel moves over.
-            // The WMMA expert kernels step K by kWmmaKC (64): a TP-4 rank's intermediate (640 / 4 = 160) isn't a
-            // multiple of it, so its grouped experts run the FP32 math (ST-3 step 1: TP-4 prefill was refused).
-            const bool wmma_k = l.down.K() % 64 == 0;  // kernels/wmma_gemm.hpp kWmmaKC
+            // The WMMA expert kernels step K by kWmmaKC (64); Q4 experts also take a K tail of 32 (PF-6: a TP-4 rank's
+            // intermediate 640 / 4 = 160 at G = 32). Anything else runs the FP32 math.
+            const bool wmma_k = l.down.K() % 64 == 0 || (l.gate_up.bits == 4 && l.down.bits == 4 && l.down.K() % 32 == 0);
             const kernels::MoeMath em = !wmma_k ? kernels::MoeMath::F32
                                         : moe_math == kernels::MoeMath::WmmaBf16 && l.gate_up.bits == 4 && l.down.bits == 4
                                             ? kernels::MoeMath::WmmaF16
