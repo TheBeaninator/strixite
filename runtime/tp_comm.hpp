@@ -29,6 +29,14 @@
 // (a mirror bug - e.g. a verify of another T - would otherwise sum garbage silently). Arrival is published only after
 // the check.
 //
+// Large FP32 -> BF16 all-reduces (prefill, >= rsag_min_bytes) run as a reduce-scatter + all-gather: two
+// exchanges. 1: every rank sends peer q only q's slice of its FP32 partial (flat element ranges, q * base with base
+// = ceil(elems / N) rounded up to even); q sums its slice over the ranks in rank order 0..N-1 and rounds once (RNE) -
+// the same arithmetic every rank does for every element on the all-to-all path, so the bits are identical - and
+// writes the BF16 result to out and its send slot. 2: every rank sends its BF16 slice to every peer, which copies the
+// peers' slices into out. Each rank's egress per exchange drops from (N-1) x elems x 4 to (N-1) x elems x (4 + 2) / N
+// bytes. Small exchanges (decode, verifies) keep the one-round-trip all-to-all.
+//
 // Needs LimitMEMLOCK=infinity (the windows are 9 x max_bytes of pinned memory at N = 2).
 
 #include "kernels/norm.hpp"  // Act
@@ -53,6 +61,8 @@ struct TpCommConfig {
     uint64_t chunk = 4ull << 20;     // WRITE size for large payloads (plan v2: never one WRITE above 32 MiB)
     double connect_timeout_s = 600;  // waiting for the peers to come up
     double exchange_timeout_s = 900; // a peer this late on an exchange poisons the communicator
+    size_t rsag_min_bytes = 1u << 20; // FP32 -> BF16 all-reduces of at least this many bytes: reduce-scatter +
+                                      // all-gather (identical bits); 0 = always the all-to-all
 };
 
 // The control channel as tp_mirror uses it (TpDriver / tp_executor): TpComm's TCP mesh, or an in-process loopback
@@ -108,7 +118,9 @@ private:
     std::string dev_;
     size_t max_bytes_ = 0;
     uint64_t seq_ = 0;
-    void enqueue(const void *src, size_t bytes, hipStream_t stream);  // publish + wait for exchange seq_
+    void enqueue(const void *src, size_t bytes, hipStream_t stream, int mode = 0);  // publish + wait for exchange seq_
+    void post(size_t bytes, int mode);  // queue exchange seq_ (payload already in its send slot) for the comm thread
+    void publish_wait(hipStream_t stream);  // flag + wait for exchange seq_, then ++seq_
 };
 
 // The LM head's candidate merge (vocabulary split by rank): gathered [N][rows * kLogitCands LogitCand, then rows NaN

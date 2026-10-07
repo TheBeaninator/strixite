@@ -34,8 +34,20 @@ constexpr uint64_t kRing = 1u << 16;  // queued exchange sizes the comm thread h
 constexpr int kSqDepth = 4096, kRqDepth = 1024;
 constexpr uint32_t kPoisonImm = 0xffffffffu;  // a zero-length WRITE_WITH_IMM carrying it poisons the receiver
 
+// Exchange modes: 0 the whole payload to every peer; 1 reduce-scatter (peer q gets q's slice of an FP32
+// payload); 2 all-gather (every peer gets this rank's slice of a BF16 payload). Slices: element ranges [off(q),
+// off(q + 1)), off(q) = min(elems, q * base), base = ceil(elems / N) rounded up to even (BF16 slices are whole words).
+constexpr int kModeAll = 0, kModeScatter = 1, kModeGather = 2;
+__host__ __device__ inline uint64_t slice_base(uint64_t elems, int N) { return ((elems + N - 1) / N + 1) & ~1ull; }
+__host__ __device__ inline uint64_t slice_off(uint64_t elems, int N, int q) {
+    const uint64_t o = (uint64_t)q * slice_base(elems, N);
+    return o < elems ? o : elems;
+}
+
 // The immediate of exchange seq of `bytes`: seq's low 20 bits, then a 12-bit tag of the size (never the poison word).
-uint32_t exchange_imm(uint64_t seq, uint64_t bytes) {
+// The tag covers the whole exchange's size and mode, identical on every rank even when slices are uneven.
+uint32_t exchange_imm(uint64_t seq, uint64_t bytes, int mode = 0) {
+    bytes ^= (uint64_t)mode * 0x5a5a5a4ull;
     const uint32_t tag = (uint32_t)(((bytes >> 2) ^ (bytes >> 14) ^ (bytes >> 26)) & 0xfffu);
     uint32_t imm = ((uint32_t)(seq & 0xfffffu) << 12) | tag;
     if (imm == 0xffffffffu) imm ^= 1u;
@@ -101,6 +113,28 @@ __global__ void k_sum_f32_bf16(uint16_t *out, const float *buf, const float *rec
         float s = 0.0f;
         for (int r = 0; r < N; ++r) s += r == rank ? buf[i] : recv[((uint64_t)r * kWindows + w) * slot_elems + i];
         out[i] = f2bf(s);
+    }
+}
+// Reduce-scatter's combine: this rank's slice [lo, hi) of the FP32 partials, summed in rank order 0..N-1 exactly as
+// k_sum_f32_bf16 does for every element, rounded once; the BF16 bits go to out and to the all-gather's send slot.
+__global__ void k_rs_sum_f32_bf16(uint16_t *out, uint16_t *send_slot, const float *buf, const float *recv,
+                                  uint64_t slot_elems, int N, int rank, uint64_t w, uint64_t lo, uint64_t hi) {
+    for (uint64_t i = lo + blockIdx.x * (uint64_t)blockDim.x + threadIdx.x; i < hi; i += (uint64_t)gridDim.x * blockDim.x) {
+        float s = 0.0f;
+        for (int r = 0; r < N; ++r) s += r == rank ? buf[i] : recv[((uint64_t)r * kWindows + w) * slot_elems + i];
+        const uint16_t b = f2bf(s);
+        out[i] = b;
+        send_slot[i] = b;
+    }
+}
+// All-gather's copy-out: every element outside this rank's slice from its owner's window (BF16, element offsets kept).
+__global__ void k_ag_copy_bf16(uint16_t *out, const uint16_t *recv, uint64_t slot_elems, int N, int rank, uint64_t w,
+                               uint64_t elems) {
+    const uint64_t base = slice_base(elems, N);
+    for (uint64_t i = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x; i < elems; i += (uint64_t)gridDim.x * blockDim.x) {
+        const int q = (int)(i / base);
+        if (q == rank) continue;
+        out[i] = recv[((uint64_t)q * kWindows + w) * slot_elems + i];
     }
 }
 __global__ void k_gather(uint32_t *dst, const uint32_t *src, const uint32_t *recv, uint64_t slot_words, int N, int rank,
@@ -263,6 +297,14 @@ struct TpComm::Impl {
     };
     std::vector<Peer> P;
     std::vector<uint64_t> ring = std::vector<uint64_t>(kRing);
+    std::vector<uint8_t> modes = std::vector<uint8_t>(kRing);  // exchange mode by seq % kRing (kModeAll / Scatter / Gather)
+    // Byte range [b, e) of exchange `bytes` / `mode` this rank writes to peer p (the same offsets in p's window).
+    void range(uint64_t bytes, int mode, int p, uint64_t &b, uint64_t &e) const {
+        if (mode == kModeAll) { b = 0, e = bytes; return; }
+        const uint64_t es = mode == kModeScatter ? 4 : 2, elems = bytes / es;
+        const int q = mode == kModeScatter ? p : rank;
+        b = slice_off(elems, N, q) * es, e = slice_off(elems, N, q + 1) * es;
+    }
     std::atomic<uint64_t> queued{0}, posted{0};
     std::atomic<bool> stop{false}, poison_out{false};  // poison_out: tell the peers (an immediate of kPoisonImm)
     mutable std::mutex err_mu;
@@ -329,21 +371,23 @@ void TpComm::Impl::loop() {
         // post exchange `next` once queued by the host and published by the GPU
         if (queued.load(std::memory_order_acquire) > next && *ready() >= next + 1) {
             const uint64_t bytes = ring[next % kRing], w = next % kWindows;
-            const uint64_t c = std::min<uint64_t>(cfg.chunk ? cfg.chunk : bytes, 32ull << 20);
+            const int mode = modes[next % kRing];
             for (int p = 0; p < N; ++p) {
                 if (p == rank) continue;
                 Peer &pr = P[p];
-                uint64_t off = 0;
+                uint64_t off, end;  // this peer's byte range (the whole payload, or one slice; may be empty)
+                range(bytes, mode, p, off, end);
+                const uint64_t c = std::min<uint64_t>(cfg.chunk ? cfg.chunk : end - off, 32ull << 20);
                 do {
-                    const uint64_t len = std::min(c, bytes - off);
-                    const bool last = off + len >= bytes;
+                    const uint64_t len = std::min(c, end - off);
+                    const bool last = off + len >= end;
                     while (pr.outstanding > (uint64_t)kSqDepth - 64)
                         if (!reap_send()) return;
                     ibv_sge sg{(uint64_t)(uintptr_t)(send_h + w * slot + off), (uint32_t)len, smr->lkey};
                     ibv_send_wr wr{}, *bad = nullptr;
                     wr.sg_list = len ? &sg : nullptr, wr.num_sge = len ? 1 : 0;
                     wr.opcode = last ? IBV_WR_RDMA_WRITE_WITH_IMM : IBV_WR_RDMA_WRITE;
-                    wr.imm_data = htonl(exchange_imm(next, bytes));
+                    wr.imm_data = htonl(exchange_imm(next, bytes, mode));
                     wr.wr.rdma.remote_addr = pr.remote.region + ((uint64_t)rank * kWindows + w) * slot + off;
                     wr.wr.rdma.rkey = pr.remote.rkey;
                     ++pr.since_sig, ++pr.outstanding;
@@ -353,7 +397,7 @@ void TpComm::Impl::loop() {
                         return;
                     }
                     off += len;
-                } while (off < bytes);
+                } while (off < end);
             }
             posted.store(++next, std::memory_order_release);
             did = true;
@@ -394,7 +438,7 @@ void TpComm::Impl::loop() {
             const uint64_t c0 = pr.checked;
             while (pr.checked < pr.imms && pr.checked < q) {
                 const uint64_t s = pr.checked, bytes = ring[s % kRing];
-                const uint32_t want = exchange_imm(s, bytes) & 0xfffu;
+                const uint32_t want = exchange_imm(s, bytes, modes[s % kRing]) & 0xfffu;
                 if (pr.tags[s % kRing] != want) {
                     set_poison(cat("TpComm: exchange ", s, ": rank ", p, "'s payload size tag ", pr.tags[s % kRing],
                                    " != this rank's ", want, " (", bytes, " bytes) - the ranks ran different shapes"));
@@ -572,15 +616,30 @@ void TpComm::check() const {
 
 void TpComm::poison(const std::string &why) { impl_->set_poison(why); }
 
-void TpComm::enqueue(const void *src, size_t bytes, hipStream_t stream) {
+void TpComm::post(size_t bytes, int mode) {
     Impl &I = *impl_;
     STRIX_CHECK(bytes > 0 && bytes <= max_bytes_ && bytes % 4 == 0, "TpComm: exchange of ", bytes, " bytes (max ",
                 max_bytes_, ", a multiple of 4)");
     while (seq_ - I.posted.load(std::memory_order_acquire) >= kRing / 2 && !I.is_poisoned())
         usleep(50);  // never in practice: a forward queues ~100 exchanges, then waits for its logits
+    I.ring[seq_ % kRing] = bytes;
+    I.modes[seq_ % kRing] = (uint8_t)mode;
+    I.queued.store(seq_ + 1, std::memory_order_release);
+}
+
+void TpComm::publish_wait(hipStream_t stream) {
+    Impl &I = *impl_;
+    k_flag<<<1, 1, 0, stream>>>(I.flags_d, seq_);
+    STRIX_HIP_CHECK_LAUNCH("TpComm publish");
+    k_wait<<<1, 32, 0, stream>>>(I.flags_d + 8, I.flags_d + 4, world_, rank_, seq_ + 1);
+    STRIX_HIP_CHECK_LAUNCH("TpComm wait");
+    ++seq_;
+}
+
+void TpComm::enqueue(const void *src, size_t bytes, hipStream_t stream, int mode) {
+    Impl &I = *impl_;
+    post(bytes, mode);
     const uint64_t s = seq_, w = s % kWindows;
-    I.ring[s % kRing] = bytes;
-    I.queued.store(s + 1, std::memory_order_release);
     uint8_t *dst = I.send_d + w * I.slot;
     if (bytes <= (256u << 10)) {
         if (bytes % 16 == 0)
@@ -617,8 +676,28 @@ void TpComm::allreduce(void *buf, int64_t elems, kernels::Act act, hipStream_t s
 
 void TpComm::allreduce_f32_to_bf16(const float *buf, int64_t elems, void *out, hipStream_t stream) {
     Impl &I = *impl_;
+    const size_t bytes = (size_t)elems * 4;
+    if (I.cfg.rsag_min_bytes && bytes >= I.cfg.rsag_min_bytes && elems % 2 == 0) {
+        // 1. reduce-scatter: each peer gets its slice of the FP32 partial; this rank sums its own slice
+        const uint64_t w1 = seq_ % kWindows, w2 = (seq_ + 1) % kWindows;
+        const uint64_t lo = slice_off((uint64_t)elems, world_, rank_), hi = slice_off((uint64_t)elems, world_, rank_ + 1);
+        enqueue(buf, bytes, stream, kModeScatter);
+        uint16_t *slot2 = (uint16_t *)(I.send_d + w2 * I.slot);
+        const unsigned g1 = (unsigned)std::min<uint64_t>(1024, (hi - lo + 255) / 256 + 1);
+        k_rs_sum_f32_bf16<<<g1, 256, 0, stream>>>((uint16_t *)out, slot2, buf, (const float *)I.recv_d, I.slot / 4,
+                                                  world_, rank_, w1, lo, hi);
+        STRIX_HIP_CHECK_LAUNCH("TpComm reduce-scatter sum");
+        // 2. all-gather: this rank's BF16 slice (already in the send slot) to every peer, then the peers' into out
+        post((size_t)elems * 2, kModeGather);
+        publish_wait(stream);
+        const unsigned g2 = (unsigned)std::min<int64_t>(1024, (elems + 255) / 256);
+        k_ag_copy_bf16<<<g2, 256, 0, stream>>>((uint16_t *)out, (const uint16_t *)I.recv_d, I.slot / 2, world_, rank_, w2,
+                                               (uint64_t)elems);
+        STRIX_HIP_CHECK_LAUNCH("TpComm all-gather copy");
+        return;
+    }
     const uint64_t w = seq_ % kWindows;
-    enqueue(buf, (size_t)elems * 4, stream);
+    enqueue(buf, bytes, stream);
     const unsigned grid = (unsigned)std::min<int64_t>(1024, (elems + 255) / 256);
     k_sum_f32_bf16<<<grid, 256, 0, stream>>>((uint16_t *)out, buf, (const float *)I.recv_d, I.slot / 4, world_, rank_, w,
                                              (uint64_t)elems);

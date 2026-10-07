@@ -428,6 +428,7 @@ int main(int argc, char **argv) {
             cc.port = (int)a.num("tp-port", 18600);
             cc.max_bytes = (size_t)(chunk * Dm.d * (f32_mixer || f32_moe ? 4 : 2));
             cc.exchange_timeout_s = a.real("tp-timeout", 900);
+            cc.rsag_min_bytes = (size_t)a.num("tp-rsag-min-bytes", (int64_t)cc.rsag_min_bytes);  // 0 = all-to-all
             t0 = now_ms();
             comm = std::make_unique<TpComm>(cc);
             tp_attach(ses, model, *comm);
