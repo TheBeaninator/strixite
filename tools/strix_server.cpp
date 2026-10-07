@@ -18,6 +18,8 @@
 #include "serve/server_config.hpp"
 #include "serve/tokenizer.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <csignal>
 #include <filesystem>
 #include <cstdio>
@@ -105,14 +107,22 @@ int run(int argc, char **argv) {
     cfg.defaults = sampling_defaults(gen_config);
     const Tokenizer tok(tokenizer);
     slog(LogLevel::Info, "startup: tokenizer %s (%d tokens)", tokenizer.c_str(), tok.size());
-    const Qwen4ExpModel model(weights, ngram, kernels::Act::BF16, /*allow_truncated=*/false, ngram_cache_rows,
-                              yarn_factor);
+    Qwen4ExpModel model(weights, ngram, kernels::Act::BF16, /*allow_truncated=*/false, ngram_cache_rows,
+                        yarn_factor);
     if (yarn_factor > 1.0f)
         slog(LogLevel::Info, "startup: YaRN factor %g: %lld positions (%lld trained), cos/sin factor %.4f",
              (double)yarn_factor, (long long)model.dims().max_positions(), (long long)model.dims().trained_positions,
              (double)model.rope_scale());
     slog(LogLevel::Info, "startup: %.1f GiB of weights loaded in %.1f s",
                  (double)model.weights().data_bytes() / (1ull << 30), model.weights().load_seconds());
+    if (use_mtp && model.has_mtp()) {  // drafts score a Q4 copy of the draft vocabulary's LM head rows
+        const int64_t rows = mtp_vocab > 0 ? std::min<int64_t>(mtp_vocab, model.dims().vocab) : model.dims().vocab;
+        const auto t0 = std::chrono::steady_clock::now();
+        model.make_draft_head_q4(rows);
+        slog(LogLevel::Info, "startup: MTP draft head: Q4 copy of the first %lld LM head rows made in %.2f s",
+             (long long)model.draft_head_q4().N(),
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
     Qwen4ExpBackend backend(model, capacity, chunk, use_mtp, mtp_vocab);
     std::unique_ptr<PromptCache> cache;
     if (cache_gib > 0) {
