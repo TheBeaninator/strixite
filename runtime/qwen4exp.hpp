@@ -85,6 +85,10 @@ struct TpConfig {
     // is rows [0, max(vocab / N, draft_rows)) - the trunk uses the first vocab / N (a prefix view), the draft up to
     // draft_rows (at N = 4: 62,080 < 65,536, the served mtp-vocab).
     int64_t draft_rows = 65536;
+    // The draft head's vocabulary rows split across the ranks (rank r scores rows [r * Dr, (r + 1) * Dr), Dr =
+    // draft_rows / N): ranks 1..N-1 also load their Dr rows of the LM head (+ Dr x d Q8, ~42 MB at TP4). Only the
+    // draft's LM head is split; the MTP layer stays on rank 0 (Qwen4ExpSession::set_draft_split).
+    bool draft_split = false;
 };
 
 class Qwen4ExpModel {
@@ -162,6 +166,13 @@ public:
     // rows. 65,536 rows at G = 64: 178 -> 94 MB per draft call. Call before any session drafts with it.
     void make_draft_head_q4(int64_t rows, int64_t G = 64);
     const QWeightView &draft_head_q4() const { return draft_head_q4_; }  // bits == 0 until made
+    // Split draft head (TpConfig::draft_split): this rank's Dr rows of the draft vocabulary (ids draft_base() ..), Q8 as loaded and
+    // (make_draft_local_q4) its Q4 copy - rank 0's is a prefix of draft_head_q4(), the others' are quantized the same
+    // way from the same Q8 rows (per-row quantization: identical bytes). bits == 0 when the split is off.
+    const QWeightView &draft_local() const { return draft_local_; }
+    const QWeightView &draft_local_q4() const { return draft_local_q4_; }
+    int64_t draft_base() const { return draft_base_; }
+    void make_draft_local_q4(int64_t G = 64);
 
 private:
     Qwen4ExpDims dims_, mtp_dims_;
@@ -171,7 +182,9 @@ private:
     std::vector<Layer> layers_;
     const uint16_t *embed_ = nullptr;
     Q8DeviceView embed_q8_{};
-    QWeightView lm_head_, draft_head_, draft_head_q4_;
+    QWeightView lm_head_, draft_head_, draft_head_q4_, draft_local_, draft_local_q4_;
+    int64_t draft_base_ = 0;
+    std::unique_ptr<Q4Device> draft_local_q4_dev_;
     std::unique_ptr<Q4Device> draft_q4_;
     bool truncated_ = false, shared_separate_ = false, has_mtp_ = false;
     MtpHead mtp_;
@@ -353,6 +366,14 @@ public:
     // Draft over the model's Q4 copy of the draft head (Qwen4ExpModel::make_draft_head_q4; it must cover
     // mtp_vocab() rows) instead of the head as loaded. Off by default; switchable between calls (A/B in one process).
     void set_mtp_draft_q4(bool on);
+    // Draft over this rank's share of the draft vocabulary (Qwen4ExpModel::draft_local, TpConfig::draft_split):
+    // rank 0 sends the head's input u to every rank (exchange kind 4), each rank scores its rows and reduces them to a
+    // part (kernels::mtp_pick_part), the parts are gathered (kind 5) and merged - the same pick as the whole head. The
+    // executors run their side through draft_head_exec (TpDriver mirrors it as kDraftHead before each draft).
+    void set_draft_split(bool on);
+    bool draft_split() const { return draft_split_; }
+    // An executor's side of one split draft (no MTP layer here): receive u, score the local rows, send the part.
+    void draft_head_exec(int64_t mtp_vocab, bool q4);
     bool mtp_draft_q4() const { return mtp_draft_q4_; }
     int64_t mtp_vocab() const { return mtp_vocab_; }
     // Test hooks. debug_mtp_feed: the MTP catch-up for ids at pos().. from the given trunk streams X [T, H * d]
@@ -470,6 +491,9 @@ private:
     void run_mtp(int32_t token_id, int64_t step);
     void mtp_done(int64_t step);
     DeviceBuffer<uint8_t> mtp_pick_;  // kernels::MtpPick on the device (allocated on the first forward_mtp_top2)
+    bool draft_split_ = false;
+    DeviceBuffer<uint8_t> mtp_parts_;  // split draft head: [0] this rank's kernels::MtpPart, [1..] the N gathered parts
+    void draft_head_local(int64_t mtp_vocab, bool q4);  // the split draft's local scoring + the two exchanges
     // Grouped experts for multi-token forwards (kernels/moe_grouped): the route grouping and combine's FP32
     // per-slot dots. Allocated when max_tokens reaches kGroupedMinTokens.
     // QSA selection past dense_key_limit(): scores [max_tokens, cap_blocks] F32, the kept blocks [max_tokens,
