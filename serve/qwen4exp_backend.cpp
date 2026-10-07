@@ -36,6 +36,15 @@ void Qwen4ExpBackend::set_tp_driver(TpDriver *drv) {
         for (int &id : tp_slot_) id = tp_->make_snapshot();
 }
 
+Top2 Qwen4ExpBackend::forward_mtp_top2(int32_t token_id, int64_t step) {
+    // Under TP the driver runs it: a split draft head needs the executors' halves (calling the session directly left
+    // rank 0 waiting on parts nobody computed - NaN draft logits in serve/replay over TP).
+    const Qwen4ExpSession::MtpTop2 p = tp_ ? tp_->forward_mtp_top2(token_id, step) : session_.forward_mtp_top2(token_id, step);
+    Top2 t;
+    t.best = p.best, t.best_v = p.best_v, t.second_v = p.second_v, t.nan = p.nan;
+    return t;
+}
+
 void Qwen4ExpBackend::reset() {
     if (tp_) tp_->reset();
     else session_.reset();
