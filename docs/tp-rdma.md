@@ -2,9 +2,10 @@
 
 This fork of [strixite](https://github.com/shawnshekari/strixite) runs one Qwen3.8-Flash-Next decode stream across
 **2 or 4 Strix Halo machines** with tensor parallelism. The machines exchange partial sums over 100 GbE RDMA
-(RoCE v2). Each machine holds only its share of the weights. Rank 0 drives the others and runs the MTP draft head.
-Everything else in strixite is unchanged: a stock build and a single machine compute bit-identical results (see
-[Correctness](#correctness)).
+(RoCE v2). Each machine holds only its share of the weights. Rank 0 drives the others and runs the MTP layer; the
+draft head's vocabulary is split across all ranks. On one machine the arithmetic is unchanged: a single machine
+computes bit-identical results with and without these changes (see [Correctness](#correctness)). The fork does change
+one single-machine default: the MTP draft policy (see [MTP draft policy](#mtp-draft-policy)).
 
 ## How it works
 
@@ -15,13 +16,17 @@ Everything else in strixite is unchanged: a stock build and a single machine com
   - the routed and shared experts' intermediate (gate/up rows, down columns)
   - the LM head rows by vocabulary
 
-  The embedding, HC mixes, norms, router, PLE and QSA indexer are replicated. The MTP head lives whole on rank 0.
+  The embedding, HC mixes, norms, router, PLE and QSA indexer are replicated. The MTP layer lives whole on rank 0.
 - **Exchanges** (`runtime/tp_comm`, `TpComm`):
   - 96 all-reduces per forward, at the mixer and MoE row-parallel outputs, plus an exact merge of the LM-head
     candidates.
   - A communication thread posts RDMA WRITE-with-immediate into 3 rotating windows per peer. It uses libibverbs with
     the stock rdma-core mlx5 provider, not the GPU's peer memory.
   - Every rank sums the partials in FP32 in rank order and rounds once, so all ranks hold bit-identical activations.
+  - Large exchanges (prefill, 1 MiB and up) run as a reduce-scatter plus all-gather: each rank sums only its slice,
+    in the same rank order with the same single rounding, and sends back BF16. The results are bit-identical to the
+    all-to-all path, and each rank sends (N-1) x 6 / N instead of (N-1) x 4 bytes per element (TP4: 90 instead of
+    240 MiB per 8,192-token exchange).
   - Any error poisons every wait: a work-completion error, the watchdog, or a peer failure.
   - The TCP mesh used for the handshake stays open as the control channel.
 - **Mirror protocol** (`runtime/tp_mirror`):
@@ -32,8 +37,28 @@ Everything else in strixite is unchanged: a stock build and a single machine com
   - `TpLoopback` runs the same protocol in one process, for the mirror-shadow test.
 - **FP32 partials (the TP default).** Under TP the mixer and MoE partials stay FP32 until the exchange. With BF16
   partials, four-node perplexity drifted +0.71% from one node; with FP32 partials it is +0.15%.
+- **Split draft head.** The MTP draft scores 65,536 vocabulary rows per call. Under TP each rank scores its own
+  quarter or half of them (Q4, quantized identically on every rank). Rank 0 sends the draft input to every rank,
+  each rank picks its local top-2, and rank 0 merges the parts exactly the way the whole-head pick does (lowest id
+  on a tie). The drafts, and so the outputs, are identical to scoring the whole head on rank 0. Executors load
+  their draft rows too (+42 MB at TP4). This changes the mirror protocol to v3.
+- **Small-output GEMV occupancy.** At TP4 a rank's shared-expert gate/up has only 320 outputs, which left most of
+  gfx1151's 40 compute units idle at 2..8 rows. The Q4/Q8 GEMVs now use fewer rows per block until the grid has 160
+  blocks. A row's arithmetic does not change, so outputs are bit-identical.
 - **K-tail WMMA kernels.** A TP-4 rank's expert and shared-expert down projections have K = 640 / 4 = 160. The Q4/Q8
   WMMA GEMMs gain a tail path for K % 64 == 32. At world 1 every K is a multiple of 64, so the old kernels run.
+
+## MTP draft policy
+
+The fork's defaults for MTP, in `strix_server` and `tp_ar`, are:
+- margin 1.5 and up to 7 drafts (upstream: 2.0 and 5)
+- the Q4 draft head: drafts score a Q4 copy of the draft vocabulary's LM head rows, made once at load from the Q8
+  head, which halves the bytes a draft call reads
+
+The verify still decides every token, so greedy output can move only at near-ties, as with any change of MTP policy.
+At TP4 the new policy measured 99.1 / 111.7 / 103.2 -> 107.2 / 115.4 / 102.5 MTP t/s at 4k / 64k / 400k (the 400k
+difference is within run noise). `--mtp-margin 2 --mtp-draft 5 --mtp-draft-q4 off` restores upstream's policy.
+`strix_bench` keeps upstream's policy, so its `--hash-run` stays comparable across builds.
 
 ## Hardware it was measured on
 
@@ -96,6 +121,7 @@ Useful checks:
 | Command | What it checks |
 |---|---|
 | `test_wmma_ktail` | WMMA kernels at K = 160 / 320 / 640 against the FP32 kernels and a host reference |
+| `test_mtp_split_pick` | The split draft pick (per-rank parts + merge) against the whole-head pick: 418 cases, including ties across rank boundaries, NaN, +-0 and empty parts, for N = 2 and 4 |
 | `strix_bench --hash-run 1` | One fixed call sequence, every result hashed. Two builds must print the same three hashes |
 | `tp_ar --shadow 1` | Mirror-shadow test: driver and executor sessions in one process over `TpLoopback`, the real MTP loop with injected drops, restores and failures. No RDMA is used. |
 | `tp_ar --tp-world 2 --tp-peers IP,IP` (two processes, one machine) | Loopback smoke test through one NIC |
@@ -104,7 +130,33 @@ Useful checks:
 
 ## Results
 
-Four machines vs one, single stream, measured 2026-10-06. Method:
+All results are one stream on the hardware above. Each A/B ran in alternating order with the same binaries
+(A, B, A, B), using a teacher-forced replay of the engine's MTP loop over each configuration's own greedy
+continuation. The changes marked bit-identical were also checked hash for hash.
+
+### Current build, four machines
+
+| Context | MTP, 4 nodes | Prefill, 4 nodes |
+|---|---|---|
+| 4k | ~114 t/s | |
+| 64k | ~121 t/s | 37.0 s (one node: ~46 s) |
+| 400k | ~108 t/s | 213 s (one node: ~278 s) |
+
+How the four-node numbers moved since the first build below (each step an alternating A/B on four machines):
+
+| Change | 4k | 64k | 400k |
+|---|---|---|---|
+| MTP policy 1.5 x 7 + Q4 draft head (MTP t/s) | 99.1 -> 107.2 | 111.7 -> 115.4 | 103.2 -> 102.5 |
+| Split draft head (MTP t/s, outputs identical) | 106.8 -> 114.4 (+7.1%) | 115.9 -> 121.3 (+4.7%) | 102.7 -> 107.9 (+5.1%) |
+| Small-output GEMV occupancy (MTP, bit-identical) | +0.6% | +1.1% | |
+| Reduce-scatter prefill exchanges (prefill s, bit-identical) | | 55.2 -> 37.0 | 310 -> 213 |
+
+Quality of the current build vs one node: plain-decode perplexity +0.15%, MTP perplexity -0.34%, 0 activation hash
+mismatches across the four ranks.
+
+### First build: four machines vs one
+
+Measured 2026-10-06. Method:
 - One binary per session, with one-node and four-node runs alternated.
 - The one-node baseline is the faster of two machines at each depth.
 - "Plain" means greedy decode, teacher-forced, p50 per token.
@@ -120,7 +172,7 @@ Four machines vs one, single stream, measured 2026-10-06. Method:
 
 ### Correctness
 
-Four nodes with FP32 partials, MTP on, 5,120 WikiText-2 positions after an 8,192-token prefix, compared against the
+First build, four nodes with FP32 partials, MTP on (2.0 x 5, Q8 draft head), 5,120 WikiText-2 positions after an 8,192-token prefix, compared against the
 one-node result:
 
 | | BF16 partials (before) | FP32 partials (shipped) |
@@ -144,8 +196,7 @@ With FP32 partials:
 
 ## Known limits
 
-- **Prefill does not scale past two nodes yet.** At 64k a four-node prefill takes about 52 s, vs about 46 s on one
-  node. The FP32 partials make prefill's exchanges bigger.
+- **Prefill scales only modestly.** At 64k a four-node prefill takes about 37 s, vs about 46 s on one node.
 - **FP32 partials cost some decode speed** at long context (about 6% of MTP decode at 400k) in exchange for the
   perplexity fix above.
 - **The slowest machine paces the group**, including where it loads its weights and n-gram rows from.
