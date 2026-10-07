@@ -26,9 +26,10 @@ measured in real agentic coding sessions, not a synthetic benchmark.
 > ahead, and not reading the same book twice - then goes as deep as you want to follow.
 
 > [!NOTE]
-> **This is a fork.** It adds tensor parallelism across 2 or 4 Strix Halo machines over 100 GbE RDMA (RoCE v2): up to
-> 1.77x plain and 1.73x MTP decode speed on four machines, about 109 tokens/s with MTP at 64k context. See
-> [docs/tp-rdma.md](docs/tp-rdma.md). The single-machine engine is unchanged. Upstream:
+> **This is a fork.** It adds tensor parallelism across 2 or 4 Strix Halo machines over 100 GbE RDMA (RoCE v2):
+> about 114 / 121 / 108 tokens/s with MTP at 4k / 64k / 400k context on four machines. See
+> [docs/tp-rdma.md](docs/tp-rdma.md). Single-machine arithmetic is unchanged; the fork's server defaults to a
+> different MTP draft policy (margin 1.5, up to 7 drafts, Q4 draft head). Upstream:
 > [shawnshekari/strixite](https://github.com/shawnshekari/strixite).
 
 ## What it is
