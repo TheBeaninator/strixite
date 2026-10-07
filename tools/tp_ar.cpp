@@ -353,8 +353,8 @@ int main(int argc, char **argv) {
 
         double t0 = now_ms();
         const bool use_mtp = a.num("mtp", 0) != 0, shadow = a.num("shadow", 0) != 0;
-        const int64_t mtp_draft = a.num("mtp-draft", 5), mtp_vocab = a.num("mtp-vocab", 65536), gen_n = a.num("gen", 256);
-        const double margin = a.real("mtp-margin", 2.0);
+        const int64_t mtp_draft = a.num("mtp-draft", 7), mtp_vocab = a.num("mtp-vocab", 65536), gen_n = a.num("gen", 256);
+        const double margin = a.real("mtp-margin", 1.5);  // default since the Q4 draft head (was 2.0 x 5, Q8 head)
         const bool reject_forward = a.num("mtp-reject-forward", 0) != 0, verify_k = a.num("verify-k", 1) != 0;
         const int64_t verify_reps = a.num("verify-reps", 8);
         STRIX_CHECK(!shadow || world == 1, "tp_ar: --shadow runs the whole model in one process (world 1)");
@@ -380,7 +380,7 @@ int main(int argc, char **argv) {
         Qwen4ExpSession &ses = be ? be->session() : *own;
         if (ses_mtp) ses.set_mtp_vocab(mtp_vocab);
         // The Q4 draft head (rank 0 / world 1 only: executors never draft)
-        const bool draft_q4 = onoff_arg(a.get("mtp-draft-q4", "off"), "tp_ar --mtp-draft-q4");
+        const bool draft_q4 = onoff_arg(a.get("mtp-draft-q4", "on"), "tp_ar --mtp-draft-q4");
         const bool free_q4 = a.num("mtp-free-q4", 0) != 0;
         // control for free_q4: the same free-running decode with the Q8 head under another policy (MARGINxDRAFTS):
         // how far any change of the drafts moves the verify-decided tokens

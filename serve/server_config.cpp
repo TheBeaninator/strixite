@@ -259,11 +259,11 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir, in
         // drafts at margin 2.0 with a 65536-id draft vocabulary. 5 drafts since 2026-10-01: teacher-forced replays of
         // real traffic, 3 repeats (7692313-draftconf-*): -0.60% ms/token on terminal-bench / mixed captures, -0.74% on
         // opencode turns vs 4.
-        {"mtp-draft", K::Int, 1, 15, "5", "MTP: most drafts per verify (the head chained)"},
-        {"mtp-margin", K::Number, 0, 100, "2", "MTP: draft only while the top-1 logit margin is at least this"},
+        {"mtp-draft", K::Int, 1, 15, "7", "MTP: most drafts per verify (the head chained)"},
+        {"mtp-margin", K::Number, 0, 100, "1.5", "MTP: draft only while the top-1 logit margin is at least this"},
         {"mtp-reject-forward", K::OnOff, 0, 0, "off",
          "MTP: after a rejected draft, forward its position's token alone (the pre-PF-1 path; A/B only)"},
-        {"mtp-draft-q4", K::OnOff, 0, 0, "off",
+        {"mtp-draft-q4", K::OnOff, 0, 0, "on",
          "MTP: drafts score a Q4 copy of the draft vocabulary rows (made at load) instead of the Q8 LM head"},
         {"mtp-vocab", K::Int, 0, 1 << 30, "65536", "MTP: drafts are scored over token ids [0, N); 0 = the whole vocabulary"},
         {"ngram-cache-rows", K::Int, 0, 1 << 26, std::to_string(ngram_cache_rows_default),
