@@ -15,6 +15,7 @@ namespace {
 
 constexpr int kThreads = 256;
 constexpr int kRowsPerPass = 8;  // x rows accumulated together per W pass
+constexpr int64_t kMinBlocks = 160;  // MR steps down below this many blocks (4 per CU on gfx1151's 40)
 constexpr int kChunk = 32;       // codes per lane per load (16 bytes)
 constexpr int64_t kMaxN = 0x7fffffff;
 constexpr int64_t kMaxM = 65535ll * kRowsPerPass;
@@ -312,11 +313,18 @@ int split_k(int64_t K) {
 template <typename TX, typename TY>
 void launch(const TX *x, const Q4DeviceView &w, TY *y, int64_t M, hipStream_t stream) {
     // Rows of x per weight pass: as many as there are, up to kRowsPerPass - fewer accumulators for short M
-    // (MTP verify, M = 2-5) keep the occupancy of the M = 1 kernel.
-    if (M == 1) launch_mr<TX, TY, 1>(x, w, y, M, split_k(w.K), stream);
-    else if (M == 2) launch_mr<TX, TY, 2>(x, w, y, M, split_k(w.K), stream);
-    else if (M <= 4) launch_mr<TX, TY, 4>(x, w, y, M, split_k(w.K), stream);
-    else launch_mr<TX, TY, kRowsPerPass>(x, w, y, M, split_k(w.K), stream);
+    // (MTP verify, M = 2-5) keep the occupancy of the M = 1 kernel. Small outputs (a TP rank's shared expert gate/up:
+    // N = 320 at TP4 = 40 blocks) leave the GPU's 40 CUs idle at those MR, so MR steps down until the grid has
+    // kMinBlocks blocks (measured: TP4 sh_gu M = 4 15.6 -> 10.4 us). MR never changes a row's
+    // arithmetic at a fixed split-K (bit-identical, row-invariant), and large outputs keep today's MR.
+    const int KS = split_k(w.K);
+    const int64_t bx = (w.N + kThreads / device_warp_size() / KS - 1) / (kThreads / device_warp_size() / KS);
+    int mr = M == 1 ? 1 : M == 2 ? 2 : M <= 4 ? 4 : kRowsPerPass;
+    while (mr > 1 && bx * ((M + mr - 1) / mr) < kMinBlocks) mr /= 2;
+    if (mr == 1) launch_mr<TX, TY, 1>(x, w, y, M, KS, stream);
+    else if (mr == 2) launch_mr<TX, TY, 2>(x, w, y, M, KS, stream);
+    else if (mr == 4) launch_mr<TX, TY, 4>(x, w, y, M, KS, stream);
+    else launch_mr<TX, TY, kRowsPerPass>(x, w, y, M, KS, stream);
 }
 
 template <typename T, int HB>
