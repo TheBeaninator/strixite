@@ -32,4 +32,18 @@ static_assert(sizeof(MtpPick) == 64, "MtpPick is copied as one 64-byte block");
 void mtp_pick(const float *logits, int64_t n, const uint32_t *router_err, const uint32_t *expert_err,
               const uint32_t *attn_err, const EmbeddingError *emb_err, MtpPick *out, hipStream_t stream);
 
+// The draft head split across TP ranks by vocabulary rows: one rank's partial top-2 over its n local logits
+// (global ids base .. base + n - 1; n = 0 gives the empty part), and the merge of N ranks' parts in rank order. The
+// merge is mtp_pick's own (lowest id on a tie; the runner-up = max(winner's runner-up, loser's best); NaN OR-ed), so
+// the merged pick equals mtp_pick over the whole draft vocabulary (up to the sign of a zero runner-up).
+struct MtpPart {
+    float b1, b2;
+    int32_t i1;  // INT32_MAX: nothing seen
+    uint32_t nan;
+};
+static_assert(sizeof(MtpPart) == 16, "MtpPart is gathered as 16 bytes per rank");
+void mtp_pick_part(const float *logits, int64_t n, int64_t base, MtpPart *out, hipStream_t stream);
+void mtp_pick_merge(const MtpPart *parts, int N, const uint32_t *router_err, const uint32_t *expert_err,
+                    const uint32_t *attn_err, const EmbeddingError *emb_err, MtpPick *out, hipStream_t stream);
+
 }  // namespace strix::kernels

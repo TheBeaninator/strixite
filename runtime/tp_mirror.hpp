@@ -76,9 +76,10 @@ public:
     void keep_verify();
     void keep_verify_prefix(int64_t rows);
     void drop_verify();
-    // The MTP head (rank 0 only; not mirrored).
+    // The MTP head (rank 0 only). With the split draft head (Qwen4ExpSession::set_draft_split) each draft is
+    // mirrored as kDraftHead first: the executors score their rows of the draft vocabulary in the same two exchanges.
     bool has_mtp() const { return ses_.has_mtp(); }
-    Qwen4ExpSession::MtpTop2 forward_mtp_top2(int32_t token_id, int64_t step) { return ses_.forward_mtp_top2(token_id, step); }
+    Qwen4ExpSession::MtpTop2 forward_mtp_top2(int32_t token_id, int64_t step);
     void set_mtp_vocab(int64_t n) { ses_.set_mtp_vocab(n); }
     void set_lookahead(const std::vector<int32_t> &next_ids);
     void prefetch_ple(const std::vector<int32_t> &ids, int64_t first);

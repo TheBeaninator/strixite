@@ -16,7 +16,8 @@ namespace strix {
 namespace {
 
 // v2: + c (the candidate n_valid folded into the forwards), the verify ops, state hash and stats.
-constexpr uint32_t kMsgMagic = 0x54503233, kReplyMagic = 0x54503252;
+// v3: + kDraftHead (a = the draft vocabulary, b = Q4 head), fire-and-forget.
+constexpr uint32_t kMsgMagic = 0x54503333, kReplyMagic = 0x54503252;
 enum Op : uint32_t {
     kReset = 1,
     kForward,
@@ -33,6 +34,7 @@ enum Op : uint32_t {
     kDropVerify,
     kStateHash,
     kStats,
+    kDraftHead,
 };
 enum : int64_t { kFull = 1, kHash = 2, kLogitsHash = 4 };
 
@@ -160,6 +162,14 @@ TpDriver::~TpDriver() {
         finish();
     } catch (...) {
     }
+}
+
+Qwen4ExpSession::MtpTop2 TpDriver::forward_mtp_top2(int32_t token_id, int64_t step) {
+    if (ses_.draft_split()) {  // Split draft head: the executors' half of the draft first (it waits for rank 0's u)
+        send_all(kDraftHead, ses_.mtp_vocab(), ses_.mtp_draft_q4() ? 1 : 0);
+        ++ops_["draft_head"];
+    }
+    return ses_.forward_mtp_top2(token_id, step);
 }
 
 void TpDriver::send_all(uint32_t op, int64_t a, int64_t b, int64_t c, const std::vector<int32_t> *ids) {
@@ -424,6 +434,7 @@ void tp_executor(Qwen4ExpSession &ses, TpControl &ctl) {
                     break;
                 }
                 case kWantCandidates: ses.want_candidates(m.a); break;
+                case kDraftHead: ses.draft_head_exec(m.a, m.b != 0); break;
                 case kKeepVerify: ses.keep_verify(); break;
                 case kKeepVerifyPrefix: ses.keep_verify_prefix(m.a); break;
                 case kDropVerify: ses.drop_verify(); break;

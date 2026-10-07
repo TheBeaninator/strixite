@@ -358,8 +358,12 @@ int main(int argc, char **argv) {
         const bool reject_forward = a.num("mtp-reject-forward", 0) != 0, verify_k = a.num("verify-k", 1) != 0;
         const int64_t verify_reps = a.num("verify-reps", 8);
         STRIX_CHECK(!shadow || world == 1, "tp_ar: --shadow runs the whole model in one process (world 1)");
-        Qwen4ExpModel model(weights, ngram, kernels::Act::BF16, false, cache_rows, yarn,
-                                  TpConfig{world, rank, std::max<int64_t>(1, mtp_vocab)});
+        // --mtp-split-head on - the draft head's vocabulary rows split across the ranks (every rank loads its
+        // share; rank 0 keeps the MTP layer). Off by default until the TP4 identity + ABAB gates pass.
+        const bool split_head = world > 1 && use_mtp && onoff_arg(a.get("mtp-split-head", "off"), "tp_ar --mtp-split-head");
+        TpConfig tpc{world, rank, std::max<int64_t>(1, mtp_vocab)};
+        tpc.draft_split = split_head;
+        Qwen4ExpModel model(weights, ngram, kernels::Act::BF16, false, cache_rows, yarn, tpc);
         const double load_s = (now_ms() - t0) / 1000;
         const Qwen4ExpDims &Dm = model.dims();
         std::fprintf(stderr, "tp_ar: rank %d of %d: %.2f GiB of weights (%.2f GiB read) loaded in %.1f s\n", rank, world,
@@ -408,6 +412,7 @@ int main(int argc, char **argv) {
                          (long long)model.draft_head_q4().N(), (long long)model.draft_head_q4().q4.G, draft_q4_s);
         }
         if (ses_mtp) ses.set_mtp_draft_q4(draft_q4);
+        if (split_head && draft_q4) model.make_draft_local_q4(a.num("mtp-draft-q4-group", 64));  // every rank's Q4 rows
         // FP32 partials are the session's default under TP; 0 switches them off (the BF16 A/B).
         const bool f32_mixer = world > 1 && a.num("tp-f32-mixer", 1) != 0;
         const bool f32_moe = world > 1 && a.num("tp-f32-moe", 1) != 0;
@@ -432,6 +437,7 @@ int main(int argc, char **argv) {
             t0 = now_ms();
             comm = std::make_unique<TpComm>(cc);
             tp_attach(ses, model, *comm);
+            if (split_head) ses.set_draft_split(true);
             std::fprintf(stderr, "tp_ar: rank %d of %d: communicator up in %.1f s (%s, port %d)\n", rank, world,
                          (now_ms() - t0) / 1000, comm->device().c_str(), cc.port + rank);
         }

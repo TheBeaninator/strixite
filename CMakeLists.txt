@@ -206,6 +206,11 @@ target_link_libraries(strix_model PUBLIC strix_kernels strix_formats strix_runti
 add_executable(test_wmma_ktail)
 strix_hip_sources(test_wmma_ktail tools/test_wmma_ktail.cpp)
 target_link_libraries(test_wmma_ktail PRIVATE strix_kernels strix_formats)
+
+# The split draft pick (per-rank parts + merge) against mtp_pick over the whole draft vocabulary.
+add_executable(test_mtp_split_pick)
+strix_hip_sources(test_mtp_split_pick tools/test_mtp_split_pick.cpp)
+target_link_libraries(test_mtp_split_pick PRIVATE strix_kernels strix_formats)
 # ROCTX ranges (common/trace.hpp) for profiler timelines - off in every shipping build.
 option(STRIX_ROCTX "Compile in ROCTX ranges (forward / layer / sublayer) for rocprofv3 --marker-trace" OFF)
 if(STRIX_ROCTX)

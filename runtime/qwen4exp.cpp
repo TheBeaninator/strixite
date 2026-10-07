@@ -80,8 +80,18 @@ QWeightView rows_prefix(QWeightView v, int64_t n, const char *what) {
     return v;
 }
 
+// Rows [r0, r0 + n) of a row-major Q8 weight (the same data: a pointer-offset view). The split draft head's rows.
+QWeightView rows_range(QWeightView v, int64_t r0, int64_t n, const char *what) {
+    STRIX_CHECK(r0 >= 0 && n >= 1 && r0 + n <= v.N(), what, ": rows [", r0, ", +", n, ") of ", v.N());
+    STRIX_CHECK(v.bits == 8, what, ": a row range of a ", v.bits, "-bit weight (Q8 only)");
+    const int64_t gs = v.q8.K / v.q8.G;
+    v.q8.q += r0 * v.q8.K, v.q8.scale += r0 * gs, v.q8.minv += r0 * gs, v.q8.N = n;
+    return v;
+}
+
 // Rank r of N's share of each tensor (StrixwSlice): F the whole model's dims. See Qwen4ExpDims::tp_world.
-std::optional<StrixwSlice> tp_slice(const StrixwTensor &t, const Qwen4ExpDims &F, int N, int r, int64_t draft_rows) {
+std::optional<StrixwSlice> tp_slice(const StrixwTensor &t, const Qwen4ExpDims &F, int N, int r, int64_t draft_rows,
+                                    bool draft_split = false) {
     const std::string &n = t.name;
     // Under TP the MTP draft head lives on rank 0 only, whole (its drafts and the catch-up need no exchange).
     if (n.rfind("mtp.", 0) == 0) return r == 0 ? std::nullopt : std::optional<StrixwSlice>(StrixwSlice{true, {}, 0, 0});
@@ -89,6 +99,10 @@ std::optional<StrixwSlice> tp_slice(const StrixwTensor &t, const Qwen4ExpDims &F
         if (n == "lm_head.weight") {
             const int64_t V = F.vocab / N;
             if (r == 0) return StrixwSlice{false, {{0, rank0_head_rows(F, N, draft_rows)}}, 0, 0};
+            if (draft_split) {  // + this rank's draft rows, after its vocabulary share
+                const int64_t Dr = draft_rows / N;
+                return StrixwSlice{false, {{r * V, (r + 1) * V}, {r * Dr, (r + 1) * Dr}}, 0, 0};
+            }
             return StrixwSlice{false, {{r * V, (r + 1) * V}}, 0, 0};
         }
         return std::nullopt;
@@ -162,8 +176,12 @@ Qwen4ExpModel::Qwen4ExpModel(const std::string &weights, const std::string &ngra
         D.idx_col = D.hq * 2 * D.hd + 2 * D.hkv * D.hd, D.astride = D.idx_col + D.idx_h * D.idx_d + D.idx_d;
         const int rank = tp.rank;
         const int64_t draft_rows = tp.draft_rows;
-        w_ = std::make_unique<StrixwDevice>(
-            weights, [F, N, rank, draft_rows](const StrixwTensor &t) { return tp_slice(t, F, N, rank, draft_rows); });
+        const bool split = tp.draft_split;
+        STRIX_CHECK(!split || draft_rows % N == 0, "Qwen4ExpModel: draft_split needs draft_rows (", draft_rows,
+                    ") divisible by ", N);
+        w_ = std::make_unique<StrixwDevice>(weights, [F, N, rank, draft_rows, split](const StrixwTensor &t) {
+            return tp_slice(t, F, N, rank, draft_rows, split);
+        });
     } else {
         w_ = std::make_unique<StrixwDevice>(weights);
     }
@@ -193,9 +211,17 @@ Qwen4ExpModel::Qwen4ExpModel(const std::string &weights, const std::string &ngra
         embed_ = w_->bf16(kLm + "embed_tokens.weight", {D.vocab, D.d});
     }
     // Rank 0 of N may hold more rows than its share (the draft's; tp_slice): the trunk's head is the first lm_rows.
-    const int64_t head_rows = D.tp_world > 1 && D.tp_rank == 0 ? rank0_head_rows(whole, D.tp_world, tp.draft_rows) : D.lm_rows;
+    const bool split = D.tp_world > 1 && tp.draft_split;
+    const int64_t Dr = split ? tp.draft_rows / D.tp_world : 0;
+    const int64_t head_rows = D.tp_world > 1 && D.tp_rank == 0 ? rank0_head_rows(whole, D.tp_world, tp.draft_rows)
+                              : D.lm_rows + Dr;  // ranks 1.. hold their draft rows after their share
     draft_lm_ = w_->qw("lm_head.weight", {head_rows, D.d});
     lm_head_ = head_rows == D.lm_rows ? draft_lm_ : rows_prefix(draft_lm_, D.lm_rows, "Qwen4ExpModel: LM head");
+    if (split) {
+        draft_base_ = D.tp_rank * Dr;
+        draft_local_ = D.tp_rank == 0 ? rows_prefix(draft_lm_, Dr, "Qwen4ExpModel: draft rows")
+                                      : rows_range(draft_lm_, D.lm_rows, Dr, "Qwen4ExpModel: draft rows");
+    }
     final_ = load_hc(*w_, kLm + "hyper_connection_mixer.", D, false);
     D.yarn_factor = yarn_factor;
     if (yarn_factor > 1.0f) {
@@ -363,6 +389,32 @@ int64_t make_served_mtp_draft_head(Qwen4ExpModel &model, int64_t mtp_vocab) {
     const int64_t rows = mtp_vocab == 0 ? vocab : mtp_vocab;
     model.make_draft_head_q4(rows, /*G=*/64, /*threads=*/16);
     return rows;
+}
+
+void Qwen4ExpModel::make_draft_local_q4(int64_t G, int threads) {
+    const char *fn = "Qwen4ExpModel::make_draft_local_q4";
+    STRIX_CHECK(draft_local_.bits != 0, fn, ": the draft split is off (TpConfig::draft_split)");
+    if (dims_.tp_rank == 0) {  // a prefix of the whole draft head's Q4 copy: the same bytes
+        STRIX_CHECK(draft_head_.bits == 4 && draft_head_.N() >= draft_local_.N() && draft_head_.q4.G == G, fn,
+                    ": rank 0 needs make_draft_head_q4 (group ", G, ") covering its ", draft_local_.N(), " rows first");
+        draft_local_q4_ = rows_prefix(draft_head_, draft_local_.N(), fn);
+        return;
+    }
+    STRIX_CHECK(draft_local_.bits == 8, fn, ": draft rows are ", draft_local_.bits, "-bit, expected 8");
+    STRIX_CHECK(threads >= 1 && threads <= 64, fn, ": threads ", threads, ", expected 1..64");
+    // As make_draft_head_q4 does for rank 0's rows: read the Q8 rows back, quantize_q4_from_q8.
+    const Q8DeviceView &v = draft_local_.q8;
+    const int64_t rows = draft_local_.N(), K = v.K;
+    Q8Weight q8;
+    q8.N = rows, q8.K = K, q8.G = v.G;
+    q8.q.resize((size_t)(rows * K));
+    q8.scale.resize((size_t)(rows * (K / v.G)));
+    q8.minv.resize(q8.scale.size());
+    STRIX_HIP_CHECK(hipMemcpy(q8.q.data(), v.q, q8.q.size(), hipMemcpyDeviceToHost), fn, ": read back Q8 codes");
+    STRIX_HIP_CHECK(hipMemcpy(q8.scale.data(), v.scale, q8.scale.size() * 2, hipMemcpyDeviceToHost), fn, ": read back Q8 scales");
+    STRIX_HIP_CHECK(hipMemcpy(q8.minv.data(), v.minv, q8.minv.size() * 2, hipMemcpyDeviceToHost), fn, ": read back Q8 mins");
+    draft_local_q4_dev_ = std::make_unique<Q4Device>(Q4Device::upload(quantize_q4_from_q8(q8, G, threads), "lm_head.draft_local_q4"));
+    draft_local_q4_ = qweight(draft_local_q4_dev_->view());
 }
 
 const Qwen4ExpModel::Layer &Qwen4ExpModel::layer(int64_t i) const {
@@ -1688,6 +1740,40 @@ void Qwen4ExpSession::set_mtp_vocab(int64_t n) {
 
 void Qwen4ExpSession::set_mtp_draft_q4(bool on) { mtp_draft_q4_ = on; }
 
+void Qwen4ExpSession::set_draft_split(bool on) {
+    const Qwen4ExpDims &D = m_.dims();
+    STRIX_CHECK(!on || (D.tp_world > 1 && m_.draft_local().bits != 0),
+                "Qwen4ExpSession::set_draft_split: needs a TP model loaded with TpConfig::draft_split");
+    STRIX_CHECK(!on || exchange_, "Qwen4ExpSession::set_draft_split: no exchange attached (tp_attach)");
+    draft_split_ = on;
+}
+
+void Qwen4ExpSession::draft_head_local(int64_t mtp_vocab, bool q4) {
+    const Qwen4ExpDims &D = m_.dims();
+    const int N = (int)D.tp_world;
+    if (mtp_parts_.size() == 0) mtp_parts_ = DeviceBuffer<uint8_t>(sizeof(kernels::MtpPart) * (size_t)(N + 1), "MTP parts");
+    auto *part = reinterpret_cast<kernels::MtpPart *>(mtp_parts_.get());
+    // 1. u (the head's collapsed input, rank 0's) to every rank
+    exchanges_ += 2;
+    exchange_(u_.get(), D.d, 4, stream_, nullptr);
+    // 2. this rank's rows of the draft vocabulary [base, base + n)
+    const QWeightView &local = q4 ? m_.draft_local_q4() : m_.draft_local();
+    STRIX_CHECK(local.bits != 0, "Qwen4ExpSession: the split draft head", q4 ? " (Q4: make_draft_local_q4)" : "", " is not loaded");
+    const int64_t base = m_.draft_base(), n = std::clamp<int64_t>(mtp_vocab - base, 0, local.N());
+    if (n > 0) {
+        const QWeightView head = rows_prefix(local, n, "Qwen4ExpSession: draft rows");
+        kernels::linear_qw(u_.get(), head, logits_.get(), 1, m_.act(), Act::F32, stream_);
+    }
+    kernels::mtp_pick_part(logits_.get(), n, base, part, stream_);
+    // 3. every rank's part, in rank order, into [1..N]
+    exchange_(part, 1, 5, stream_, part + 1);
+}
+
+void Qwen4ExpSession::draft_head_exec(int64_t mtp_vocab, bool q4) {
+    STRIX_CHECK(draft_split_ || m_.draft_local().bits != 0, "Qwen4ExpSession::draft_head_exec: no draft rows on this rank");
+    draft_head_local(mtp_vocab, q4);
+}
+
 void Qwen4ExpSession::mtp_input(int64_t T, const void *prev0) {
     STRIX_CHECK(mtp_, "Qwen4ExpSession::mtp_input: MTP is off");
     STRIX_CHECK(T >= 1 && T <= max_tokens_, "Qwen4ExpSession::mtp_input: ", T, " rows, expected 1..", max_tokens_);
@@ -1720,6 +1806,8 @@ void Qwen4ExpSession::mtp_input(int64_t T, const void *prev0) {
 }
 
 std::vector<float> Qwen4ExpSession::forward_mtp(int32_t token_id, int64_t step) {
+    STRIX_CHECK(!draft_split_, "Qwen4ExpSession::forward_mtp: whole draft logits are not available with the split draft "
+                               "head (set_draft_split); use forward_mtp_top2");
     run_mtp(token_id, step);
     std::vector<float> logits = read_back((size_t)mtp_vocab_, " MTP");
     mtp_done(step);
@@ -1730,8 +1818,12 @@ Qwen4ExpSession::MtpTop2 Qwen4ExpSession::forward_mtp_top2(int32_t token_id, int
     run_mtp(token_id, step);
     if (mtp_pick_.size() == 0) mtp_pick_ = DeviceBuffer<uint8_t>(sizeof(kernels::MtpPick), "MTP pick");
     auto *dev = reinterpret_cast<kernels::MtpPick *>(mtp_pick_.get());
-    kernels::mtp_pick(logits_.get(), mtp_vocab_, router_err_.get(), expert_err_.get(), attn_err_.get(),
-                      emb_err_.get(), dev, stream_);
+    if (draft_split_)
+        kernels::mtp_pick_merge(reinterpret_cast<const kernels::MtpPart *>(mtp_parts_.get()) + 1, (int)m_.dims().tp_world,
+                                router_err_.get(), expert_err_.get(), attn_err_.get(), emb_err_.get(), dev, stream_);
+    else
+        kernels::mtp_pick(logits_.get(), mtp_vocab_, router_err_.get(), expert_err_.get(), attn_err_.get(),
+                          emb_err_.get(), dev, stream_);
     // One copy into the pinned area (the logits' part - unused here) behind the forward, one synchronize.
     STRIX_CHECK(readback_.size() >= kReadbackLogitsAt + sizeof(kernels::MtpPick),
                 "Qwen4ExpSession::forward_mtp_top2: pinned area of ", readback_.size(), " bytes");
@@ -1866,6 +1958,10 @@ void Qwen4ExpSession::run_mtp(int32_t token_id, int64_t step) {
     // Q4 draft copy when it covers mtp_vocab_ (Qwen4ExpModel::make_draft_head_q4: drafts only, the verify decides),
     // else from the LM head as loaded.
     hc_mix(mtp.hc_mixer, false);
+    if (draft_split_) {  // Split draft head: every rank scores its rows; forward_mtp_top2 merges the gathered parts
+        draft_head_local(mtp_vocab_, mtp_draft_q4_);
+        return;
+    }
     const QWeightView &draft = m_.draft_head_q4();
     // mtp_draft_q4_ off (tp_ar's Q8 comparison cells): the Q8 rows, as before the copy.
     QWeightView head = mtp_draft_q4_ && draft.bits != 0 && mtp_vocab_ <= draft.N() ? draft : m_.draft_lm();
