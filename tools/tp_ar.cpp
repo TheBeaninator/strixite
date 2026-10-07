@@ -359,8 +359,8 @@ int main(int argc, char **argv) {
         const int64_t verify_reps = a.num("verify-reps", 8);
         STRIX_CHECK(!shadow || world == 1, "tp_ar: --shadow runs the whole model in one process (world 1)");
         // --mtp-split-head on - the draft head's vocabulary rows split across the ranks (every rank loads its
-        // share; rank 0 keeps the MTP layer). Off by default until the TP4 identity + ABAB gates pass.
-        const bool split_head = world > 1 && use_mtp && onoff_arg(a.get("mtp-split-head", "off"), "tp_ar --mtp-split-head");
+        // share; rank 0 keeps the MTP layer). On by default since the TP4 gates (identical outputs, +4.7..7.1% MTP).
+        const bool split_head = world > 1 && use_mtp && onoff_arg(a.get("mtp-split-head", "on"), "tp_ar --mtp-split-head");
         TpConfig tpc{world, rank, std::max<int64_t>(1, mtp_vocab)};
         tpc.draft_split = split_head;
         Qwen4ExpModel model(weights, ngram, kernels::Act::BF16, false, cache_rows, yarn, tpc);
