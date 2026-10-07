@@ -5,7 +5,9 @@
 //
 // Tensor parallelism (rank 0 of a TP group): set_tp_driver(drv) routes every call that changes the trunk's state
 // (forwards, verifies and their keeps / drops, resets, snapshots, PLE hints) through drv - mirrored to the executors
-// (runtime/tp_mirror.hpp) - and the MTP calls (drafts) to the session, as before: the head lives on rank 0 only.
+// (runtime/tp_mirror.hpp). Drafts go through drv too: with the split draft head (TpConfig::draft_split) every
+// rank scores its share of the draft vocabulary, so the executors must be told to run their half (TpDriver::
+// forward_mtp_top2); without the split the head lives on rank 0 and drv just forwards the call to the session.
 // Under TP a forward's logits are rank 0's vocabulary share, so forward_rows / forward_verify_rows refuse samplers that
 // need whole rows (the served defaults - greedy, top_k <= 20 - take candidates); forward / forward_verify gather whole
 // rows over the control channel (slow: quality runs). The prompt cache's export / import is not mirrored yet.
@@ -36,12 +38,7 @@ public:
     std::vector<float> forward_mtp(int32_t token_id, int64_t step) override {
         return session_.forward_mtp(token_id, step);
     }
-    Top2 forward_mtp_top2(int32_t token_id, int64_t step) override {  // reduced on the GPU, one small copy back
-        const Qwen4ExpSession::MtpTop2 p = session_.forward_mtp_top2(token_id, step);
-        Top2 t;
-        t.best = p.best, t.best_v = p.best_v, t.second_v = p.second_v, t.nan = p.nan;
-        return t;
-    }
+    Top2 forward_mtp_top2(int32_t token_id, int64_t step) override;  // reduced on the GPU, one small copy back
     std::vector<float> forward_verify(const std::vector<int32_t> &ids, int64_t n_logits) override;
     LogitRows forward_rows(const std::vector<int32_t> &ids, int64_t n_logits, bool cands, int64_t n_valid) override;
     LogitRows forward_verify_rows(const std::vector<int32_t> &ids, int64_t n_logits, bool cands, int64_t n_valid) override;

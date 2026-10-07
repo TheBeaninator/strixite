@@ -902,10 +902,13 @@ int main(int argc, char **argv) {
                       << ",\"x_mismatched\":" << qh.x_mismatched << ",\"first_mismatch\":\"" << esc(qh.first_mismatch)
                       << "\",\"x_hash_equal\":" << (qh.mismatched == 0 && qh.x_compared > 0 ? "true" : "false") << "}";
                 J << "}";
-                std::fprintf(stderr, "tp_ar: MTP quality: %lld positions, KL %.5f, top-1 %.4f, ppl %.5f, row hashes equal %lld / %lld, hashes mismatched %lld\n",
-                             (long long)all.n, mkls.empty() ? 0.0 : all.kl / (double)all.n,
-                             (double)all.agree / (double)all.n, std::exp(all.nll / (double)all.n), (long long)all.hash_eq,
-                             (long long)all.n, (long long)qh.mismatched);
+                // KL and top-1 are against --golden; without one there is nothing to compare (not "0 agreement").
+                char vs[96] = "KL n/a, top-1 n/a (no --golden)";
+                if (!mkls.empty())
+                    std::snprintf(vs, sizeof vs, "KL %.5f, top-1 %.4f", all.kl / (double)all.n, (double)all.agree / (double)all.n);
+                std::fprintf(stderr, "tp_ar: MTP quality: %lld positions, %s, ppl %.5f, row hashes equal %lld / %lld, hashes mismatched %lld\n",
+                             (long long)all.n, vs, std::exp(all.nll / (double)all.n), (long long)all.hash_eq, (long long)all.n,
+                             (long long)qh.mismatched);
             }
             if (noise_k > 0 && world == 1) {
                 kernels::set_split_k_scale(noise_k);
