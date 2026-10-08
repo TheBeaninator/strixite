@@ -47,6 +47,10 @@ reference derived from the model's spec.
 
 ## Quick start
 
+**Don't want to build it?** A container image has the server and its ROCm runtime ready to run on any Linux
+distribution with podman or docker: [Run strixite in a container](docs/container.md). The steps below build it from
+source.
+
 You need an AMD Strix Halo machine with 128 GB of memory running Linux, and a fast NVMe drive with ~120 GB free for
 the weights, plus room for the prompt cache (capped at 128 GiB, and it never leaves less than 32 GiB free).
 
