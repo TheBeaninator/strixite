@@ -39,7 +39,8 @@ reference derived from the model's spec.
 
 ## Features
 
-- **OpenAI-compatible server** - chat completions with streaming, tool calls and reasoning
+- **OpenAI-compatible server** - chat completions with streaming, tool calls, reasoning and structured output
+  ([what it accepts](docs/server.md))
 - **Multi-token prediction** - the model's own draft head, up to 5 tokens checked per step
 - **Prompt cache in RAM and on disk** - long agent conversations resume instead of being re-read every turn
 - **512k context** with YaRN, and attention that stays fast at depth
