@@ -32,6 +32,7 @@ strixite is an LLM inference engine I wrote from scratch in HIP for exactly one 
 - **AMD Strix Halo** (Ryzen AI MAX+ 395 / Radeon 8060S, gfx1151) - the whole model on the iGPU, in unified memory
 - **Qwen3.8-Flash-Next** - a 512-expert MoE with Gated DeltaNet linear attention, sparse attention and a
   51B-parameter n-gram table streamed from SSD, in ~66 GiB of 4/8-bit weights
+  ([what quant is this?](docs/weights.md))
 
 No llama.cpp, no ggml, no vendor libraries underneath. Every kernel is hand-written and checked against a CPU
 reference derived from the model's spec.

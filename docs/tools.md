@@ -100,7 +100,8 @@ build/strix/convert_qwen4exp --src ORIGINAL_MODEL_DIR --out OUTPUT_DIR --git HAS
 - `--git` - any short label; I use the strixite commit, so the file records what made it.
 - `--layout` - how many bits each kind of weight gets. The layout in the steps above is the one I serve: 4 bits for
   the 512 experts (most of the model, but each word uses only a few), 8 bits for the parts every word reads. Leave it
-  out and you get an older all-4-bit layout that is faster but noticeably less accurate.
+  out and you get an older all-4-bit layout that is faster but noticeably less accurate. Every part, its format and
+  why: [What quant is this?](weights.md).
 - `--threads N` - how many cores to use. `--plan` prints what it would write, without writing anything.
 
 ## convert_ngram_table - pull out the n-gram table
