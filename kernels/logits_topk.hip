@@ -43,14 +43,16 @@ __device__ inline LogitCand cand_of(uint64_t k, const float *row) {
     return LogitCand{row[id], id};
 }
 
-// Inputs of workgroup g of row r: logits (ids = positions, < n_valid, NaN flagged and left out) or an earlier level's
+// Inputs of workgroup g of row r: logits (ids = positions, < n_valid, NaN flagged and left out; with kMasked, also
+// left out where the row's mask bit is clear - structured output's allowed tokens) or an earlier level's
 // candidate lists (n_in a row). Writes kLogitCands sorted candidates to out[(r * groups + g) * kLogitCands ...],
 // (-inf, INT32_MAX) past the number of inputs; for logits the group's NaN flag to nan_out[r * groups + g]; on the last
 // level (groups == 1, nan != nullptr) the row's NaN flag to nan[r] (the OR of level 1's).
-template <bool kLogits>
+template <bool kLogits, bool kMasked>
 __global__ void __launch_bounds__(kThreads)
     reduce_kernel(const float *logits, int64_t ld, int n_valid, const LogitCand *in, int n_in, int groups,
-                  LogitCand *out, uint32_t *nan_out, const uint32_t *nan1, int groups1, uint32_t *nan) {
+                  LogitCand *out, uint32_t *nan_out, const uint32_t *nan1, int groups1, uint32_t *nan,
+                  const uint32_t *mask, int64_t mask_words) {
     __shared__ uint64_t s_head[kThreads], s_cand[kSlots];
     __shared__ uint64_t s_tau;
     __shared__ int s_n;
@@ -66,8 +68,10 @@ __global__ void __launch_bounds__(kThreads)
         if (kLogits) {
             if (j < n_valid) {
                 const float x = logits[r * ld + j];
+                // A NaN is flagged even where the mask disallows the id: the row is broken either way.
+                const bool allowed = !kMasked || ((mask[r * mask_words + (j >> 5)] >> (j & 31)) & 1u);
                 if (x != x) my_nan = 1u;
-                else key[p] = key_of(x, j);
+                else if (allowed) key[p] = key_of(x, j);
             }
         } else if (j < n_in) {
             const LogitCand c = in[r * n_in + j];
@@ -129,7 +133,7 @@ size_t logits_topk_workspace_bytes(int64_t rows, int64_t n_valid) {
 }
 
 void logits_topk(const float *logits, int64_t rows, int64_t ld, int64_t n_valid, LogitCand *out, uint32_t *nan,
-                 void *workspace, size_t workspace_bytes, hipStream_t stream) {
+                 void *workspace, size_t workspace_bytes, hipStream_t stream, const uint32_t *mask, int64_t mask_words) {
     const char *fn = "logits_topk";
     STRIX_CHECK(logits && out && nan && workspace, fn, ": null pointer (logits=", (const void *)logits, ", out=",
                 (void *)out, ", nan=", (void *)nan, ", workspace=", workspace, ")");
@@ -140,19 +144,32 @@ void logits_topk(const float *logits, int64_t rows, int64_t ld, int64_t n_valid,
     STRIX_CHECK(workspace_bytes >= logits_topk_workspace_bytes(rows, n_valid), fn, ": workspace ", workspace_bytes,
                 " bytes, need ", logits_topk_workspace_bytes(rows, n_valid), " for ", rows, " rows of ", n_valid);
     STRIX_CHECK(reinterpret_cast<uintptr_t>(workspace) % 8 == 0, fn, ": workspace must be 8-byte aligned");
+    if (mask != nullptr) {
+        STRIX_CHECK(mask_words >= (n_valid + 31) / 32, fn, ": mask_words = ", mask_words, " per row covers ",
+                    mask_words * 32, " ids, need ", (n_valid + 31) / 32, " words for n_valid = ", n_valid);
+        STRIX_CHECK(reinterpret_cast<uintptr_t>(mask) % 4 == 0, fn, ": mask must be 4-byte aligned");
+    } else {
+        STRIX_CHECK(mask_words == 0, fn, ": mask_words = ", mask_words, " without a mask (pass 0 when mask is null)");
+    }
     const int64_t g1 = groups_of(n_valid);
     auto *buf0 = static_cast<LogitCand *>(workspace);
     LogitCand *buf1 = buf0 + rows * g1 * kLogitCands;
     auto *nan1 = reinterpret_cast<uint32_t *>(buf1 + rows * g1 * kLogitCands);
     LogitCand *cur = g1 == 1 ? out : buf0;
-    reduce_kernel<true><<<dim3((unsigned)g1, (unsigned)rows), kThreads, 0, stream>>>(
-        logits, ld, (int)n_valid, nullptr, 0, (int)g1, cur, nan1, nullptr, 0, g1 == 1 ? nan : nullptr);
-    STRIX_HIP_CHECK_LAUNCH(fn, " level 1 rows=", rows, " n_valid=", n_valid);
+    if (mask != nullptr) {
+        reduce_kernel<true, true><<<dim3((unsigned)g1, (unsigned)rows), kThreads, 0, stream>>>(
+            logits, ld, (int)n_valid, nullptr, 0, (int)g1, cur, nan1, nullptr, 0, g1 == 1 ? nan : nullptr, mask,
+            mask_words);
+    } else {
+        reduce_kernel<true, false><<<dim3((unsigned)g1, (unsigned)rows), kThreads, 0, stream>>>(
+            logits, ld, (int)n_valid, nullptr, 0, (int)g1, cur, nan1, nullptr, 0, g1 == 1 ? nan : nullptr, nullptr, 0);
+    }
+    STRIX_HIP_CHECK_LAUNCH(fn, " level 1 rows=", rows, " n_valid=", n_valid, mask != nullptr ? " masked" : "");
     for (int64_t groups = g1, level = 2; groups > 1; ++level) {
         const int64_t n_in = groups * kLogitCands, next = groups_of(n_in);
         LogitCand *dst = next == 1 ? out : (cur == buf0 ? buf1 : buf0);
-        reduce_kernel<false><<<dim3((unsigned)next, (unsigned)rows), kThreads, 0, stream>>>(
-            logits, ld, 0, cur, (int)n_in, (int)next, dst, nullptr, nan1, (int)g1, next == 1 ? nan : nullptr);
+        reduce_kernel<false, false><<<dim3((unsigned)next, (unsigned)rows), kThreads, 0, stream>>>(
+            logits, ld, 0, cur, (int)n_in, (int)next, dst, nullptr, nan1, (int)g1, next == 1 ? nan : nullptr, nullptr, 0);
         STRIX_HIP_CHECK_LAUNCH(fn, " level ", level, " rows=", rows, " candidates=", n_in);
         cur = dst, groups = next;
     }

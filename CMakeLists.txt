@@ -76,6 +76,7 @@ find_package(Threads REQUIRED)
 add_library(strix_formats STATIC
     formats/safetensors.cpp
     formats/q4.cpp
+    formats/q4_from_q8.cpp
     formats/q5.cpp
     formats/q6.cpp
     formats/q8.cpp
@@ -212,6 +213,11 @@ endif()
 # Serving: host-only pieces - JSON, tokenizer, chat template, ...
 add_library(strix_serve STATIC
     serve/json.cpp
+    serve/grammar.cpp
+    serve/json_schema.cpp
+    serve/token_mask.cpp
+    serve/structured_output.cpp
+    serve/grammar_cache.cpp
     serve/unicode.cpp
     serve/tokenizer.cpp
     serve/chat_template.cpp
@@ -246,6 +252,8 @@ target_link_libraries(bench_host_buffer PRIVATE strix_rocm)
 
 add_executable(bench_sampler tools/bench_sampler.cpp)
 target_link_libraries(bench_sampler PRIVATE strix_serve)
+add_executable(bench_token_mask tools/bench_token_mask.cpp)
+target_link_libraries(bench_token_mask PRIVATE strix_serve)
 endif()
 
 add_executable(strix_server tools/strix_server.cpp)
@@ -255,6 +263,8 @@ if(STRIX_DEV_TOOLS)
 # Decode A/Bs on captured real traffic, teacher-forced (serve/replay.hpp).
 add_executable(bench_replay tools/bench_replay.cpp)
 target_link_libraries(bench_replay PRIVATE strix_serve_model)
+add_executable(nudge_fork tools/nudge_fork.cpp)
+target_link_libraries(nudge_fork PRIVATE strix_serve_model)
 endif()
 
 if(EXISTS "${CMAKE_SOURCE_DIR}/tests/CMakeLists.txt")

@@ -237,7 +237,7 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir, in
         {"rope-yarn-factor", K::Number, 1, 8, "1",
          "YaRN context extension: positions as trained (262144) x this; 1 = off (RoPE as trained). A change makes "
          "the prompt cache's entries from the other setting unusable (dropped at startup)"},
-        {"chunk", K::Int, 1, 8192, "512", "prefill chunk in tokens; progress and cancellation are checked per chunk"},
+        {"chunk", K::Int, 1, 16384, "512", "prefill chunk in tokens; progress and cancellation are checked per chunk"},
         {"model-id", K::Text, 0, 0, server.model_id, "the model name the API reports"},
         {"prompt-cache-dir", K::Path, 0, 0, models_dir + "/prompt-cache", "the disk prompt cache's directory"},
         {"prompt-cache-gib", K::Int, 0, 1 << 16, "128", "the disk prompt cache's cap in GiB; 0 = no prompt cache"},
@@ -261,8 +261,6 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir, in
         // opencode turns vs 4.
         {"mtp-draft", K::Int, 1, 15, "5", "MTP: most drafts per verify (the head chained)"},
         {"mtp-margin", K::Number, 0, 100, "2", "MTP: draft only while the top-1 logit margin is at least this"},
-        {"mtp-reject-forward", K::OnOff, 0, 0, "off",
-         "MTP: after a rejected draft, forward its position's token alone (the pre-PF-1 path; A/B only)"},
         {"mtp-vocab", K::Int, 0, 1 << 30, "65536", "MTP: drafts are scored over token ids [0, N); 0 = the whole vocabulary"},
         {"ngram-cache-rows", K::Int, 0, 1 << 26, std::to_string(ngram_cache_rows_default),
          "the n-gram table's LRU row cache in rows (320 B each, plus index); 0 = none"},
@@ -270,6 +268,12 @@ std::vector<ConfigOption> strix_server_options(const std::string &models_dir, in
          "write each request's token ids and MTP steps here (serve/capture.hpp); off = no capture"},
         {"think-nudge", K::OnOff, 0, 0, "on",
          "the thinking nudge into a think block going in circles (serve/think_nudge.hpp); off for like-for-like comparisons"},
+        {"think-nudge-rate", K::Number, 0.01, 1, "0.25",
+         "thinking nudge: due when this share of the last 1024 thinking tokens repeat earlier 8-grams"},
+        {"think-nudge-min-tokens", K::Int, 1024, 1 << 24, "3072", "thinking nudge: no rate trigger before this many thinking tokens"},
+        {"thinking", K::OnOff, 0, 0, "on",
+         "thinking for requests that don't say (enable_thinking / thinking.type / reasoning_effort / a budget); off = "
+         "rendered without the think block unless the request asks"},
     };
 }
 

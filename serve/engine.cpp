@@ -28,6 +28,8 @@ Engine::Engine(LmBackend &backend, const Tokenizer &tok, const Options &options)
       im_start_(tok.id_of("<|im_start|>")),
       im_end_(tok.id_of("<|im_end|>")),
       eot_(tok.id_of("<|endoftext|>")),
+      think_end_(tok.id_of("</think>")),
+      masker_(tok, backend.logits_row()),
       thinking_stop_(tok.encode(kThinkingStop)),
       nudge_{tok.encode(kThinkNudge1), tok.encode(kThinkNudge2)} {
     STRIX_CHECK(backend.logits_row() >= tok.size(), "Engine: logits rows of ", backend.logits_row(),
@@ -46,6 +48,7 @@ Engine::Engine(LmBackend &backend, const Tokenizer &tok, const Options &options)
                 ", expected 1..15");
     STRIX_CHECK(options_.capture_dir.empty() || std::filesystem::is_directory(options_.capture_dir),
                 "Engine: capture_dir '", options_.capture_dir, "' is not a directory");
+    (void)ThinkWatch{options_.think_nudge_policy};  // a bad nudge policy fails here, at startup, not on a request
     be_.reset();
     idle_since_ = now_s();
     thread_ = std::thread([this] { worker(); });
@@ -84,6 +87,10 @@ void Engine::submit(GenerationRequest req, std::shared_ptr<GenerationSink> sink)
     {
         std::lock_guard<std::mutex> lock(mu_);
         STRIX_CHECK(!stop_, "Engine::submit: shutting down");
+        // One line from the HTTP thread for a request that waits; its block prints when it starts.
+        if (stats_.busy || !queue_.empty())
+            slog(LogLevel::Info, "Request %lld queued: %s ahead of it (Request %lld running)", (long long)req.id,
+                 fmt_n((long long)queue_.size() + stats_.busy).c_str(), (long long)running_id_);
         queue_.push_back({std::move(req), std::move(sink), now_s()});
         ++stats_.queued;
     }
@@ -107,10 +114,11 @@ void Engine::worker() {
             job = std::move(queue_.front());
             queue_.pop_front();
             --stats_.queued, stats_.busy = 1;
+            running_id_ = job.req.id;
         }
         run(job);
         std::lock_guard<std::mutex> lock(mu_);
-        stats_.busy = 0;
+        stats_.busy = 0, running_id_ = 0;
         idle_since_ = now_s();
         stats_.live_tokens = (int64_t)seq_.size();
         stats_.snapshot_pos = be_.snapshot_pos(LmBackend::kTurnSlot);
@@ -143,9 +151,12 @@ int64_t Engine::resume_point(const std::vector<int32_t> &prompt, int64_t id, boo
                 if (from > 0) delta_from = from;
             }, &ram);
             if (loaded) {
-                slog(LogLevel::Info, "req %lld resume: %lld of %lld tokens from the prompt cache's %s (%.0f MB in %.0f ms%s)",
-                     (long long)id, (long long)dn, (long long)P, ram ? "RAM" : "disk", bytes / 1e6, (now_s() - t0) * 1e3,
-                     delta_from > 0 ? (", base " + std::to_string(delta_from) + " + delta").c_str() : "");
+                slog_row(LogLevel::Info, "resume", "%s of %s tokens from the prompt cache's %s", fmt_n(dn).c_str(),
+                         fmt_n(P).c_str(), ram ? "RAM" : "disk");
+                const std::string what = delta_from > 0 ? "the entry of " + fmt_n(delta_from) + " tokens + a delta"
+                                                         : std::string("a whole entry");
+                slog_row(LogLevel::Info, "", "%s, %s MB loaded in %s ms", what.c_str(), fmt_rate(bytes / 1e6, 0).c_str(),
+                         fmt_rate((now_s() - t0) * 1e3, 0).c_str());
                 from_ram = ram;
                 seq_.assign(prompt.begin(), prompt.begin() + dn);
                 from_disk = true;
@@ -153,25 +164,33 @@ int64_t Engine::resume_point(const std::vector<int32_t> &prompt, int64_t id, boo
             }
         }
     }
+    (void)id;
+    const auto none = [&] {
+        slog_row(LogLevel::Info, "resume", "none: no saved state is a prefix of this prompt - all %s tokens prefilled",
+                 fmt_n(P).c_str());
+    };
     if (how == -1 && best > 0) {
-        slog(LogLevel::Info, "req %lld resume: %lld of %lld tokens from the live session", (long long)id, (long long)best,
-             (long long)P);
+        slog_row(LogLevel::Info, "resume", "%s of %s tokens from the live session (where the last request ended)",
+                 fmt_n(best).c_str(), fmt_n(P).c_str());
         return best;
     }
     if (how == -1) {  // the live session, but nothing of it matches
-        slog(LogLevel::Info, "req %lld resume: none - all %lld tokens prefilled", (long long)id, (long long)P);
+        none();
         return 0;
     }
     if (how >= 0) {
         be_.restore_snapshot((int)how);
         seq_.resize((size_t)best);
-        slog(LogLevel::Info, "req %lld resume: %lld of %lld tokens from the %s snapshot", (long long)id, (long long)best,
-             (long long)P, how == LmBackend::kTurnSlot ? "turn" : how == LmBackend::kSystemSlot ? "system" : "user-turn");
+        slog_row(LogLevel::Info, "resume", "%s of %s tokens from the GPU snapshot at %s", fmt_n(best).c_str(),
+                 fmt_n(P).c_str(),
+                 how == LmBackend::kTurnSlot     ? "the previous prompt's end"
+                 : how == LmBackend::kSystemSlot ? "the system prompt's end"
+                                                 : "the start of the previous prompt's last user message");
         return best;
     }
     be_.reset();
     seq_.clear();
-    slog(LogLevel::Info, "req %lld resume: none - all %lld tokens prefilled", (long long)id, (long long)P);
+    none();
     return 0;
 }
 
@@ -190,7 +209,7 @@ void Engine::capture(const GenerationRequest &req, const std::vector<CaptureStep
                                std::chrono::system_clock::now().time_since_epoch()).count();
         write_capture(options_.capture_dir, rec, ms);
     } catch (const std::exception &e) {
-        slog(LogLevel::Error, "req %lld capture failed: %s", (long long)req.id, e.what());
+        slog_row(LogLevel::Error, "capture", "ERROR: failed: %s", e.what());
     }
 }
 
@@ -212,33 +231,63 @@ void Engine::report_resume_loss(const std::vector<int32_t> &prompt, int64_t star
     const std::string text = resume_loss_text(prompt, start, common, their_n, what, im_start_);
     if (text.empty()) return;
     const int64_t lost = std::min(common, P - 1) - start;
-    slog(lost >= kResumeLossWarnTokens ? LogLevel::Warning : LogLevel::Info, "req %lld   %s", (long long)id, text.c_str());
+    const bool warn = lost >= kResumeLossWarnTokens;
+    // "resume lost N tokens: why" - the label says "resume"; the why goes on its own row.
+    std::string head = text.rfind("resume ", 0) == 0 ? text.substr(7) : text, why;
+    if (const size_t colon = head.find(": "); colon != std::string::npos) why = head.substr(colon + 2), head.resize(colon);
+    slog_row(warn ? LogLevel::Warning : LogLevel::Info, "resume", "%s%s", warn ? "WARNING: " : "", head.c_str());
+    if (!why.empty()) slog_row(warn ? LogLevel::Warning : LogLevel::Info, "", "%s", why.c_str());
+    (void)id;
 }
 
 namespace {
-// A finished request: one headline (what a human scans for), the MTP and PLE detail on their own debug lines.
-void log_done(int64_t id, const GenerationResult &r, bool stream) {
-    const int64_t prefilled = r.prompt_tokens - r.cached_tokens;
+// A finished request's detail rows, before its cache saves: MTP and PLE (debug), a dropped tool call.
+void log_detail(const GenerationResult &r) {
+    if (r.mtp_drafted_tokens > 0) {
+        char per_forward[48] = "";
+        if (r.decode_forwards > 0)
+            std::snprintf(per_forward, sizeof per_forward, ", %.2f tokens per forward",
+                          (double)(r.completion_tokens - r.fed_tokens) / (double)r.decode_forwards);
+        slog_row(LogLevel::Debug, "mtp", "%s/%s drafts accepted (%.1f%%)%s", fmt_n(r.mtp_accepted_tokens).c_str(),
+                 fmt_n(r.mtp_drafted_tokens).c_str(), 100.0 * (double)r.mtp_accepted_tokens / (double)r.mtp_drafted_tokens,
+                 per_forward);
+        slog_row(LogLevel::Debug, "", "%s rollbacks; drafts accepted before the reject 0/1/2/3+: %s/%s/%s/%s",
+                 fmt_n(r.mtp_rollbacks).c_str(), fmt_n(r.mtp_reject_at[0]).c_str(), fmt_n(r.mtp_reject_at[1]).c_str(),
+                 fmt_n(r.mtp_reject_at[2]).c_str(), fmt_n(r.mtp_reject_at[3]).c_str());
+    }
+    const BackendStats &b = r.backend;
+    if (b.ple_gathers > 0) {
+        // The n-gram (PLE) table's rows: from the RAM row cache, else read from the table file - on demand inside a
+        // forward, or ahead of it by a prefetch. A forward that reached the PLE layer before its rows waited.
+        const bool slow = b.ple_wait_seconds > 1.0;
+        const LogLevel level = slow ? LogLevel::Warning : LogLevel::Debug;
+        slog_row(level, "ple", "%s row lookups, %s distinct, %.1f%% from the RAM row cache",
+                 fmt_n(b.ngram_rows_requested).c_str(), fmt_n(b.ngram_rows_unique).c_str(),
+                 b.ngram_rows_unique > 0 ? 100.0 * (double)b.ngram_rows_cached / (double)b.ngram_rows_unique : 0.0);
+        slog_row(level, "", "%s read from the table file on demand, %s prefetched", fmt_n(b.ngram_rows_read).c_str(),
+                 fmt_n(b.ngram_rows_prefetched).c_str());
+        slog_row(level, "", "%sforwards waited for rows %s times, %s s in total", slow ? "WARNING: " : "",
+                 fmt_n(b.ple_waits).c_str(), fmt_rate(b.ple_wait_seconds, 3).c_str());
+    }
+    if (r.dropped_partial_call)
+        slog_row(LogLevel::Warning, "tools", "WARNING: dropped a tool call still open when the generation ended (%s)",
+                 r.finish_reason.c_str());
+}
+
+// The end of a request's block, after its cache saves: the "done" row - the times a client sees (the total first, in
+// a fixed column) and how it ended - and the closing rule.
+void log_footer(const GenerationResult &r) {
     const LogLevel level = r.finish_reason == "error" ? LogLevel::Error
                            : r.finish_reason == "cancelled" ? LogLevel::Warning
                                                             : LogLevel::Info;
-    // The numbers are on the prefill / generate lines; this one closes the turn: how it ended, and the wait before.
-    slog(level, "req %lld done: %s%s%s (queue %.2f s, prompt %lld = %lld cached + %lld new, out %lld)", (long long)id,
-         r.finish_reason.c_str(), r.error.empty() ? "" : " - ", r.error.c_str(), r.queue_ms / 1e3,
-         (long long)r.prompt_tokens, (long long)r.cached_tokens, (long long)prefilled, (long long)r.completion_tokens);
-    if (r.mtp_drafted_tokens > 0)
-        slog(LogLevel::Debug, "req %lld   mtp %lld/%lld accepted (%.1f%%), %lld rollbacks, after 0/1/2/3+: %lld/%lld/%lld/%lld",
-             (long long)id, (long long)r.mtp_accepted_tokens, (long long)r.mtp_drafted_tokens,
-             100.0 * (double)r.mtp_accepted_tokens / (double)r.mtp_drafted_tokens, (long long)r.mtp_rollbacks,
-             (long long)r.mtp_reject_at[0], (long long)r.mtp_reject_at[1], (long long)r.mtp_reject_at[2],
-             (long long)r.mtp_reject_at[3]);
-    const BackendStats &b = r.backend;
-    if (b.ple_gathers > 0)
-        slog(b.ple_wait_seconds > 1.0 ? LogLevel::Warning : LogLevel::Debug,
-             "req %lld   ple %lld rows, %lld distinct, %.1f%% cached, %lld read, %lld prefetched, waited %.3f s over %lld",
-             (long long)id, (long long)b.ngram_rows_requested, (long long)b.ngram_rows_unique,
-             b.ngram_rows_unique > 0 ? 100.0 * (double)b.ngram_rows_cached / (double)b.ngram_rows_unique : 0.0,
-             (long long)b.ngram_rows_read, (long long)b.ngram_rows_prefetched, b.ple_wait_seconds, (long long)b.ple_waits);
+    std::string how = r.finish_reason;
+    if (r.tool_calls > 0) how += " (" + std::to_string(r.tool_calls) + (r.tool_calls == 1 ? " call)" : " calls)");
+    if (!r.error.empty()) how = "ERROR: failed (the error row above says why)";
+    char first[48] = "";
+    if (r.first_token_ms > 0) std::snprintf(first, sizeof first, ", %s s first token", fmt_rate(r.first_token_ms / 1e3, 2).c_str());
+    slog_row(level, "done", "%9s s total%s, %s, queue %s s", fmt_rate(r.total_ms / 1e3, 2).c_str(), first, how.c_str(),
+             fmt_rate(r.queue_ms / 1e3, 2).c_str());
+    slog(LogLevel::Info, "%s", kLogRule);
 }
 
 }  // namespace
@@ -251,13 +300,23 @@ void Engine::run(Job &job) {
     res.queue_ms = (t_start - job.enqueued) * 1e3;
     res.prompt_tokens = (int64_t)req.prompt.size();
     const BackendStats b0 = be_.backend_stats();
-    // A turn's lines end with a blank line, after the saves - whichever way run() returns. One
-    // no-break space (U+00A0): journald drops a line that is empty or only ASCII whitespace after the "<N>" prefix.
-    struct BlankLine {
-        ~BlankLine() { slog(LogLevel::Info, "\xc2\xa0"); }
-    } blank_line;
+    // The request's log block (serve/log.hpp): the rule, the id and the HTTP layer's rows now; the footer (log_footer)
+    // after the saves - whichever way run() returns - then a blank line before the next block.
+    // The blank line is one no-break space (U+00A0): journald drops a line that is empty or only ASCII whitespace
+    // after the "<N>" prefix.
+    slog(LogLevel::Info, "%s", kLogRule);
+    slog(LogLevel::Info, "Request %lld", (long long)req.id);
+    for (const auto &[label, text] : req.log_header) slog_row(LogLevel::Info, label.c_str(), "%s", text.c_str());
+    struct BlockEnd {
+        const GenerationResult &r;
+        ~BlockEnd() {
+            log_footer(r);
+            slog(LogLevel::Info, "\xc2\xa0");
+        }
+    } block_end{res};
     const auto finish = [&](const std::string &reason) {
         res.finish_reason = reason;
+        res.total_ms = (now_s() - job.enqueued) * 1e3;
         const BackendStats b = be_.backend_stats();
         res.backend.ngram_rows_requested = b.ngram_rows_requested - b0.ngram_rows_requested;
         res.backend.ngram_rows_unique = b.ngram_rows_unique - b0.ngram_rows_unique;
@@ -284,7 +343,7 @@ void Engine::run(Job &job) {
             if (res.decode_ms > 0 && res.completion_tokens > 1)
                 stats_.last_decode_tps = (double)(res.completion_tokens - 1) / (res.decode_ms / 1e3);
         }
-        log_done(req.id, res, req.stream);  // here, not in the HTTP thread: the turn's lines stay in order
+        log_detail(res);
         sink.on_done(res);
     };
     try {
@@ -325,6 +384,18 @@ void Engine::run(Job &job) {
         const bool cands = Sampler(req.sampling, tok_.size()).takes_candidates();
         const int64_t n_valid = tok_.size();
         LogitRows logits;
+        // Structured output (response_format / tool_choice): every logits row from the prompt's last one on is masked
+        // to what the grammar allows there (serve/structured_output.hpp); `so` follows each generated or fed token.
+        std::unique_ptr<StructuredOutput> so;
+        if (req.grammar)
+            so = std::make_unique<StructuredOutput>(req.grammar, masker_, tok_, think_end_, std::vector<int32_t>{im_end_, eot_},
+                                                    !req.parser.thinking);
+        LogitMasks row_masks;  // the masks of the forward being made (kept alive across the call)
+        const auto masks_for = [&](const std::vector<int32_t> &pending) -> const LogitMasks * {
+            if (!so) return nullptr;
+            row_masks = so->masks_for(pending);
+            return &row_masks;
+        };
         // A chunk ends at the backend's max chunk, and at the turn / user-start / system snapshot points.
         auto chunk_end = [&](int64_t pos) {
             int64_t end = std::min(P, pos + be_.max_chunk());
@@ -340,7 +411,7 @@ void Engine::run(Job &job) {
             if (end < P)
                 be_.set_lookahead(std::vector<int32_t>(prompt.begin() + end, prompt.begin() + chunk_end(end)));
             logits = be_.forward_rows(std::vector<int32_t>(prompt.begin() + pos, prompt.begin() + end), end == P ? 1 : 0,
-                                      cands, n_valid);
+                                      cands, n_valid, end == P ? masks_for({}) : nullptr);
             seq_.insert(seq_.end(), prompt.begin() + pos, prompt.begin() + end);
             pos = end;
             if (pos == cut) be_.save_snapshot(LmBackend::kTurnSlot);
@@ -354,9 +425,17 @@ void Engine::run(Job &job) {
         }
         const double t_first = now_s();
         res.prompt_ms = (t_first - t_start) * 1e3;
-        slog(LogLevel::Info, "req %lld prefill: %lld new tokens after %lld cached in %.2f s = %.0f t/s", (long long)req.id,
-             (long long)(P - start), (long long)start, res.prompt_ms / 1e3,
-             res.prompt_ms > 0 ? (double)(P - start) / (res.prompt_ms / 1e3) : 0.0);
+        res.first_token_ms = (t_first - job.enqueued) * 1e3;
+        // The rate leads the row, right-aligned in a fixed column, so the numbers a block is read for (this and
+        // "generate") stack up vertically across requests. Only for a real prefill: below ~1k tokens the time is
+        // mostly fixed cost and the rate misleads - then "-" stands in the column.
+        char rate[48];
+        if (P - start >= 1024 && res.prompt_ms > 0)
+            std::snprintf(rate, sizeof rate, "%9s t/s", fmt_rate((double)(P - start) / (res.prompt_ms / 1e3), 0).c_str());
+        else
+            std::snprintf(rate, sizeof rate, "%9s t/s", "-");
+        slog_row(LogLevel::Info, "prefill", "%s   %s new tokens in %s s", rate, fmt_n(P - start).c_str(),
+                 fmt_rate(res.prompt_ms / 1e3, 2).c_str());
         {
             std::lock_guard<std::mutex> lock(mu_);
             stats_.prompt_tokens += P, stats_.cached_tokens += start, stats_.prefill_tokens += P - start;
@@ -368,7 +447,7 @@ void Engine::run(Job &job) {
 
         Sampler sampler(req.sampling, tok_.size());
         OutputParser parser(tok_, req.parser);
-        ThinkWatch watch{ThinkWatch::Policy{}};
+        ThinkWatch watch{options_.think_nudge_policy};
         // A sampled token just fed to the parser: the nudge watch follows the reasoning ones.
         const auto watch_tok = [&](int32_t t) {
             if (options_.think_nudge && parser.in_reasoning()) watch.observe(t, tok_.decode({t}));
@@ -380,15 +459,32 @@ void Engine::run(Job &job) {
             if (!options_.capture_dir.empty())
                 steps.push_back({(uint8_t)drafted, (uint8_t)accepted, (uint8_t)emitted});
         };
-        // PF-1: a token sampled at a rejected draft's position, already counted and fed to the parser but not yet
-        // forwarded - the next step starts from it (drafts from it, then verifies it as row 0).
+        // A token sampled at a rejected draft's position - already counted, fed to the parser and the response format,
+        // but not yet forwarded: the next step starts from it (drafts from it, then verifies it as row 0) instead of a
+        // forward of its own (strixite PR #1).
         int32_t carry = -1;
         for (;;) {
             if (sink.cancelled()) {
                 reason = "cancelled";
                 break;
             }
-            // Thinking budget spent: the engine closes the think block itself (fed, not sampled); sampling goes on.
+            // An injection due (the budget's stop or a nudge, below) while a token is carried: forward the carried token
+            // alone first - the old rollback path, for this step only - so the injection lands after it. Waiting for a
+            // step without a carry instead could wait for ever: with every draft rejected, every step carries one.
+            if (carry >= 0) {
+                const bool budget_due = req.thinking_budget >= 0 && !res.thinking_budget_hit && parser.in_reasoning() &&
+                                        parser.reasoning_tokens() >= req.thinking_budget;
+                const bool nudge_due = options_.think_nudge && parser.in_reasoning() && watch.due() != 0;
+                if (budget_due || nudge_due) {
+                    ++res.decode_forwards;
+                    logits = be_.forward_rows({carry}, 1, cands, n_valid, masks_for({}));
+                    seq_.push_back(carry);
+                    step(0, 0, 1);
+                    carry = -1;
+                }
+            }
+            // Thinking budget spent: the engine closes the think block itself (fed, not sampled), then goes on sampling. Never
+            // while a carried token waits (flushed just above when due): the injection would be forwarded ahead of it.
             if (carry < 0 && req.thinking_budget >= 0 && !res.thinking_budget_hit && parser.in_reasoning() &&
                 parser.reasoning_tokens() >= req.thinking_budget) {
                 const int64_t n = (int64_t)thinking_stop_.size();
@@ -397,28 +493,38 @@ void Engine::run(Job &job) {
                     break;
                 }
                 res.thinking_budget_hit = true;
-                for (int32_t id : thinking_stop_) parser.feed(id, events);
+                res.fed_tokens += n;
+                for (int32_t id : thinking_stop_) {
+                    parser.feed(id, events);
+                    if (so) so->feed(id);
+                }
                 if (!events.empty()) sink.on_events(events), events.clear();
                 res.completion_tokens += n;
-                logits = be_.forward_rows(thinking_stop_, 1, cands, n_valid);
+                logits = be_.forward_rows(thinking_stop_, 1, cands, n_valid, masks_for({}));
                 seq_.insert(seq_.end(), thinking_stop_.begin(), thinking_stop_.end());
                 step(kThinkingStopStep, 0, n);
                 continue;
             }
             // Thinking going in circles: feed a nudge into the think block (never a </think>), then go on sampling.
-            if (carry < 0 && options_.think_nudge && parser.in_reasoning()) {  // injections wait until carry is forwarded
+            // Not while a carried token waits (as above).
+            if (carry < 0 && options_.think_nudge && parser.in_reasoning()) {
                 if (const int d = watch.due()) {
                     const std::vector<int32_t> &nt = nudge_[d - 1];
                     const int64_t n = (int64_t)nt.size();
                     if (res.completion_tokens + n < req.max_tokens) {
-                        slog(LogLevel::Info, "req %lld think nudge %d at %lld thinking tokens (self-copy %.0f%% over the last %lld)",
-                             (long long)req.id, d, (long long)watch.thinking_tokens(), 100.0 * watch.window_rate(),
-                             (long long)ThinkWatch::Policy{}.window);
-                        for (int32_t t : nt) parser.feed(t, events);
+                        slog_row(LogLevel::Info, "nudge", "#%d fed at %s thinking tokens: going in circles", d,
+                                 fmt_n(watch.thinking_tokens()).c_str());
+                        slog_row(LogLevel::Info, "", "%.0f%% of the last %s thinking tokens repeat earlier ones",
+                                 100.0 * watch.window_rate(), fmt_n((long long)options_.think_nudge_policy.window).c_str());
+                        for (int32_t t : nt) {
+                            parser.feed(t, events);
+                            if (so) so->feed(t);
+                        }
                         if (!events.empty()) sink.on_events(events), events.clear();
                         res.completion_tokens += n;
                         ++res.think_nudges;
-                        logits = be_.forward_rows(nt, 1, cands, n_valid);
+                        res.fed_tokens += n;
+                        logits = be_.forward_rows(nt, 1, cands, n_valid, masks_for({}));
                         seq_.insert(seq_.end(), nt.begin(), nt.end());
                         step(kThinkingStopStep, 0, n);
                         watch.fired();
@@ -427,7 +533,7 @@ void Engine::run(Job &job) {
                 }
             }
             int32_t id;
-            if (carry >= 0) {  // sampled, counted and parsed at the rejected position: straight to drafting
+            if (carry >= 0) {  // sampled, counted and fed at the rejected position: straight to drafting
                 id = carry;
                 carry = -1;
             } else {
@@ -437,6 +543,7 @@ void Engine::run(Job &job) {
                     reason = "stop";
                     break;
                 }
+                if (so) so->feed(id);
                 const bool stopped = parser.feed(id, events);
                 watch_tok(id);
                 if (!events.empty()) sink.on_events(events), events.clear();
@@ -460,18 +567,26 @@ void Engine::run(Job &job) {
                 // Each token's PLE rows start loading as soon as it is known, while the next draft runs - so the
                 // verify (or id's own forward, when no draft passes) finds them in the row cache.
                 be_.prefetch_ple(ids, 0);
+                StructuredOutput::Cursor draft_at = so ? so->cursor() : StructuredOutput::Cursor{};
                 for (int64_t step = 0; step < steps; ++step) {
                     const Top2 t = be_.forward_mtp_top2(ids.back(), step);
                     STRIX_CHECK(!t.nan, "Engine: NaN in the MTP draft logits (step ", step, ")");
                     const int32_t d = t.best;
                     if (t.best_v - t.second_v < options_.mtp_margin || d == im_end_ || d == eot_) break;
+                    // A draft the response format refuses would be rejected anyway: don't verify it.
+                    if (so) {
+                        if (!so->allows(draft_at, d)) break;
+                        draft_at = so->after(draft_at, d);
+                    }
                     ids.push_back(d);
                     if (step + 1 < steps) be_.prefetch_ple(ids, (int64_t)ids.size() - 1);  // the last: nothing to hide behind
                 }
                 const int64_t k = (int64_t)ids.size() - 1;
                 if (k > 0) {
                     res.mtp_drafted_tokens += k;
-                    const LogitRows ml = be_.forward_verify_rows(ids, k + 1, cands, n_valid);
+                    ++res.decode_forwards;
+                    const LogitRows ml = be_.forward_verify_rows(
+                        ids, k + 1, cands, n_valid, masks_for(std::vector<int32_t>(ids.begin() + 1, ids.end())));
                     STRIX_CHECK(ml.rows == k + 1, "Engine: verify of ", k + 1, " tokens returned ", ml.rows,
                                 " logits rows");
                     // Accept drafts while the sampled token is the draft.
@@ -482,6 +597,7 @@ void Engine::run(Job &job) {
                         v = sampler.sample(ml, j);
                         if (v != ids[(size_t)j + 1]) break;
                         ++res.mtp_accepted_tokens, ++res.completion_tokens;
+                        if (so) so->feed(v);
                         const bool st = parser.feed(v, events);
                         watch_tok(v);
                         if (!events.empty()) sink.on_events(events), events.clear();
@@ -507,11 +623,11 @@ void Engine::run(Job &job) {
                         continue;
                     }
                     // Draft j rejected; v is this position's sampled token. Keep id and the j accepted drafts from the
-                    // verify (the backend doesn't run them again - keep_verify_prefix). The session's state is then
-                    // "after ids[j]", exactly what a step's drafting starts from, so v carries into the next step
-                    // (PF-1) instead of a forward of its own (mtp_reject_forward: the old path).
+                    // verify (the backend doesn't run them again - keep_verify_prefix). The session is then "after
+                    // ids[j]" - what a step's drafting starts from - so v carries into the next step instead of a
+                    // forward of its own (strixite PR #1): one forward less per rollback.
                     ++res.mtp_rollbacks, ++res.completion_tokens, ++res.mtp_reject_at[std::min<int64_t>(j, kMtpMaxDraft - 1)];
-                    {  // v's PLE rows load while the prefix is kept (its forward comes right after)
+                    {  // v's PLE rows load while the prefix is kept (its forward - the next verify's row 0 - comes soon)
                         std::vector<int32_t> next(ids.begin(), ids.begin() + j + 1);
                         next.push_back(v);
                         be_.prefetch_ple(next, j + 1);
@@ -523,25 +639,21 @@ void Engine::run(Job &job) {
                         reason = "stop";
                         break;
                     }
+                    if (so) so->feed(v);
                     const bool st = parser.feed(v, events);
                     watch_tok(v);
                     if (!events.empty()) sink.on_events(events), events.clear();
-                    if (options_.mtp_reject_forward) {
-                        logits = be_.forward_rows({v}, 1, cands, n_valid);
-                        seq_.push_back(v);
-                        step(k, j, j + 2);
-                    } else {
-                        step(k, j, j + 1);  // v is emitted by the next step
-                    }
+                    step(k, j, j + 1);  // v is emitted by the next step
                     if (st || res.completion_tokens >= req.max_tokens) {
                         reason = st ? "stop" : "length";
                         break;
                     }
-                    if (!options_.mtp_reject_forward) carry = v;
+                    carry = v;
                     continue;
                 }
             }
-            logits = be_.forward_rows({id}, 1, cands, n_valid);
+            ++res.decode_forwards;
+            logits = be_.forward_rows({id}, 1, cands, n_valid, masks_for({}));
             seq_.push_back(id);
             step(0, 0, 1);
         }
@@ -550,16 +662,22 @@ void Engine::run(Job &job) {
         res.reasoning_tokens = parser.reasoning_tokens();
         res.dropped_partial_call = parser.dropped_partial_call();
         res.decode_ms = (now_s() - t_first) * 1e3;
+        res.tool_calls = parser.tool_calls();
         if (reason == "stop" && parser.tool_calls() > 0) reason = "tool_calls";
-        slog(LogLevel::Info, "req %lld generate: %lld tokens (think %lld) in %.2f s = %.1f t/s", (long long)req.id,
-             (long long)res.completion_tokens, (long long)res.reasoning_tokens, res.decode_ms / 1e3,
-             res.decode_ms > 0 && res.completion_tokens > 1 ? (res.completion_tokens - 1) / (res.decode_ms / 1e3) : 0.0);
+        char gen_rate[48];  // the rate leads the row, in the same column as the prefill one (serve/log.hpp)
+        std::snprintf(gen_rate, sizeof gen_rate, "%9s t/s",
+                      fmt_rate(res.decode_ms > 0 && res.completion_tokens > 1 ? (res.completion_tokens - 1) / (res.decode_ms / 1e3) : 0.0,
+                               1)
+                          .c_str());
+        slog_row(LogLevel::Info, "generate", "%s   %s tokens (think %s) in %s s", gen_rate,
+                 fmt_n(res.completion_tokens).c_str(), fmt_n(res.reasoning_tokens).c_str(),
+                 fmt_rate(res.decode_ms / 1e3, 2).c_str());
         finish(reason);
         if (!options_.capture_dir.empty() && reason != "cancelled") capture(req, steps, reason);
         // After the response: the new prefixes go to the prompt cache's RAM tier (the disk only later, if at all).
         if (cache_ && reason != "cancelled") {
             const double t0 = now_s();
-            int saved = 0;
+            int saved = 0, rows = 0;  // rows: the first gets the "cache" label
             const auto save = [&](int slot, int64_t n, PromptCache::Kind kind, const char *what) {
                 // Already cached first: a request resumed exactly at its turn entry has no snapshot there, and needs none.
                 const char *skip = n <= 0                                ? "no such point in the prompt"
@@ -569,45 +687,51 @@ void Engine::run(Job &job) {
                                                                          : "";
                 if (skip == nullptr) return;  // already cached
                 if (*skip) {
-                    slog(LogLevel::Debug, "req %lld save: not the %s at %lld: %s (snapshot at %lld)", (long long)req.id, what,
-                         (long long)n, skip, (long long)be_.snapshot_pos(slot));
+                    slog_row(LogLevel::Debug, rows++ ? "" : "cache", "%s, %s tokens: not saved - %s (snapshot at %s)",
+                             what, fmt_n(n).c_str(), skip, fmt_n(be_.snapshot_pos(slot)).c_str());
                     return;
                 }
                 const double t_e = now_s();
                 // The replaced turn's buffer first (grown by this turn's few MB), else a spare: a fresh multi-GB buffer
-                // costs ~100 ms per GB of page population on the request path. A Turn of a deep conversation goes as a
-                // delta on the whole entry it extends (PromptCache "Delta entries").
+                // costs ~100 ms per GB of page population on the request path.
+                // A Turn of a deep conversation goes as a delta on the whole entry it extends (PromptCache "Delta entries").
                 const int64_t base_n = cache_->delta_base(prompt.data(), n, kind);
                 HostBuffer state = kind == PromptCache::Kind::System ? HostBuffer()
                                                                       : cache_->take_replaced_buffer(prompt.data(), n, base_n);
                 if (state.capacity() == 0) state = cache_->take_buffer();
                 be_.export_snapshot(slot, state, base_n);
                 const double ms = (now_s() - t_e) * 1e3;  // > 0.5 s: the request path waited - worth seeing
-                const std::string delta = base_n > 0 ? ", delta on " + std::to_string(base_n) : "";
-                slog(ms > 500 ? LogLevel::Warning : LogLevel::Debug, "req %lld save: the %s at %lld tokens (%.0f MB, export %.0f ms%s%s)",
-                     (long long)req.id, what, (long long)n, state.size() / 1e6, ms, delta.c_str(),
-                     req.one_shot ? ", RAM only" : "");
+                const LogLevel level = ms > 500 ? LogLevel::Warning : LogLevel::Debug;
+                // To the RAM tier only: the disk gets an entry later (idle, RAM pressure, shutdown), if at all.
+                slog_row(level, rows++ ? "" : "cache", "%s, %s tokens -> RAM%s", what, fmt_n(n).c_str(),
+                         req.one_shot ? " only (a one-shot request: never written to disk)" : "");
+                const std::string shape = base_n > 0 ? "+" + fmt_n(n - base_n) + " tokens on the " +
+                                                            fmt_n(base_n) + "-token entry"
+                                                     : std::string("whole");
+                slog_row(level, "", "%s%s, %s MB, export %s ms", ms > 500 ? "WARNING: slow export - " : "", shape.c_str(),
+                         fmt_rate(state.size() / 1e6, 0).c_str(), fmt_rate(ms, 0).c_str());
+                rows++;
                 if (!cache_->put(std::vector<int32_t>(prompt.begin(), prompt.begin() + n), kind, std::move(state),
-                                 req.one_shot, base_n))
+                                 req.one_shot, base_n, req.id))
                     return;
                 ++saved;
             };
-            if (save_sys) save(LmBackend::kSystemSlot, sys, PromptCache::Kind::System, "system prefix");
+            if (save_sys) save(LmBackend::kSystemSlot, sys, PromptCache::Kind::System, "the system prompt's end");
             // The checkpoint is the start of the user message, not its end: clients rewrite the latest user message
             // on the next one (opencode's plan mode appends a reminder to it and strips it later), so an entry that
             // includes it never matches again. The turn itself is a plain Turn, replaced by the tool loop's next.
-            if (ust >= 0) save(LmBackend::kUserSlot, ust, PromptCache::Kind::Checkpoint, "user-turn checkpoint");
-            save(LmBackend::kTurnSlot, cut, PromptCache::Kind::Turn, "turn");
+            if (ust >= 0) save(LmBackend::kUserSlot, ust, PromptCache::Kind::Checkpoint, "the last user message's start");
+            save(LmBackend::kTurnSlot, cut, PromptCache::Kind::Turn, "the reply's start");
             std::lock_guard<std::mutex> lock(mu_);
-            stats_.disk_saves += saved, stats_.export_seconds += now_s() - t0;
+            stats_.ram_saves += saved, stats_.export_seconds += now_s() - t0;
         }
     } catch (const std::exception &e) {
         // A failed forward leaves the session unusable until reset: start clean for the next request.
-        slog(LogLevel::Error, "req %lld failed: %s", (long long)req.id, e.what());
+        slog_row(LogLevel::Error, "error", "ERROR: %s", e.what());
         try {
             be_.reset();
         } catch (const std::exception &e2) {
-            slog(LogLevel::Error, "req %lld reset after the failure failed too: %s", (long long)req.id, e2.what());
+            slog_row(LogLevel::Error, "", "ERROR: the reset after it failed too: %s", e2.what());
         }
         seq_.clear();
         res.error = e.what();

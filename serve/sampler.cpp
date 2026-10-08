@@ -3,7 +3,9 @@
 #include "common/check.hpp"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
+#include <limits>
 
 namespace strix {
 
@@ -25,6 +27,34 @@ LogitRows LogitRows::from_full(std::vector<float> logits, int64_t row) {
     LogitRows l;
     l.rows = (int64_t)logits.size() / row, l.row = row, l.full = std::move(logits);
     return l;
+}
+
+const uint32_t *LogitMasks::row(int64_t r) const {
+    STRIX_CHECK(r >= 0 && r < rows && bits.size() == (size_t)(rows * words), "LogitMasks::row: row ", r, " of ", rows,
+                " (", bits.size(), " words for ", rows, " rows of ", words, ")");
+    return bits.data() + r * words;
+}
+
+void LogitMasks::check(int64_t want_rows, int64_t logits_row, const char *where) const {
+    STRIX_CHECK(rows == want_rows, where, ": ", rows, " mask rows for ", want_rows, " logits rows");
+    STRIX_CHECK(words * 32 >= logits_row, where, ": mask rows of ", words, " words cover ", words * 32,
+                " ids, the logits row has ", logits_row);
+    STRIX_CHECK(bits.size() == (size_t)(rows * words), where, ": ", bits.size(), " mask words for ", rows, " rows of ",
+                words);
+}
+
+void apply_masks(LogitRows &l, const LogitMasks &masks) {
+    STRIX_CHECK(l.cands == 0, "apply_masks: candidate rows (", l.cands, " a row) are masked by their backend, before "
+                "they are reduced - only full rows here");
+    masks.check(l.rows, l.row, "apply_masks");
+    STRIX_CHECK(l.full.size() == (size_t)(l.rows * l.row), "apply_masks: ", l.full.size(), " floats for ", l.rows,
+                " rows of ", l.row);
+    for (int64_t r = 0; r < l.rows; ++r) {
+        const uint32_t *m = masks.row(r);
+        float *x = l.full.data() + r * l.row;
+        for (int64_t i = 0; i < l.row; ++i)
+            if (!((m[i >> 5] >> (i & 31)) & 1u) && x[i] == x[i]) x[i] = -std::numeric_limits<float>::infinity();
+    }
 }
 
 LogitRows LogitRows::row_of(int64_t r) const {
@@ -159,9 +189,16 @@ int32_t Sampler::sample_candidates(const float *v, const int32_t *id, int64_t m,
                 std::min<int64_t>(n, kCandidates));
     // The full row's checks, in the same order: NaN anywhere in the row, then the top logit (draw_from_candidates).
     STRIX_CHECK(!nan, "Sampler::sample: NaN logit(s) in the row of ", n);
-    for (int64_t i = 0; i < std::min<int64_t>(m, kCandidates); ++i)
-        STRIX_CHECK(id[i] >= 0 && id[i] < n, "Sampler::sample_candidates: candidate ", i, " has id ", id[i],
-                    ", expected 0..", n - 1);
+    // Real candidates first, then (masked rows only) padding (-inf, INT32_MAX) to the end.
+    bool padding = false;
+    for (int64_t i = 0; i < std::min<int64_t>(m, kCandidates); ++i) {
+        const bool pad = id[i] == INT32_MAX && v[i] == -std::numeric_limits<float>::infinity();
+        STRIX_CHECK(pad || (!padding && id[i] >= 0 && id[i] < n), "Sampler::sample_candidates: candidate ", i,
+                    " has id ", id[i], " (value ", v[i], "), expected 0..", n - 1,
+                    padding ? " - a real candidate after padding" : "");
+        padding |= pad;
+    }
+    STRIX_CHECK(id[0] != INT32_MAX, "Sampler::sample_candidates: the row has no candidate at all (every id masked)");
     if (p_.temperature == 0) {
         if (out_margin) *out_margin = (n > 1) ? (v[0] - v[1]) : std::numeric_limits<float>::infinity();
         return id[0];

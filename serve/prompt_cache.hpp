@@ -166,8 +166,10 @@ public:
     // Adds an entry in RAM (a duplicate only refreshes the existing one; its buffer becomes a spare), replacing the
     // turns it extends, then makes room in RAM. ram_only: never written to disk (see "RAM-only entries" above).
     // base_n > 0: state is a delta on the full entry of tokens[0, base_n) (delta_base()); if that base is gone since,
-    // the state is dropped (logged) and put returns false.
-    bool put(std::vector<int32_t> tokens, Kind kind, HostBuffer state, bool ram_only = false, int64_t base_n = 0);
+    // the state is dropped (logged) and put returns false. saved_by: the request that saved it, for the log lines
+    // about the entry later (0: none).
+    bool put(std::vector<int32_t> tokens, Kind kind, HostBuffer state, bool ram_only = false, int64_t base_n = 0,
+             int64_t saved_by = 0);
     // A spare buffer (the largest; empty if none) for an export or a load, resized by whoever fills it - and back.
     // Near the margin with no spare of the last saved state's size, the least recently used RAM entry already on
     // disk gives up its buffer instead (no fresh mapping under memory pressure).
@@ -212,6 +214,7 @@ private:
         bool ram_only = false;     // never written to disk (a one-shot request's); leaving RAM drops it
         std::shared_ptr<Entry> base;  // a delta's base (a full entry, tokens[0, base->tokens.size())); null: whole
         int dependents = 0;           // deltas on this entry
+        int64_t saved_by = 0;         // the request that put it (log lines; 0: none)
     };
     using EntryPtr = std::shared_ptr<Entry>;
     struct Job {
@@ -237,6 +240,10 @@ private:
     // Makes room for `need` bytes on disk by evicting entries used less recently than `last_used`; false if it can't.
     bool disk_room_locked(uint64_t need, uint64_t last_used);
     bool spend_budget_locked(uint64_t bytes);
+    double budget_now_locked() const;  // write budget bytes left now (refilled since budget_at_); no spending
+    // The writer's state line, every kSummarySeconds while something changed (puts, hits, writes, drops).
+    void summary_locked(double now);
+    static constexpr double kSummarySeconds = 600;
     void enqueue_locked(const EntryPtr &e, Why why);
     void write_idle_locked(double now);
     uint64_t prefault_want_locked() const;  // bytes of the spare to populate now; 0 = none
@@ -256,6 +263,8 @@ private:
     uint64_t ram_bytes_ = 0, spare_bytes_ = 0, disk_bytes_ = 0;
     uint64_t prefault_bytes_ = 0;  // the spare size to keep ready: the last saved state + prefault_headroom
     double budget_bytes_ = 0, budget_at_ = 0;  // write budget tokens and when they were last topped up
+    double summary_at_ = 0;                    // the last summary line (steady clock, s)
+    uint64_t summary_sig_ = 0;                 // clock_ + writes + RAM evictions at that line: unchanged = no line
     bool stop_ = false, writing_ = false, shutting_down_ = false;
     PromptCacheStats stats_;
     std::thread thread_;

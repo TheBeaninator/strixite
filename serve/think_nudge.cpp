@@ -7,11 +7,10 @@
 namespace strix {
 
 ThinkWatch::ThinkWatch(Policy p) : p_(p) {
-    STRIX_CHECK(p_.min_tokens >= 0 && p_.window >= 16 && p_.rate > 0 && p_.rate <= 1 && p_.backstop >= 1 &&
+    STRIX_CHECK(p_.min_tokens >= 0 && p_.window >= 16 && p_.rate > 0 && p_.rate <= 1 &&
                     p_.min_gap >= 0 && p_.boundary_wait >= 0 && p_.ngram >= 2 && p_.ngram <= 32 && p_.max_nudges >= 0 &&
                     p_.max_nudges <= 2,
-                "ThinkWatch: policy min_tokens ", p_.min_tokens, ", window ", p_.window, ", rate ", p_.rate, ", backstop ",
-                p_.backstop, ", min_gap ", p_.min_gap, ", boundary_wait ", p_.boundary_wait, ", ngram ", p_.ngram,
+                "ThinkWatch: policy min_tokens ", p_.min_tokens, ", window ", p_.window, ", rate ", p_.rate, ", min_gap ", p_.min_gap, ", boundary_wait ", p_.boundary_wait, ", ngram ", p_.ngram,
                 ", max_nudges ", p_.max_nudges, " (expected window >= 16, 0 < rate <= 1, ngram 2..32, max_nudges 0..2)");
     last_.assign((size_t)(p_.ngram - 1), -1);
     hits_.assign((size_t)p_.window, 0);
@@ -19,9 +18,9 @@ ThinkWatch::ThinkWatch(Policy p) : p_(p) {
 
 bool ThinkWatch::condition() const {
     const bool repeating = n_ >= p_.min_tokens && n_ >= p_.window && window_rate() >= p_.rate;
-    if (nudges_ == 0) return repeating || n_ >= p_.backstop;
+    if (nudges_ == 0) return repeating;
     const int64_t after = std::max(2 * first_at_, first_at_ + p_.min_gap);
-    return (n_ >= after && repeating) || n_ >= 2 * p_.backstop;
+    return n_ >= after && repeating;
 }
 
 void ThinkWatch::observe(int32_t id, const std::string &text) {

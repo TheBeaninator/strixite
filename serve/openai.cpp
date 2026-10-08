@@ -181,16 +181,34 @@ ChatRequest parse_chat_request(const json::Value &body, const SamplingParams &de
             }
     }
     parse_common(body, r, /*legacy_completions=*/false);
-    // Until structured output lands: a clean 400 worded the way OpenAI-compatible
-    // clients recognize an unsupported parameter ("... is not supported"), so those that can retry without it do -
-    // Hermes Agent's title request, whose fallback missed the old wording ("only ... is supported") and leaked the
-    // error into its reply. Still a 400: never silently unconstrained.
+    // Structured output: the shape is checked here, the schema itself where it is
+    // compiled (HttpServer: a 400 naming the keyword it can't enforce). An unknown type stays a 400 worded the way
+    // OpenAI-compatible clients recognize an unsupported parameter ("... is not supported") - never unconstrained.
     if (const json::Value *v = field(body, "response_format")) {
-        const json::Value *type = v->is_object() ? v->find("type") : nullptr;
-        if (!type || !type->is_string() || type->as_string("type") != "text")
-            bad("response_format", "response_format type '" +
-                                       (type && type->is_string() ? type->as_string("type") : std::string("(none)")) +
-                                       "' is not supported (no constrained decoding; only {\"type\": \"text\"})");
+        if (!v->is_object()) bad("response_format", std::string("'response_format' must be an object, got ") + json::type_name(v->type()));
+        const json::Value *type = v->find("type");
+        const std::string kind = type && type->is_string() ? type->as_string("type") : std::string("(none)");
+        if (kind == "text") {
+            r.response_format = ChatRequest::ResponseFormat::Text;
+        } else if (kind == "json_object") {
+            r.response_format = ChatRequest::ResponseFormat::JsonObject;
+        } else if (kind == "json_schema") {
+            const json::Value *spec = v->find("json_schema");
+            if (!spec || !spec->is_object())
+                bad("response_format.json_schema", "response_format type 'json_schema' needs a 'json_schema' object "
+                                                   "({\"name\": ..., \"schema\": {...}})");
+            const json::Value *schema = spec->find("schema");
+            if (!schema || !(schema->is_object() || schema->is_bool()))
+                bad("response_format.json_schema.schema", "response_format.json_schema needs a 'schema' (an object)");
+            if (const json::Value *strict = spec->find("strict"); strict && !strict->is_null())
+                get_bool(*strict, "response_format.json_schema.strict");
+            if (const json::Value *name = spec->find("name"); name && !name->is_null())
+                r.response_schema_name = get_string(*name, "response_format.json_schema.name");
+            r.response_format = ChatRequest::ResponseFormat::JsonSchema;
+            r.response_schema = *schema;
+        } else {
+            bad("response_format", "response_format type '" + kind + "' is not supported (text, json_object, json_schema)");
+        }
     }
     // Tools.
     std::string tool_choice = "auto";
@@ -204,6 +222,11 @@ ChatRequest parse_chat_request(const json::Value &body, const SamplingParams &de
         check_tools(*v);
         if (tool_choice == "auto" && !v->as_array("tools").empty()) r.tools = *v;
     }
+    // A JSON answer and tool calls exclude each other: the grammar holds the whole answer, so the model couldn't call
+    // a tool - refused rather than tools silently dropped.
+    if (r.response_format != ChatRequest::ResponseFormat::Text && !r.tools.is_null())
+        bad("response_format", "response_format json_object / json_schema together with tools is not supported (the "
+                               "answer is either a JSON document or tool calls) - send no tools, or tool_choice \"none\"");
     // Thinking budget: any of four spellings; two that disagree are refused, not silently resolved.
     {
         std::vector<std::pair<std::string, int64_t>> budgets;

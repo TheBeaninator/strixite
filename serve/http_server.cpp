@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <random>
 
 namespace strix {
@@ -78,11 +79,30 @@ void send_error(httplib::Response &res, int status, const std::string &msg, cons
     res.set_content(error_body(msg, type, param), "application/json");
 }
 
-// A request answered with an error before reaching the engine: 4xx the client's (warning), 5xx the server's (error).
+// A request answered with an error before reaching the engine (no block - one line): 4xx the client's (warning),
+// 5xx the server's (error).
 void log_error(int64_t id, const httplib::Request &req, int status, const std::string &msg) {
-    slog(status >= 500 ? LogLevel::Error : LogLevel::Warning, "req %lld %s %s from %s: %d - %s", (long long)id,
+    slog(status >= 500 ? LogLevel::Error : LogLevel::Warning, "Request %lld rejected: %s %s from %s: %d - %s", (long long)id,
          req.method.c_str(), req.path.c_str(), req.remote_addr.c_str(), status, msg.c_str());
     slog(LogLevel::Info, "\xc2\xa0");  // a blank line after each request
+}
+
+// The top rows of a request's log block (GenerationRequest::log_header): where it came from and what it asked.
+std::vector<std::pair<std::string, std::string>> header_rows(const httplib::Request &req, bool stream,
+                                                             const std::string &model) {
+    char from[256];
+    std::snprintf(from, sizeof from, "%s, %s %s, %s KB, %s", req.remote_addr.c_str(), req.method.c_str(),
+                  req.path.c_str(), fmt_rate(req.body.size() / 1e3, 1).c_str(), stream ? "streamed" : "not streamed");
+    // The model asked for is only logged: any name is served, and responses carry the real one.
+    return {{"from", from}, {"model", model.empty() ? "none requested" : "\"" + model + "\" requested"}};
+}
+
+// The max_tokens row: what the request gets, and why when that isn't what it asked for.
+std::string max_tokens_text(const std::optional<int64_t> &asked, int64_t granted) {
+    if (!asked) return fmt_n(granted) + " (none asked: the room the context leaves)";
+    if (*asked > granted)
+        return fmt_n(granted) + " (asked " + fmt_n(*asked) + ", clamped to the room the context leaves)";
+    return fmt_n(granted);
 }
 
 }  // namespace
@@ -113,8 +133,9 @@ void HttpServer::routes() {
         const int64_t id = ++next_id_;
         ChatRequest cr;
         GenerationRequest gen;
-        bool thinking_skipped = false;
+        bool thinking_skipped = false, thinking_defaulted_off = false;
         bool clamped = false;
+        std::string format_row;  // the response_format row of the log block, if one was asked
         try {
             json::Value body;
             try {
@@ -123,6 +144,31 @@ void HttpServer::routes() {
                 throw ApiError(400, std::string("request body: ") + e.what());
             }
             cr = parse_chat_request(body, cfg_.defaults);
+            // The server's thinking default (config `thinking`) for a request that doesn't say either way.
+            if (!cfg_.thinking_default && !cr.template_options.enable_thinking.has_value() && !thinking_requested(cr)) {
+                cr.template_options.enable_thinking = false;
+                thinking_defaulted_off = true;
+            }
+            // Structured output: the response format compiled (or found compiled) here, on the HTTP thread; a schema
+            // the compiler can't enforce is a 400 naming the keyword and where it is.
+            if (cr.response_format != ChatRequest::ResponseFormat::Text) {
+                const int64_t misses = grammars_.misses();
+                try {
+                    gen.grammar = cr.response_format == ChatRequest::ResponseFormat::JsonObject
+                                      ? grammars_.any_object()
+                                      : grammars_.schema(cr.response_schema, "response_format.json_schema.schema");
+                } catch (const Error &e) {
+                    // The check's own prefix (function, file:line, condition) goes to the log; the client gets the reason.
+                    const std::string full = e.what();
+                    const size_t at = full.find("failed: ");
+                    throw ApiError(400, at == std::string::npos ? full : full.substr(at + 8), "response_format");
+                }
+                format_row = std::string(cr.response_format == ChatRequest::ResponseFormat::JsonObject ? "json_object"
+                                                                                                        : "json_schema") +
+                             (cr.response_schema_name.empty() ? "" : " '" + cr.response_schema_name + "'") + " (grammar " +
+                             (grammars_.misses() > misses ? "compiled" : "cached") + ", " + fmt_n(grammars_.size()) +
+                             " cached)";
+            }
             std::string prompt;
             try {
                 prompt = render_chat(cr.messages, cr.tools.is_null() ? nullptr : &cr.tools, cr.template_options);
@@ -165,13 +211,16 @@ void HttpServer::routes() {
             const size_t msgs = cr.messages.is_array() ? cr.messages.as_array("messages").size() : 0;
             const size_t tools = cr.tools.is_array() ? cr.tools.as_array("tools").size() : 0;
             const bool thinking = !(cr.template_options.enable_thinking.has_value() && !*cr.template_options.enable_thinking);
-            slog(LogLevel::Info, "req %lld %s %s from %s (%.1f KB, %s)", (long long)id, req.method.c_str(), req.path.c_str(),
-                 req.remote_addr.c_str(), req.body.size() / 1e3, cr.stream ? "stream" : "json");
-            // The model asked for is only logged: any name is served, and responses carry the real one.
-            const std::string model = cr.model.empty() ? "(none)" : "\"" + cr.model + "\"";
-            slog(LogLevel::Info, "req %lld request: %lld prompt tokens, %zu messages, %zu tools, max_tokens %lld%s, thinking %s, "
-                 "model asked %s", (long long)id, (long long)gen.prompt.size(), msgs, tools, (long long)gen.max_tokens,
-                 clamped ? " (clamped)" : "", thinking_skipped ? "skipped (no room)" : thinking ? "on" : "off", model.c_str());
+            gen.log_header = header_rows(req, cr.stream, cr.model);
+            gen.log_header.emplace_back("prompt", fmt_n((long long)gen.prompt.size()) + " tokens, " + fmt_n((long long)msgs) +
+                                                      (msgs == 1 ? " message, " : " messages, ") + fmt_n((long long)tools) +
+                                                      (tools == 1 ? " tool, thinking " : " tools, thinking ") +
+                                                      (thinking_skipped      ? "skipped (no room)"
+                                                       : thinking             ? "on"
+                                                       : thinking_defaulted_off ? "off (server default)"
+                                                                              : "off"));
+            gen.log_header.emplace_back("max_tokens", max_tokens_text(cr.max_tokens, gen.max_tokens));
+            if (!format_row.empty()) gen.log_header.emplace_back("format", format_row);
         }
         gen.id = id, gen.stream = cr.stream;
         if (!cr.seeded) cr.sampling.seed = std::random_device{}();
@@ -311,14 +360,9 @@ void HttpServer::routes() {
             log_error(id, req, 500, e.what());
             return send_error(res, 500, e.what(), "server_error");
         }
-        {
-            slog(LogLevel::Info, "req %lld %s %s from %s (%.1f KB, %s)", (long long)id, req.method.c_str(), req.path.c_str(),
-                 req.remote_addr.c_str(), req.body.size() / 1e3, cr.stream ? "stream" : "json");
-            const std::string model = cr.model.empty() ? "(none)" : "\"" + cr.model + "\"";
-            slog(LogLevel::Info, "req %lld request: %lld prompt tokens, raw completion, max_tokens %lld%s, model asked %s",
-                 (long long)id, (long long)gen.prompt.size(), (long long)gen.max_tokens, clamped ? " (clamped)" : "",
-                 model.c_str());
-        }
+        gen.log_header = header_rows(req, cr.stream, cr.model);
+        gen.log_header.emplace_back("prompt", fmt_n((long long)gen.prompt.size()) + " tokens, raw completion (no chat template)");
+        gen.log_header.emplace_back("max_tokens", max_tokens_text(cr.max_tokens, gen.max_tokens));
         gen.id = id, gen.stream = cr.stream;
         gen.one_shot = true;  // a raw prompt: its cache entries stay in RAM (benchmarks send many unique ones)
         if (!cr.seeded) cr.sampling.seed = std::random_device{}();

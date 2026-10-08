@@ -299,6 +299,14 @@ static_assert(kDW % 32 == 0 && 8 % kWWaves == 0, "wave split: whole 32-dim steps
 // rows a WMMA fragment load reads fall in distinct banks (a stride of 16 elements put rows l and l + 4 in one bank).
 constexpr int kTLd = 20;
 constexpr int kKeyChunk = 256;  // keys per position-table fill (a multiple of the 16-key tile)
+// A workgroup barrier that orders LDS only. __syncthreads' workgroup fence also waits for every global load the
+// wave has in flight (s_waitcnt vmcnt(0): in WGP mode a workgroup spans two CUs' L0 caches), so in the tile loop it
+// drained the next tile's K / V prefetch at every tile. The loop's waves share only LDS, so LDS ordering suffices.
+__device__ __forceinline__ void lds_barrier() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
 template <bool GATHER>
 __global__ void __launch_bounds__(kWWaves * 32)
     attention_partial_wmma_kernel(const uint16_t *q, int64_t q_ts, int64_t q_hs, const uint16_t *kc,
@@ -420,11 +428,11 @@ __global__ void __launch_bounds__(kWWaves * 32)
         if (k1 < ke) {
             if (GATHER && (k1 - kb) % kKeyChunk == 0) {
                 fill_table(k1);
-                __syncthreads();
+                lds_barrier();
             }
             load_tile(k1);
         }
-        __syncthreads();  // all S partials written; every wave done with the previous tile's P
+        lds_barrier();  // all S partials written; every wave done with the previous tile's P
         // This wave's rows: full S (the partials summed in wave order), online softmax, P hi / lo and the rescale
         // factors into LDS for every wave.
 #pragma unroll
@@ -452,7 +460,7 @@ __global__ void __launch_bounds__(kWWaves * 32)
             pl[r * kTLd + col] = (uint16_t)((lb + 0x7fffu + ((lb >> 16) & 1u)) >> 16);
             if (col == 0) s_alpha[r] = alpha;
         }
-        __syncthreads();  // P and the rescale factors complete
+        lds_barrier();  // P and the rescale factors complete
 #pragma unroll
         for (int v = 0; v < 8; ++v) {
             const float alpha = s_alpha[2 * v + half];
@@ -466,9 +474,9 @@ __global__ void __launch_bounds__(kWWaves * 32)
             o[j] = wmma_bf16(a_hi, b, o[j]);
             o[j] = wmma_bf16(a_lo, b, o[j]);
         }
-        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");  // V reads done before this wave's next V writes
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");  // V reads done before this wave's next V writes
         __builtin_amdgcn_wave_barrier();
-        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
     }
     // The block's partial for rows < G: m, l from the wave owning the row, O from each wave's dims.
 #pragma unroll

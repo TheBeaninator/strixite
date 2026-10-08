@@ -5,7 +5,7 @@
 // has it), each sublayer fed by a hyper-connection mix and written back by an injection, MoE MLP (top-10 of
 // 512 + the gated shared expert), the final mix, the untied LM head.
 //
-// Weights come from the converter's weights.strixw (formats/strixw.hpp), loaded once into device memory
+// Weights come from the converter's weights.strixw (formats/strixw), loaded once into device memory
 // (runtime/strixw_loader), every tensor already in its kernel's layout. The dense projections (GDN in/out,
 // attention q|k|v|idx and o, PLE key|value, LM head, a separate shared expert) run as Q4 or Q8, whichever the
 // layout gave each tensor, and so do the HC mixes; the routed experts are Q4 (their kernels are Q4-only, so the
@@ -133,13 +133,24 @@ public:
     const NgramRowSource &ngram_rows() const;
     bool has_mtp() const { return has_mtp_; }
     const MtpHead &mtp() const { return mtp_; }
-    // The MTP draft's own Q4 copy (group G: 32 / 64 / 128) of the LM head's first `rows` rows, made once at load: a Q8
-    // head is dequantized exactly and quantized as formats/q4 quantize_q4 (a Q4 head is used as loaded). Drafts then
-    // read about half the bytes per call (65,536 rows: 178 -> 94 MB). Only the draft uses it: the trunk's lm_head()
-    // never changes and every drafted token is still decided by the verify. A session drafts over it whenever it
-    // covers the session's mtp_vocab() rows. Call before any session drafts.
-    void make_draft_head_q4(int64_t rows, int64_t G = 64);
-    const QWeightView &draft_head_q4() const { return draft_head_q4_; }  // bits == 0 until made
+
+    // The MTP draft's own Q4 copy of the LM head's first `rows` rows (strixite PR #2 by @TheBeaninator, rewritten;
+    // formats/q4_from_q8.hpp). Every draft call scores the first mtp_vocab rows of the LM head; the served head is
+    // Q8, so at 65,536 rows a draft reads 178 MB of it. The copy halves that (94 MB at G 64).
+    //   - Only drafts use it: lm_head() - the trunk's logits, the verify, sampling - never changes, and the verify
+    //     decides every drafted token, so the copy can change how many drafts are accepted, never the output.
+    //   - Q8 head: read back from the device, dequantized exactly, quantized as formats/q4 does with group G.
+    //     Q4 head: used as loaded (G must then equal the head's own group size). Other widths (5 / 6 bits): refused.
+    //   - Sessions draft over it whenever it covers their mtp_vocab() rows (Qwen4ExpSession::run_mtp), else over
+    //     lm_head() as before - a model that never makes the copy behaves exactly as before.
+    // Preconditions (each a thrown error naming the values): the model has an MTP head; 1 <= rows <= vocab; G is
+    // 32 / 64 / 128 and divides the head's K; no copy made yet (call once, at load, before any session drafts -
+    // sessions read it without locking). threads: 1..64 CPU workers for the requantization (~0.1 s at 65,536 rows).
+    void make_draft_head_q4(int64_t rows, int64_t G = 64, int threads = 16);
+    // The copy (bits == 0 until make_draft_head_q4 ran).
+    const QWeightView &draft_head_q4() const { return draft_head_; }
+    // Device bytes the copy holds (0 when none, or when it is the loaded Q4 head itself).
+    size_t draft_head_q4_bytes() const { return draft_q4_ ? draft_q4_bytes_ : 0; }
 
 private:
     Qwen4ExpDims dims_;
@@ -149,13 +160,21 @@ private:
     std::vector<Layer> layers_;
     const uint16_t *embed_ = nullptr;
     Q8DeviceView embed_q8_{};
-    QWeightView lm_head_, draft_head_q4_;
-    std::unique_ptr<Q4Device> draft_q4_;
+    QWeightView lm_head_;
+    QWeightView draft_head_;                 // make_draft_head_q4's copy (bits 0: none)
+    std::unique_ptr<Q4Device> draft_q4_;     // its storage when made from a Q8 head
+    size_t draft_q4_bytes_ = 0;
     bool truncated_ = false, shared_separate_ = false, has_mtp_ = false;
     MtpHead mtp_;
     Hc final_;
     DeviceBuffer<float> inv_freq_;
 };
+
+// What strix_server does at load when MTP is on, shared so the benches (bench_forward_qwen4exp, bench_replay) measure
+// the served path: the Q4 draft head copy (Qwen4ExpModel::make_draft_head_q4, group 64) over the rows the drafts
+// score - mtp_vocab rows, or the whole vocabulary when mtp_vocab is 0. Returns the rows copied. Throws (from
+// make_draft_head_q4) when the model has no MTP head or mtp_vocab is outside 0..vocab.
+int64_t make_served_mtp_draft_head(Qwen4ExpModel &model, int64_t mtp_vocab);
 
 // Called with each intermediate under the goldens' names where they exist ("embed", "L<i>.attn_in",
 // "L<i>.mixer", "L<i>.mlp_in", "L<i>.router_logits", "L<i>.moe", "L<i>.out", "final_mixed") plus what a
@@ -169,8 +188,7 @@ using Qwen4ExpProbe =
     std::function<void(const std::string &name, const void *dev, int64_t rows, int64_t cols, ProbeType type)>;
 
 // How multi-token forwards (prefill) compute their Q4 / Q8 GEMMs: on the matrix units with BF16 inputs and FP32
-// accumulation (the default since 2026-09-25: drift vs the goldens equal to the FP32 path's, 2.5x its
-// prefill), or FP32 on the vector units (the reference semantics, for tests and comparison).
+// accumulation (the default: drift vs the reference outputs equal to the FP32 path's, 2.5x its prefill), or FP32 on the vector units (the reference semantics, for tests and comparison).
 // Decode (and forwards below kWmmaMinTokens / kGroupedMinTokens) is the same either way.
 enum class PrefillMath { F32, WmmaBf16 };
 
@@ -255,9 +273,12 @@ public:
     std::vector<float> forward(const std::vector<int32_t> &ids, int64_t n_logits, const Qwen4ExpProbe &probe = nullptr);
     // The next forward / forward_verify (one call) reduces its logits rows on the GPU to each row's top
     // kernels::kLogitCands candidates over ids [0, n_valid) (kernels/logits_topk) and copies only those back: it
-    // returns an empty vector, candidates() holds them. n_valid: 1..vocab. Measured reason: the host copied and
-    // scanned ~1 MB a row after every forward.
-    void want_candidates(int64_t n_valid);
+    // returns an empty vector, candidates() holds them. n_valid: 1..vocab. Measured reason: the host
+    // copied and scanned ~1 MB a row after every forward.
+    // masks (structured output): null, or [mask_rows, mask_words] host words - one allowed-token mask per logits
+    // row of that forward (mask_rows must equal its n_logits; mask_words >= ceil(vocab / 32)), copied here into a
+    // pinned buffer and uploaded by the forward ahead of logits_topk, which leaves disallowed ids out.
+    void want_candidates(int64_t n_valid, const uint32_t *masks = nullptr, int64_t mask_rows = 0, int64_t mask_words = 0);
     struct Candidates {
         int64_t rows = 0;
         std::vector<kernels::LogitCand> cand;  // [rows, kernels::kLogitCands]
@@ -403,6 +424,15 @@ private:
     // logits, into cand_host_.
     std::vector<float> read_back(size_t n_floats, const char *what, int64_t n_cand_rows = 0);
     int64_t cand_n_valid_ = 0;  // want_candidates() for the next forward; 0 = full rows
+    // Structured-output masks for the next forward (want_candidates): mask_rows_ rows of mask_words_ in mask_host_
+    // (pinned), uploaded into mask_dev_ by that forward. The pinned buffer is written again only after the event of
+    // its last upload completed (an ungated pinned-buffer reuse corrupted transfers on gfx1151, measured). Both
+    // allocated on the first masked forward.
+    int64_t mask_rows_ = 0, mask_words_ = 0;
+    PinnedHostBuffer mask_host_;
+    DeviceBuffer<uint32_t> mask_dev_;
+    hipEvent_t mask_uploaded_ = nullptr;
+    bool mask_upload_recorded_ = false;
     DeviceBuffer<uint8_t> cand_dev_, cand_ws_;
     size_t cand_ws_bytes_ = 0;
     Candidates cand_host_;
@@ -411,7 +441,8 @@ private:
     // PLE rows on the host (runtime/ngram_table gather -> the activation dtype), in pinned buffers [max_tokens, ple_e]
     // for an async upload. Two, so the next forward's gather (set_lookahead) fills one while this forward's upload
     // reads the other; a buffer is written again only after the forward that uploaded from it ended with its stream
-    // sync - the gfx1151 pinned-reuse gate. Declared before ple_pending_: its worker is joined first.
+    // sync - the pinned-reuse gate (as for mask_host_ above). Declared before ple_pending_: its worker is joined
+    // first.
     PinnedHostBuffer ple_host_[2];
     struct PleGather {
         bool active = false;

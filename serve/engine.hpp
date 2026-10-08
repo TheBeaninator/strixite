@@ -17,7 +17,11 @@
 #include "serve/capture.hpp"
 #include "serve/output_parser.hpp"
 #include "serve/prompt_cache.hpp"
+#include "serve/grammar.hpp"
 #include "serve/sampler.hpp"
+#include "serve/structured_output.hpp"
+#include "serve/think_nudge.hpp"
+#include "serve/token_mask.hpp"
 #include "serve/tokenizer.hpp"
 
 #include <condition_variable>
@@ -27,6 +31,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace strix {
@@ -83,13 +88,21 @@ public:
     // each row's top Sampler::kCandidates candidates over ids [0, n_valid) instead of the full row (the engine asks
     // only when Sampler::takes_candidates() - the sampled tokens are the same either way). The default returns full
     // rows; Qwen4ExpBackend reduces them on the GPU (kernels/logits_topk).
-    virtual LogitRows forward_rows(const std::vector<int32_t> &ids, int64_t n_logits, bool cands, int64_t n_valid) {
+    // masks (structured output): null, or one allowed-token mask per returned row (LogitMasks; masks->rows ==
+    // n_logits) - the rows then hold allowed ids only (candidates from those alone, or full rows with the rest -inf).
+    virtual LogitRows forward_rows(const std::vector<int32_t> &ids, int64_t n_logits, bool cands, int64_t n_valid,
+                                   const LogitMasks *masks = nullptr) {
         (void)cands, (void)n_valid;
-        return LogitRows::from_full(forward(ids, n_logits), logits_row());
+        LogitRows l = LogitRows::from_full(forward(ids, n_logits), logits_row());
+        if (masks != nullptr) apply_masks(l, *masks);
+        return l;
     }
-    virtual LogitRows forward_verify_rows(const std::vector<int32_t> &ids, int64_t n_logits, bool cands, int64_t n_valid) {
+    virtual LogitRows forward_verify_rows(const std::vector<int32_t> &ids, int64_t n_logits, bool cands, int64_t n_valid,
+                                          const LogitMasks *masks = nullptr) {
         (void)cands, (void)n_valid;
-        return LogitRows::from_full(forward_verify(ids, n_logits), logits_row());
+        LogitRows l = LogitRows::from_full(forward_verify(ids, n_logits), logits_row());
+        if (masks != nullptr) apply_masks(l, *masks);
+        return l;
     }
     virtual BackendStats backend_stats() const { return {}; }
     // A hint (Qwen4ExpSession::prefetch_ple): the next forward starts with ids (while a verify awaits its outcome:
@@ -139,8 +152,14 @@ struct GenerationRequest {
     // One message and no tools (a batch client's one-off prompt, nothing a later turn extends): its prompt cache
     // entries stay in RAM and never reach the disk (PromptCache "RAM-only entries").
     bool one_shot = false;
-    int64_t id = 0;       // the HTTP layer's request id, for log lines ("req <id> ..."); 0 = none given
+    // Structured output (response_format / tool_choice): the compiled grammar
+    // the answer must follow, or null. Shared by requests with the same schema; the engine thread alone uses it.
+    std::shared_ptr<grammar::GrammarAutomaton> grammar;
+    int64_t id = 0;       // the HTTP layer's request id, for log lines ("Request <id>"); 0 = none given
     bool stream = false;  // for the log only (the HTTP layer streams or not)
+    // The HTTP layer's rows for the top of the request's log block (label, text; an empty label goes on the row
+    // above), printed by the engine thread when the request starts - so they never land inside another request's block.
+    std::vector<std::pair<std::string, std::string>> log_header;
 };
 
 // What the engine feeds when a thinking budget is spent: Qwen's documented early-stop text, then the think close.
@@ -157,6 +176,12 @@ struct GenerationResult {
     int64_t mtp_drafted_tokens = 0, mtp_accepted_tokens = 0, mtp_rollbacks = 0;
     int64_t mtp_reject_at[kMtpMaxDraft] = {};  // rollbacks by drafts j accepted before the rejected one (last: j >= 3)
     double queue_ms = 0, prompt_ms = 0, decode_ms = 0;
+    // From the submit to the end of the prefill (the first token's logits are ready) / to the response's end.
+    double first_token_ms = 0, total_ms = 0;
+    // Trunk forwards of sampled tokens in the decode (a verify counts once), and the tokens the engine fed itself
+    // (thinking stop, nudges - each one forward of its own): (completion - fed) / forwards = tokens per forward.
+    int64_t decode_forwards = 0, fed_tokens = 0;
+    int64_t tool_calls = 0;       // tool calls in the answer
     bool dropped_partial_call = false;
     BackendStats backend;  // this request's share (wait_max: the longest wait of the session so far)
     bool thinking_budget_hit = false;  // the engine closed the think block (kThinkingStop was fed)
@@ -189,8 +214,9 @@ struct EngineStats {
     // wait for a real gap (e.g. idle_seconds >= 2).
     double idle_seconds = 0;
     int64_t live_tokens = 0, snapshot_pos = -1;
-    // Prompts resumed from the prompt cache (either tier; ram_hits: of those, from its RAM tier) / states put there.
-    int64_t disk_hits = 0, disk_tokens = 0, disk_saves = 0, ram_hits = 0;
+    // Prompts resumed from the prompt cache (either tier; ram_hits: of those, from its RAM tier) / states put in its
+    // RAM tier (the disk gets them later, if at all).
+    int64_t disk_hits = 0, disk_tokens = 0, ram_saves = 0, ram_hits = 0;
     double export_seconds = 0;
 };
 
@@ -199,10 +225,6 @@ public:
     struct Options {
         PromptCache *cache = nullptr;
         float mtp_margin = 1.5f;  // logit margin (top1 - top2) required to draft MTP token
-        // After a rejected draft, the old path forwarded the rejected position's token v alone to get the next logits.
-        // Off (default, PF-1): v becomes the next step's first token instead - drafted from right away and run as
-        // row 0 of the next verify (or alone when no draft passes). On: the old path, kept for A/B comparison only.
-        bool mtp_reject_forward = false;
         int64_t mtp_draft = 1;    // most drafts per verify (the head chained), 1..15
         // Non-empty: every finished request's token ids and MTP steps are written there (serve/capture.hpp). The
         // directory must exist.
@@ -210,6 +232,7 @@ public:
         // The thinking nudge (serve/think_nudge.hpp): on in service; off for like-for-like
         // comparisons with engines that don't have it.
         bool think_nudge = true;
+        ThinkWatch::Policy think_nudge_policy;  // when it fires (config think-nudge-rate / -min-tokens)
     };
 
     Engine(LmBackend &backend, const Tokenizer &tok, const Options &options);
@@ -252,6 +275,8 @@ private:
     PromptCache *cache_;
     const int64_t capacity_;
     const int32_t im_start_, im_end_, eot_;
+    const int32_t think_end_;  // </think>
+    const TokenMasker masker_;  // structured output's token masks over the logits row (built once, ~35 ms)
     const std::vector<int32_t> thinking_stop_;  // kThinkingStop, tokenized
     const std::vector<int32_t> nudge_[2];       // kThinkNudge1 / 2, tokenized
     std::vector<int32_t> seq_;  // the tokens in the backend (seq_.size() == be_.pos())
@@ -261,6 +286,7 @@ private:
     bool stop_ = false;
     EngineStats stats_;
     double idle_since_ = 0;  // when the last request finished (steady clock, s); under mu_
+    int64_t running_id_ = 0;  // the id of the request the worker runs (while stats_.busy); under mu_
     std::thread thread_;
 };
 

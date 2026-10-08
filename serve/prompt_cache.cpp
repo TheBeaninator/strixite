@@ -36,6 +36,23 @@ constexpr uint64_t kHeaderBytes = 4096;
 constexpr size_t kFpAt = 56, kFpBytes = 192, kHeaderHashAtV1 = 248, kBaseAt = 248, kHeaderHashAt = 256;
 
 double now_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
+// For log lines: what an entry is.
+const char *kind_name(PromptCache::Kind k) {
+    return k == PromptCache::Kind::System ? "system-prefix" : k == PromptCache::Kind::Checkpoint ? "checkpoint" : "turn";
+}
+
+// For log lines: a duration as "40 s" / "12 min" / "3.5 h".
+std::string ago(double seconds) {
+    char b[32];
+    if (seconds < 120) std::snprintf(b, sizeof b, "%.0f s", seconds);
+    else if (seconds < 7200) std::snprintf(b, sizeof b, "%.0f min", seconds / 60);
+    else std::snprintf(b, sizeof b, "%.1f h", seconds / 3600);
+    return b;
+}
+
+// Continuation lines of a "prompt cache: " line start under its text.
+constexpr const char *kCont = "              ";
 uint64_t align4k(uint64_t x) { return (x + 4095) & ~uint64_t{4095}; }
 uint64_t file_total(uint64_t n_tokens, uint64_t state_bytes) { return align4k(kHeaderBytes + n_tokens * 4) + state_bytes; }
 
@@ -182,8 +199,8 @@ PromptCache::PromptCache(std::string dir, uint64_t max_bytes, std::string finger
                 ++d->base->dependents;
                 continue;
             }
-            slog(LogLevel::Warning, "prompt cache: dropping %s: a delta whose %llu-token base isn't there", d->path.c_str(),
-                 (unsigned long long)base_n);
+            slog(LogLevel::Warning, "prompt cache: dropping %s: a delta whose %s-token base isn't there", d->path.c_str(),
+                 fmt_n((long long)base_n).c_str());
             remove_locked((size_t)find_locked(d.get()));
             ++stats_.invalid, ++stats_.deltas_dropped;
         }
@@ -207,8 +224,8 @@ PromptCache::~PromptCache() {
     const bool done = idle_cv_.wait_for(lock, std::chrono::duration<double>(opt_.shutdown_seconds),
                                         [&] { return queue_.empty() && !writing_; });
     if (!done)
-        slog(LogLevel::Warning, "prompt cache: shutdown flush stopped after %.0f s, %zu writes not done",
-                     now_s() - t0, queue_.size());
+        slog(LogLevel::Warning, "prompt cache: shutdown flush stopped after %s s, %s writes not done",
+                     fmt_rate(now_s() - t0, 0).c_str(), fmt_n((long long)queue_.size()).c_str());
     for (Job &j : queue_) j.e->queued = false;
     queue_.clear(), pending_bytes_ = 0;
     stop_ = true;
@@ -533,7 +550,9 @@ int64_t PromptCache::delta_base(const int32_t *tokens, int64_t n, Kind kind) con
     return best;
 }
 
-bool PromptCache::put(std::vector<int32_t> tokens, Kind kind, HostBuffer state, bool ram_only, int64_t base_n) {
+bool PromptCache::put(std::vector<int32_t> tokens, Kind kind, HostBuffer state, bool ram_only, int64_t base_n,
+                      int64_t saved_by) {
+    STRIX_CHECK(saved_by >= 0, "PromptCache::put: saved_by request id ", saved_by, ", expected >= 0");
     STRIX_CHECK(!tokens.empty() && !state.empty(), "PromptCache::put: ", tokens.size(), " tokens, ", state.size(), " state bytes");
     STRIX_CHECK(kind == Kind::System || kind == Kind::Turn || kind == Kind::Checkpoint, "PromptCache::put: kind ",
                 (uint32_t)kind, ", expected 1..3");
@@ -546,8 +565,8 @@ bool PromptCache::put(std::vector<int32_t> tokens, Kind kind, HostBuffer state, 
     if (base_n > 0) {
         const int b = find_locked(tokens.data(), base_n);
         if (b < 0 || entries_[(size_t)b]->base) {  // gone (or replaced) since delta_base: the delta is useless
-            slog(LogLevel::Warning, "prompt cache: dropped a %zu-token delta: its %lld-token base is gone", tokens.size(),
-                 (long long)base_n);
+            slog(LogLevel::Warning, "prompt cache: dropped a %s-token delta: its %s-token base is gone",
+                 fmt_n((long long)tokens.size()).c_str(), fmt_n(base_n).c_str());
             keep_spare_locked(std::move(state));
             trash.swap(trash_);
             return false;
@@ -603,7 +622,7 @@ bool PromptCache::put(std::vector<int32_t> tokens, Kind kind, HostBuffer state, 
     if (!base) prefault_bytes_ = state.size() + opt_.prefault_headroom;
     auto e = std::make_shared<Entry>();
     e->tokens = std::move(tokens), e->kind = kind, e->last_used = ++clock_, e->touched_s = now_s();
-    e->ram_only = ram_only;
+    e->ram_only = ram_only, e->saved_by = saved_by;
     if (base) {
         e->base = base, ++base->dependents;
         ++stats_.delta_puts, stats_.delta_bytes += (int64_t)state.size();
@@ -617,10 +636,14 @@ bool PromptCache::put(std::vector<int32_t> tokens, Kind kind, HostBuffer state, 
     return true;
 }
 
+double PromptCache::budget_now_locked() const {
+    const double cap = opt_.write_gib_per_hour * (double)(1ull << 30);
+    return std::min(cap, budget_bytes_ + (now_s() - budget_at_) * cap / 3600.0);
+}
+
 bool PromptCache::spend_budget_locked(uint64_t bytes) {
     if (opt_.write_gib_per_hour <= 0) return true;
-    const double cap = opt_.write_gib_per_hour * (double)(1ull << 30), t = now_s();
-    budget_bytes_ = std::min(cap, budget_bytes_ + (t - budget_at_) * cap / 3600.0), budget_at_ = t;
+    budget_bytes_ = budget_now_locked(), budget_at_ = now_s();
     if (budget_bytes_ < (double)bytes) return false;
     budget_bytes_ -= (double)bytes;
     return true;
@@ -723,10 +746,53 @@ void PromptCache::make_room_locked() {
             continue;
         }
         (no[0] == 'q' ? stats_.rejected_queue : no[0] == 's' ? stats_.rejected_space : stats_.rejected_budget)++;
-        slog(LogLevel::Warning, "prompt cache: dropped the %zu-token entry leaving RAM (%s)",
-                     lru->tokens.size(), no[0] == 'q' ? "write queue full" : no[0] == 's' ? "no disk space" : "write budget spent");
+        // What was lost, why it had to leave RAM, and why the disk said no. Long unused: a conversation that's likely
+        // over (an info line); recent: one that may come back to a full prefill (a warning).
+        const double idle = now_s() - lru->touched_s;
+        const LogLevel level = idle >= opt_.idle_seconds ? LogLevel::Info : LogLevel::Warning;
+        const std::string by = lru->saved_by > 0 ? "saved by Request " + std::to_string(lru->saved_by) + ", " : "";
+        const std::string deltas = lru->dependents > 0 ? " and its " + fmt_n((long long)lru->dependents) + " deltas" : "";
+        slog(level, "prompt cache: dropped a %s entry of %s tokens%s, %s GB (%slast used %s ago)", kind_name(lru->kind),
+             fmt_n((long long)lru->tokens.size()).c_str(), deltas.c_str(), fmt_rate(lru->ram.size() / 1e9, 1).c_str(),
+             by.c_str(), ago(idle).c_str());
+        slog(level, "%sit had to leave RAM (MemAvailable %s GiB, below the %s GiB margin) and can't go to disk:", kCont,
+             fmt_rate(avail / (double)(1ull << 30), 1).c_str(), fmt_rate(opt_.ram_margin / (double)(1ull << 30), 0).c_str());
+        if (no[0] == 'q')
+            slog(level, "%sthe write queue is full (%s of %s GB queued)", kCont, fmt_rate(pending_bytes_ / 1e9, 1).c_str(),
+                 fmt_rate(queue_cap / 1e9, 1).c_str());
+        else if (no[0] == 's')
+            slog(level, "%sno disk room (needs %s GB, the cap leaves %s GB)", kCont, fmt_rate(total / 1e9, 1).c_str(),
+                 fmt_rate(std::min(max_bytes_, fs_cap) / 1e9, 1).c_str());
+        else {
+            const double rate = opt_.write_gib_per_hour * (double)(1ull << 30) / 3600.0;  // bytes per second
+            slog(level, "%sthe write budget is spent (%s of %s GiB left this hour, needs %s GB: enough in %s)", kCont,
+                 fmt_rate(budget_bytes_ / (double)(1ull << 30), 1).c_str(), fmt_rate(opt_.write_gib_per_hour, 0).c_str(),
+                 fmt_rate(total / 1e9, 1).c_str(), ago(((double)total - budget_bytes_) / rate).c_str());
+        }
         remove_locked((size_t)find_locked(lru));
     }
+}
+
+void PromptCache::summary_locked(double now) {
+    const uint64_t sig = clock_ + (uint64_t)stats_.writes + (uint64_t)stats_.ram_evicted;
+    if (now - summary_at_ < kSummarySeconds || sig == summary_sig_) return;
+    summary_at_ = now, summary_sig_ = sig;
+    int64_t ram_n = 0, disk_n = 0;
+    for (const EntryPtr &e : entries_) ram_n += !e->ram.empty(), disk_n += !e->path.empty();
+    const double gib = (double)(1ull << 30);
+    slog(LogLevel::Info, "prompt cache: RAM %s entries, %s GB (+ %s GB spare buffers); MemAvailable %s GiB (margin %s)",
+         fmt_n(ram_n).c_str(), fmt_rate(ram_bytes_ / 1e9, 1).c_str(), fmt_rate(spare_bytes_ / 1e9, 1).c_str(),
+         fmt_rate(mem_available() / gib, 1).c_str(), fmt_rate(opt_.ram_margin / gib, 0).c_str());
+    char budget[64] = "no write budget";
+    if (opt_.write_gib_per_hour > 0)
+        std::snprintf(budget, sizeof budget, "write budget %s of %s GiB left this hour",
+                      fmt_rate(budget_now_locked() / gib, 1).c_str(), fmt_rate(opt_.write_gib_per_hour, 0).c_str());
+    slog(LogLevel::Info, "%sdisk %s entries, %s of %s GiB; %s", kCont, fmt_n(disk_n).c_str(), fmt_rate(disk_bytes_ / gib, 1).c_str(),
+         fmt_rate(max_bytes_ / gib, 0).c_str(), budget);
+    slog(LogLevel::Info, "%ssince the start: %s written, %s dropped leaving RAM, %s write failures", kCont,
+         fmt_n(stats_.writes).c_str(),
+         fmt_n(stats_.rejected_queue + stats_.rejected_space + stats_.rejected_budget).c_str(),
+         fmt_n(stats_.write_failures).c_str());
 }
 
 void PromptCache::write_idle_locked(double now) {
@@ -804,8 +870,10 @@ void PromptCache::writer() {
                     lock.lock();
                     continue;
                 }
-                if (cv_.wait_for(lock, std::chrono::duration<double>(scan_s)) == std::cv_status::timeout)
+                if (cv_.wait_for(lock, std::chrono::duration<double>(scan_s)) == std::cv_status::timeout) {
                     write_idle_locked(now_s());
+                    summary_locked(now_s());
+                }
             }
             if (queue_.empty()) return;  // stop_ with nothing left
             job = std::move(queue_.front());
@@ -927,6 +995,15 @@ void PromptCache::write_entry(Job &job) {
     } else if (ok) {
         e.path = path, e.file_bytes = total;
         disk_bytes_ += total;
+        const std::string by = e.saved_by > 0 ? " (saved by Request " + std::to_string(e.saved_by) + ")" : "";
+        slog(LogLevel::Info, "prompt cache: wrote a %s entry of %s tokens%s to disk, %s MB in %s s", kind_name(e.kind),
+             fmt_n((long long)n).c_str(), by.c_str(), fmt_rate(total / 1e6, 0).c_str(), fmt_rate(now_s() - t0, 2).c_str());
+        const std::string delta = base_n > 0 ? "; a delta on the " + fmt_n((long long)base_n) + "-token entry" : "";
+        slog(LogLevel::Info, "%swhy: %s%s", kCont,
+             job.why == Why::Idle    ? ("unused for " + ago(now_s() - e.touched_s)).c_str()
+             : job.why == Why::Evict ? "leaving RAM (MemAvailable below the margin)"
+                                     : "server shutdown",
+             delta.c_str());
         if (e.drop_ram) drop_ram_locked(e, true), e.drop_ram = false;
     }
     release_locked(e);

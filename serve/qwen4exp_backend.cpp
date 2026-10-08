@@ -84,6 +84,22 @@ std::string Qwen4ExpBackend::describe() const {
            }();
 }
 
+LogitRows Qwen4ExpBackend::rows_of(const std::vector<int32_t> &ids, int64_t n_logits, bool cands, int64_t n_valid,
+                                   const LogitMasks *masks, bool verify) {
+    if (masks != nullptr) masks->check(n_logits, logits_row(), "Qwen4ExpBackend::forward_rows");
+    if (!cands || n_logits == 0) {
+        LogitRows l = LogitRows::from_full(verify ? session_.forward_verify(ids, n_logits) : session_.forward(ids, n_logits),
+                                           logits_row());
+        if (masks != nullptr) apply_masks(l, *masks);
+        return l;
+    }
+    if (masks != nullptr) session_.want_candidates(n_valid, masks->bits.data(), masks->rows, masks->words);
+    else session_.want_candidates(n_valid);
+    if (verify) session_.forward_verify(ids, n_logits);
+    else session_.forward(ids, n_logits);
+    return candidate_rows(n_logits);
+}
+
 LogitRows Qwen4ExpBackend::candidate_rows(int64_t rows) const {
     const Qwen4ExpSession::Candidates &c = session_.candidates();
     constexpr int64_t K = kernels::kLogitCands;

@@ -8,9 +8,11 @@
 // without).
 //
 // ThinkWatch follows one turn's reasoning tokens and says when a nudge is due:
-//   nudge 1: past min_tokens with the last `window` tokens' self-copy rate >= rate, or past backstop tokens;
-//   nudge 2 (firmer): past max(2 x, + min_gap) the first nudge's position, with the rate condition again, or past
-//            2 x backstop;
+//   nudge 1: past min_tokens with the last `window` tokens' self-copy rate >= rate;
+//   nudge 2 (firmer): past max(2 x, + min_gap) the first nudge's position, with the rate condition again;
+// No length backstop (removed after measuring it): its 3 fires
+// (16.4k / 16.4k / 4.1k thinking tokens with ~1-5% self-copy) were ignored twice and once made the model end its turn
+// inside the think block - an empty reply. Long thinking that isn't circling is not this mechanism's job.
 // at most max_nudges. A due nudge waits for a paragraph break ("\n\n" in the text so far) up to boundary_wait tokens,
 // so it never lands mid-sentence. self-copy: the n-gram ending at a token occurred earlier in this turn's thinking.
 
@@ -35,7 +37,6 @@ public:
         int64_t min_tokens = 3072;     // no rate trigger before this many thinking tokens
         int64_t window = 1024;         // tokens the self-copy rate is taken over
         double rate = 0.25;            // the rate that makes a nudge due
-        int64_t backstop = 16384;      // thinking tokens that make the first nudge due regardless
         int64_t min_gap = 4096;        // nudge 2: at least this many tokens after nudge 1 (and 2 x its position)
         int64_t boundary_wait = 256;   // a due nudge waits at most this long for a paragraph break
         int ngram = 8;

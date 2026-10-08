@@ -34,6 +34,12 @@ struct ChatRequest {
     std::vector<std::string> stop;
     ChatTemplateOptions template_options;
     std::optional<int64_t> thinking_budget;  // explicit, from any of the four budget fields
+    // response_format: text, json_object (any JSON object), or json_schema with
+    // response_schema the schema (json_schema.schema; `strict` false is constrained like true, `name` only logged).
+    enum class ResponseFormat { Text, JsonObject, JsonSchema };
+    ResponseFormat response_format = ResponseFormat::Text;
+    json::Value response_schema;
+    std::string response_schema_name;
 };
 
 // A legacy /v1/completions request (for the Local LLM Benchmarks speed runner, which drives this endpoint): a raw

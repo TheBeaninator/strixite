@@ -2,6 +2,8 @@
 
 #include "runtime/ngram_table.hpp"
 
+#include "formats/q4_from_q8.hpp"
+
 #include "common/hip_check.hpp"
 #include "common/trace.hpp"
 #include "kernels/attention.hpp"
@@ -24,7 +26,6 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
-#include <thread>
 
 namespace strix {
 
@@ -188,53 +189,60 @@ Qwen4ExpModel::Qwen4ExpModel(const std::string &weights, const std::string &ngra
     }
 }
 
-void Qwen4ExpModel::make_draft_head_q4(int64_t rows, int64_t G) {
-    const QWeightView &src = lm_head_;
-    STRIX_CHECK(rows >= 1 && rows <= src.N(), "Qwen4ExpModel::make_draft_head_q4: ", rows, " rows, expected 1..", src.N());
-    STRIX_CHECK(q4_group_size_supported(G), "Qwen4ExpModel::make_draft_head_q4: group ", G, ", expected 32, 64 or 128");
-    if (src.bits == 4) {  // already Q4: the draft reads the head as loaded
-        draft_head_q4_ = src;
-        draft_head_q4_.q4.N = rows;
+void Qwen4ExpModel::make_draft_head_q4(int64_t rows, int64_t G, int threads) {
+    const char *fn = "Qwen4ExpModel::make_draft_head_q4";
+    STRIX_CHECK(has_mtp_, fn, ": the model has no MTP head - nothing drafts");
+    STRIX_CHECK(draft_head_.bits == 0, fn, ": a draft head copy of ", draft_head_.N(), " rows was already made (call once)");
+    STRIX_CHECK(lm_head_.bits != 0, fn, ": the LM head isn't loaded");
+    const int64_t N = lm_head_.N(), K = lm_head_.K();
+    STRIX_CHECK(N == dims_.vocab, fn, ": the LM head has ", N, " rows, expected the vocabulary's ", dims_.vocab);
+    STRIX_CHECK(rows >= 1 && rows <= N, fn, ": rows ", rows, ", expected 1..", N, " (the LM head's rows)");
+    STRIX_CHECK(q4_group_size_supported(G), fn, ": group size ", G, ", expected 32, 64 or 128");
+    STRIX_CHECK(K % G == 0, fn, ": the LM head's K = ", K, " is not a multiple of group size ", G);
+    STRIX_CHECK(threads >= 1 && threads <= 64, fn, ": threads ", threads, ", expected 1..64");
+
+    if (lm_head_.bits == 4) {  // already Q4: the draft reads the loaded head (a row prefix of it)
+        STRIX_CHECK(lm_head_.q4.G == G, fn, ": the LM head is Q4 with group size ", lm_head_.q4.G, ", asked for ", G,
+                    " - a Q4 head is used as loaded, not requantized");
+        draft_head_ = lm_head_;
+        draft_head_.q4.N = rows;
         return;
     }
-    STRIX_CHECK(src.bits == 8, "Qwen4ExpModel::make_draft_head_q4: the LM head has ", src.bits, " bits, expected 8 (or 4)");
-    const Q8DeviceView &v = src.q8;
-    const int64_t K = v.K, gs = K / v.G;
-    // Row chunks over threads: read back the Q8 rows (row-major: a prefix is contiguous), dequantize exactly, quantize.
-    const int nt = (int)std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
-    const int64_t per = (rows + nt - 1) / nt;
-    std::vector<Q4Weight> part((size_t)nt);
-    std::vector<std::string> err((size_t)nt);
-    std::vector<std::thread> th;
-    for (int t = 0; t < nt; ++t) {
-        const int64_t r0 = std::min(rows, (int64_t)t * per), r1 = std::min(rows, r0 + per);
-        if (r1 <= r0) continue;
-        th.emplace_back([&, t, r0, r1] {
-            try {
-                Q8Weight w;
-                w.N = r1 - r0, w.K = K, w.G = v.G;
-                w.q.resize((size_t)(w.N * K));
-                w.scale.resize((size_t)(w.N * gs));
-                w.minv.resize(w.scale.size());
-                STRIX_HIP_CHECK(hipMemcpy(w.q.data(), v.q + r0 * K, w.q.size(), hipMemcpyDeviceToHost), "draft q4: codes");
-                STRIX_HIP_CHECK(hipMemcpy(w.scale.data(), v.scale + r0 * gs, w.scale.size() * 2, hipMemcpyDeviceToHost),
-                                "draft q4: scales");
-                STRIX_HIP_CHECK(hipMemcpy(w.minv.data(), v.minv + r0 * gs, w.minv.size() * 2, hipMemcpyDeviceToHost),
-                                "draft q4: mins");
-                const std::vector<float> f = dequantize_q8(w);
-                part[(size_t)t] = quantize_q4(f.data(), w.N, K, G);
-            } catch (const std::exception &e) {
-                err[(size_t)t] = e.what();
-            }
-        });
-    }
-    for (std::thread &x : th) x.join();
-    for (const std::string &e : err) STRIX_CHECK(e.empty(), "Qwen4ExpModel::make_draft_head_q4: ", e);
-    Q4Weight all;
-    for (const Q4Weight &q : part)
-        if (q.N) append_rows_q4(all, q, "Qwen4ExpModel::make_draft_head_q4");
-    draft_q4_ = std::make_unique<Q4Device>(Q4Device::upload(all, "lm_head.draft_q4"));
-    draft_head_q4_ = qweight(draft_q4_->view());
+    STRIX_CHECK(lm_head_.bits == 8, fn, ": the LM head has ", lm_head_.bits, " bits, expected 8 (requantized) or 4 (used ",
+                "as loaded)");
+
+    // Read the Q8 rows back (row-major: the first `rows` rows are a prefix of each array).
+    const Q8DeviceView &v = lm_head_.q8;
+    STRIX_CHECK(v.q && v.scale && v.minv && v.K == K && v.G >= 1 && K % v.G == 0, fn, ": the Q8 LM head view is ",
+                "incomplete (codes ", (const void *)v.q, ", scales ", (const void *)v.scale, ", mins ",
+                (const void *)v.minv, ", K ", v.K, ", G ", v.G, ")");
+    Q8Weight q8;
+    q8.N = rows, q8.K = K, q8.G = v.G;
+    q8.q.resize((size_t)(rows * K));
+    q8.scale.resize((size_t)(rows * (K / v.G)));
+    q8.minv.resize(q8.scale.size());
+    STRIX_HIP_CHECK(hipMemcpy(q8.q.data(), v.q, q8.q.size(), hipMemcpyDeviceToHost), fn, ": read back ", q8.q.size(),
+                    " bytes of Q8 codes");
+    STRIX_HIP_CHECK(hipMemcpy(q8.scale.data(), v.scale, q8.scale.size() * 2, hipMemcpyDeviceToHost), fn, ": read back ",
+                    q8.scale.size(), " Q8 scales");
+    STRIX_HIP_CHECK(hipMemcpy(q8.minv.data(), v.minv, q8.minv.size() * 2, hipMemcpyDeviceToHost), fn, ": read back ",
+                    q8.minv.size(), " Q8 mins");
+
+    const Q4Weight q4 = quantize_q4_from_q8(q8, G, threads);
+    draft_q4_ = std::make_unique<Q4Device>(Q4Device::upload(q4, "lm_head.mtp_draft_q4"));
+    draft_q4_bytes_ = q4.bytes();
+    draft_head_ = qweight(draft_q4_->view());
+    STRIX_CHECK(draft_head_.N() == rows && draft_head_.K() == K, fn, ": the uploaded copy is [", draft_head_.N(), ", ",
+                draft_head_.K(), "], expected [", rows, ", ", K, "]");
+}
+
+int64_t make_served_mtp_draft_head(Qwen4ExpModel &model, int64_t mtp_vocab) {
+    const int64_t vocab = model.dims().vocab;
+    STRIX_CHECK(mtp_vocab >= 0 && mtp_vocab <= vocab, "make_served_mtp_draft_head: mtp_vocab ", mtp_vocab, ", expected 0..",
+                vocab, " (0 = the whole vocabulary)");
+    const int64_t rows = mtp_vocab == 0 ? vocab : mtp_vocab;
+    model.make_draft_head_q4(rows, /*G=*/64, /*threads=*/16);
+    return rows;
 }
 
 const Qwen4ExpModel::Layer &Qwen4ExpModel::layer(int64_t i) const {
@@ -259,8 +267,8 @@ Qwen4ExpSession::Qwen4ExpSession(const Qwen4ExpModel &model, int64_t capacity, i
     STRIX_CHECK(capacity <= D.max_positions(), "Qwen4ExpSession: capacity = ", capacity, " is past the model's ",
                 D.max_positions(), " positions (", D.trained_positions, " trained x YaRN factor ", D.yarn_factor,
                 ") - positions beyond it aren't meaningful; load the model with a larger yarn_factor");
-    STRIX_CHECK(max_tokens >= 1 && max_tokens <= capacity && max_tokens <= 8192, "Qwen4ExpSession: max_tokens = ",
-                max_tokens, ", expected 1..min(capacity = ", capacity, ", 8192)");
+    STRIX_CHECK(max_tokens >= 1 && max_tokens <= capacity && max_tokens <= 16384, "Qwen4ExpSession: max_tokens = ",
+                max_tokens, ", expected 1..min(capacity = ", capacity, ", 16384)");
     STRIX_HIP_CHECK(hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking), "Qwen4ExpSession: stream");
     const size_t e = es(m_.act());
     const int64_t M = max_tokens, n4 = D.H * D.d, A = D.top_k + 1;
@@ -400,6 +408,7 @@ Qwen4ExpSession::~Qwen4ExpSession() {
         (void)hipStreamSynchronize(stream_);  // no upload may still read a pinned buffer when it's freed
         (void)hipStreamDestroy(stream_);
     }
+    if (mask_uploaded_) (void)hipEventDestroy(mask_uploaded_);
 }
 
 Qwen4ExpSession::PleWorker::PleWorker() : thread_([this] { loop(); }) {}
@@ -836,9 +845,35 @@ std::vector<float> Qwen4ExpSession::read_back(size_t n_floats, const char *what,
     return std::vector<float>(l, l + n_floats);
 }
 
-void Qwen4ExpSession::want_candidates(int64_t n_valid) {
-    STRIX_CHECK(n_valid >= 1 && n_valid <= m_.dims().vocab, "Qwen4ExpSession::want_candidates: n_valid = ", n_valid,
-                ", expected 1..", m_.dims().vocab);
+void Qwen4ExpSession::want_candidates(int64_t n_valid, const uint32_t *masks, int64_t mask_rows, int64_t mask_words) {
+    const char *fn = "Qwen4ExpSession::want_candidates";
+    const int64_t vocab = m_.dims().vocab;
+    STRIX_CHECK(n_valid >= 1 && n_valid <= vocab, fn, ": n_valid = ", n_valid, ", expected 1..", vocab);
+    if (masks == nullptr) {
+        STRIX_CHECK(mask_rows == 0 && mask_words == 0, fn, ": mask_rows = ", mask_rows, ", mask_words = ", mask_words,
+                    " without masks (pass 0 for both)");
+    } else {
+        STRIX_CHECK(mask_rows >= 1 && mask_rows <= kMaxLogits, fn, ": mask_rows = ", mask_rows, ", expected 1..",
+                    kMaxLogits);
+        STRIX_CHECK(mask_words >= (vocab + 31) / 32, fn, ": mask_words = ", mask_words, " covers ", mask_words * 32,
+                    " ids, the vocabulary has ", vocab);
+        const size_t bytes = (size_t)(mask_rows * mask_words) * 4;
+        if (mask_host_.size() < bytes) {
+            STRIX_CHECK(!mask_upload_recorded_ || hipEventSynchronize(mask_uploaded_) == hipSuccess, fn,
+                        ": waiting for the last mask upload before replacing its buffer");
+            mask_upload_recorded_ = false;
+            const size_t capacity = (size_t)(kMaxLogits * mask_words) * 4;
+            mask_host_ = PinnedHostBuffer(capacity, "structured-output masks (host)");
+            mask_dev_ = DeviceBuffer<uint32_t>(capacity / 4, "structured-output masks");
+            if (mask_uploaded_ == nullptr)
+                STRIX_HIP_CHECK(hipEventCreateWithFlags(&mask_uploaded_, hipEventDisableTiming), fn, ": mask upload event");
+        }
+        // The gate: the previous upload from this pinned buffer has completed before it is written again.
+        if (mask_upload_recorded_) STRIX_HIP_CHECK(hipEventSynchronize(mask_uploaded_), fn, ": last mask upload");
+        std::memcpy(mask_host_.get(), masks, bytes);
+    }
+    mask_rows_ = masks == nullptr ? 0 : mask_rows;
+    mask_words_ = masks == nullptr ? 0 : mask_words;
     cand_n_valid_ = n_valid;
 }
 
@@ -868,7 +903,10 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
     STRIX_CHECK(n_logits >= 0 && n_logits <= std::min(T, kMaxLogits), "Qwen4ExpSession::forward: n_logits = ",
                 n_logits, ", expected 0..", std::min(T, kMaxLogits));
     const int64_t cand_n_valid = cand_n_valid_;  // want_candidates() covers this one forward, whatever happens
-    cand_n_valid_ = 0;
+    const int64_t mask_rows = mask_rows_, mask_words = mask_words_;
+    cand_n_valid_ = 0, mask_rows_ = 0, mask_words_ = 0;
+    STRIX_CHECK(mask_rows == 0 || (cand_n_valid > 0 && mask_rows == n_logits), "Qwen4ExpSession::forward: ",
+                mask_rows, " structured-output mask rows for a forward of ", n_logits, " logits rows");
     broken_ = true;
     const bool fresh = pos_ == 0;
     auto at = [&](const DeviceBuffer<uint8_t> &b, int64_t elem) { return b.get() + (size_t)elem * e; };
@@ -1158,9 +1196,17 @@ std::vector<float> Qwen4ExpSession::forward(const std::vector<int32_t> &ids, int
     const bool cands = cand_n_valid > 0 && n_logits > 0;
     if (cands) {
         auto *cd = reinterpret_cast<kernels::LogitCand *>(cand_dev_.get());
+        if (mask_rows > 0) {
+            STRIX_HIP_CHECK(hipMemcpyAsync(mask_dev_.get(), mask_host_.get(), (size_t)(mask_rows * mask_words) * 4,
+                                           hipMemcpyHostToDevice, stream_),
+                            "Qwen4ExpSession::forward: structured-output masks upload");
+            STRIX_HIP_CHECK(hipEventRecord(mask_uploaded_, stream_), "Qwen4ExpSession::forward: mask upload event");
+            mask_upload_recorded_ = true;
+        }
         kernels::logits_topk(logits_.get(), n_logits, D.vocab, cand_n_valid, cd,
                              reinterpret_cast<uint32_t *>(cd + n_logits * kernels::kLogitCands), cand_ws_.get(),
-                             cand_ws_bytes_, stream_);
+                             cand_ws_bytes_, stream_, mask_rows > 0 ? mask_dev_.get() : nullptr,
+                             mask_rows > 0 ? mask_words : 0);
     }
 
     // MTP: the layer's K / V (and indexer keys) for these positions, each from its token and the trunk's streams
@@ -1495,11 +1541,14 @@ void Qwen4ExpSession::run_mtp(int32_t token_id, int64_t step) {
         kernels::hc_inject(mtp_x_.get(), w_in_.get(), y_.get(), T, D.H, D.d, act, stream_);
     }
 
-    // The head's own collapse, then the shared LM head's first mtp_vocab_ rows (row-major: a prefix view) - or the
-    // model's Q4 draft copy of them when it covers mtp_vocab_ (Qwen4ExpModel::make_draft_head_q4).
+    // The head's own collapse, then the LM head's first mtp_vocab_ rows (row-major: a prefix view) - from the model's
+    // Q4 draft copy when it covers mtp_vocab_ (Qwen4ExpModel::make_draft_head_q4: drafts only, the verify decides),
+    // else from the LM head as loaded.
     hc_mix(mtp.hc_mixer, false);
-    const QWeightView &q4 = m_.draft_head_q4();
-    QWeightView head = q4.bits != 0 && mtp_vocab_ <= q4.N() ? q4 : m_.lm_head();
+    const QWeightView &draft = m_.draft_head_q4();
+    QWeightView head = draft.bits != 0 && mtp_vocab_ <= draft.N() ? draft : m_.lm_head();
+    STRIX_CHECK(head.K() == m_.lm_head().K() && mtp_vocab_ <= head.N(), "Qwen4ExpSession::forward_mtp: draft head [",
+                head.N(), ", ", head.K(), "] for mtp_vocab ", mtp_vocab_, " and the LM head's K ", m_.lm_head().K());
     switch (head.bits) {
         case 8: head.q8.N = mtp_vocab_; break;
         case 6: head.q6.N = mtp_vocab_; break;

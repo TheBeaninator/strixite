@@ -18,7 +18,6 @@
 #include "serve/server_config.hpp"
 #include "serve/tokenizer.hpp"
 
-#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <filesystem>
@@ -104,23 +103,27 @@ int run(int argc, char **argv) {
     const int64_t ngram_cache_rows = settings.integer("ngram-cache-rows");
     const std::string capture_dir = settings.text("capture-dir");  // empty: no capture
     const bool think_nudge = settings.on("think-nudge");
+    ThinkWatch::Policy nudge_policy;
+    nudge_policy.rate = settings.number("think-nudge-rate");
+    nudge_policy.min_tokens = settings.integer("think-nudge-min-tokens");
+    cfg.thinking_default = settings.on("thinking");
     cfg.defaults = sampling_defaults(gen_config);
     const Tokenizer tok(tokenizer);
     slog(LogLevel::Info, "startup: tokenizer %s (%d tokens)", tokenizer.c_str(), tok.size());
-    Qwen4ExpModel model(weights, ngram, kernels::Act::BF16, /*allow_truncated=*/false, ngram_cache_rows,
-                        yarn_factor);
+    Qwen4ExpModel model(weights, ngram, kernels::Act::BF16, /*allow_truncated=*/false, ngram_cache_rows, yarn_factor);
     if (yarn_factor > 1.0f)
         slog(LogLevel::Info, "startup: YaRN factor %g: %lld positions (%lld trained), cos/sin factor %.4f",
              (double)yarn_factor, (long long)model.dims().max_positions(), (long long)model.dims().trained_positions,
              (double)model.rope_scale());
     slog(LogLevel::Info, "startup: %.1f GiB of weights loaded in %.1f s",
                  (double)model.weights().data_bytes() / (1ull << 30), model.weights().load_seconds());
-    if (use_mtp && model.has_mtp()) {  // drafts score a Q4 copy of the draft vocabulary's LM head rows
-        const int64_t rows = mtp_vocab > 0 ? std::min<int64_t>(mtp_vocab, model.dims().vocab) : model.dims().vocab;
+    // MTP drafts score a Q4 copy of the draft vocabulary's LM head rows (Qwen4ExpModel::make_draft_head_q4; strixite
+    // PR #2): half the bytes per draft call, the verify still decides every token.
+    if (use_mtp && model.has_mtp()) {
         const auto t0 = std::chrono::steady_clock::now();
-        model.make_draft_head_q4(rows);
-        slog(LogLevel::Info, "startup: MTP draft head: Q4 copy of the first %lld LM head rows made in %.2f s",
-             (long long)model.draft_head_q4().N(),
+        const int64_t rows = make_served_mtp_draft_head(model, mtp_vocab);
+        slog(LogLevel::Info, "startup: MTP draft head: Q4 G64 copy of the first %lld LM head rows, %.1f MB, made in %.2f s",
+             (long long)rows, (double)model.draft_head_q4_bytes() / 1e6,
              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
     Qwen4ExpBackend backend(model, capacity, chunk, use_mtp, mtp_vocab);
@@ -137,10 +140,15 @@ int run(int argc, char **argv) {
     Engine::Options eng_opts;
     eng_opts.cache = cache.get();
     eng_opts.mtp_margin = mtp_margin;
-    eng_opts.mtp_reject_forward = settings.on("mtp-reject-forward");
     eng_opts.mtp_draft = mtp_draft;
     eng_opts.think_nudge = think_nudge;
-    slog(LogLevel::Info, "startup: thinking nudge %s", think_nudge ? "on" : "off");
+    eng_opts.think_nudge_policy = nudge_policy;
+    if (think_nudge)
+        slog(LogLevel::Info, "startup: thinking nudge on: %.0f%% self-copy over %lld tokens past %lld",
+             100.0 * nudge_policy.rate, (long long)nudge_policy.window, (long long)nudge_policy.min_tokens);
+    else
+        slog(LogLevel::Info, "startup: thinking nudge off");
+    slog(LogLevel::Info, "startup: thinking %s for requests that don't say", cfg.thinking_default ? "on" : "off");
     if (!capture_dir.empty()) {
         std::error_code ec;
         std::filesystem::create_directories(capture_dir, ec);

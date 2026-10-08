@@ -37,7 +37,12 @@ size_t logits_topk_workspace_bytes(int64_t rows, int64_t n_valid);
 // logits [rows, ld] FP32 on the device; n_valid <= ld, 1 <= n_valid <= kLogitsTopkMaxValid, rows >= 1.
 // out [rows, kLogitCands], nan [rows] (1 if the row has a NaN among its first n_valid logits), both on the device.
 // workspace: >= logits_topk_workspace_bytes(rows, n_valid) bytes, no initialisation needed.
+// mask (structured output: response_format): null, or [rows, mask_words] uint32 on the device - bit
+// (id % 32) of word (id / 32) of a row set = id allowed. Disallowed ids are left out like padding (a row with fewer
+// allowed ids than kLogitCands fills the rest with (-inf, INT32_MAX)); a NaN is flagged whether its id is allowed or
+// not. mask_words >= ceil(n_valid / 32); 0 when mask is null. Applied in the first level only, where logits are read.
 void logits_topk(const float *logits, int64_t rows, int64_t ld, int64_t n_valid, LogitCand *out, uint32_t *nan,
-                 void *workspace, size_t workspace_bytes, hipStream_t stream);
+                 void *workspace, size_t workspace_bytes, hipStream_t stream, const uint32_t *mask = nullptr,
+                 int64_t mask_words = 0);
 
 }  // namespace strix::kernels

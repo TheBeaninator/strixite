@@ -38,17 +38,14 @@ public:
     std::vector<float> forward_verify(const std::vector<int32_t> &ids, int64_t n_logits) override {
         return session_.forward_verify(ids, n_logits);
     }
-    LogitRows forward_rows(const std::vector<int32_t> &ids, int64_t n_logits, bool cands, int64_t n_valid) override {
-        if (!cands || n_logits == 0) return LogitRows::from_full(session_.forward(ids, n_logits), logits_row());
-        session_.want_candidates(n_valid);
-        session_.forward(ids, n_logits);
-        return candidate_rows(n_logits);
+    // Full rows are masked on the host (apply_masks); candidates on the GPU, in logits_topk's first level.
+    LogitRows forward_rows(const std::vector<int32_t> &ids, int64_t n_logits, bool cands, int64_t n_valid,
+                           const LogitMasks *masks = nullptr) override {
+        return rows_of(ids, n_logits, cands, n_valid, masks, false);
     }
-    LogitRows forward_verify_rows(const std::vector<int32_t> &ids, int64_t n_logits, bool cands, int64_t n_valid) override {
-        if (!cands || n_logits == 0) return LogitRows::from_full(session_.forward_verify(ids, n_logits), logits_row());
-        session_.want_candidates(n_valid);
-        session_.forward_verify(ids, n_logits);
-        return candidate_rows(n_logits);
+    LogitRows forward_verify_rows(const std::vector<int32_t> &ids, int64_t n_logits, bool cands, int64_t n_valid,
+                                  const LogitMasks *masks = nullptr) override {
+        return rows_of(ids, n_logits, cands, n_valid, masks, true);
     }
     void keep_verify() override { session_.keep_verify(); }
     void drop_verify() override { session_.drop_verify(); }
@@ -69,6 +66,8 @@ public:
 
 private:
     LogitRows candidate_rows(int64_t rows) const;  // session_.candidates() of the last forward, checked
+    LogitRows rows_of(const std::vector<int32_t> &ids, int64_t n_logits, bool cands, int64_t n_valid,
+                      const LogitMasks *masks, bool verify);
     const Qwen4ExpModel &model_;
     Qwen4ExpSession session_;
     Qwen4ExpSnapshot snapshots_[4];

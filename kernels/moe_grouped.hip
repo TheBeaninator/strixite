@@ -26,6 +26,17 @@ __device__ inline uint16_t f32_to_bf16_bits(float f) {
 }
 __device__ inline void store(float *p, int64_t i, float v) { p[i] = v; }
 __device__ inline void store(uint16_t *p, int64_t i, float v) { p[i] = f32_to_bf16_bits(v); }
+// The combine's partials (one per slot, summed by combine_reduce_kernel): FP32, or - the F16 kernel, MoeMath::WmmaF16,
+// the served path for Q4 experts - rounded to BF16 (to nearest even) into the same buffer read as uint16_t, half its
+// bytes. BF16 partials: the down kernel 88 -> 76 us a token at 8192, the same 400-needle long-context score as FP32
+// partials (365 vs 366; F16 partials, as fast, scored 301), NLL inside the noise floor.
+__device__ inline void put_partial(float *p, int64_t i, float v, bool bf16) {
+    if (bf16) reinterpret_cast<uint16_t *>(p)[i] = f32_to_bf16_bits(v);
+    else p[i] = v;
+}
+__device__ inline float get_partial(const float *p, int64_t i, bool bf16) {
+    return bf16 ? bf16_bits_to_f32(reinterpret_cast<const uint16_t *>(p)[i]) : p[i];
+}
 
 __device__ inline void load_x32(const float *x, int64_t off, float (&v)[kChunk]) {
     const float4 *p = reinterpret_cast<const float4 *>(x + off);
@@ -310,7 +321,7 @@ __device__ inline f16x2 bf16_bits_to_f16x2(uint16_t b) { return wmma_bf16_bits_t
 template <typename T, int G, bool COMBINE, int TR>
 __global__ void __launch_bounds__(kWmmaThreads)
     grouped_wmma_f16_kernel(const T *x, const uint8_t *q, const uint16_t *scale, const uint16_t *minv,
-                            const int32_t *ws, int64_t A, int64_t N, int64_t K, T *y, float *partial) {
+                            const int32_t *ws, int64_t A, int64_t N, int64_t K, T *y, float *partial, bool pbf16) {
     static_assert(TR == RW, "the route kernel's WMMA tile size");
     static_assert(G == 32 || G == 64 || G == 128, "group sizes: a 32-code half-step lies in one group");
     constexpr int TM = TR / 16;
@@ -340,7 +351,7 @@ __global__ void __launch_bounds__(kWmmaThreads)
     if (bucket == E) {  // invalid ids: NaN outputs (err was set by moe_group_routes)
         for (int i = threadIdx.x; i < rows * rows_w; i += kWmmaThreads) {
             const int r = i / rows_w, c = i % rows_w;
-            if (COMBINE) partial[ooff[r] + n0 + c] = __int_as_float(0x7fc00000);
+            if (COMBINE) put_partial(partial, ooff[r] + n0 + c, __int_as_float(0x7fc00000), pbf16);
             else store(y, ooff[r] + n0 + c, __int_as_float(0x7fc00000));
         }
         return;
@@ -428,7 +439,7 @@ __global__ void __launch_bounds__(kWmmaThreads)
             for (int v = 0; v < 8; ++v) {
                 const int r = 16 * i + wmma_c_row(v), c = wave * 16 + (int)threadIdx.x % 16;
                 if (r < rows && c < rows_w) {
-                    if (COMBINE) partial[ooff[r] + n0 + c] = acc[i][v];
+                    if (COMBINE) put_partial(partial, ooff[r] + n0 + c, acc[i][v], pbf16);
                     else store(y, ooff[r] + n0 + c, acc[i][v]);
                 }
             }
@@ -447,7 +458,7 @@ __global__ void __launch_bounds__(kWmmaThreads)
 template <typename T>
 __global__ void __launch_bounds__(kThreads)
     combine_reduce_kernel(const float *partial, const int32_t *ids, const float *coef, int64_t M, int64_t A,
-                          int64_t E, int64_t N, T *y) {
+                          int64_t E, int64_t N, T *y, bool pbf16) {
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= M * N) return;
     const int64_t m = i / N, n = i % N;
@@ -456,7 +467,7 @@ __global__ void __launch_bounds__(kThreads)
     for (int64_t a = 0; a < A; ++a) {
         const int32_t id = ids[m * A + a];
         ok = ok && id >= 0 && id < E;
-        v = fmaf(coef[m * A + a], partial[(m * A + a) * N + n], v);
+        v = fmaf(coef[m * A + a], get_partial(partial, (m * A + a) * N + n, pbf16), v);
     }
     store(y, i, ok ? v : __int_as_float(0x7fc00000));
 }
@@ -507,9 +518,9 @@ void launch_grouped(const T *x, const Q4DeviceView &w, int64_t E, const void *ws
         STRIX_CHECK(tiles <= 65535, "moe grouped (WMMA F16): ", tiles, " tile slots exceed the grid");
         dim3 grid((unsigned)((N + kWmmaBN - 1) / kWmmaBN), (unsigned)tiles), block(kWmmaThreads);
         switch (w.G) {
-            case 32: grouped_wmma_f16_kernel<T, 32, COMBINE, RW><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial); break;
-            case 64: grouped_wmma_f16_kernel<T, 64, COMBINE, RW><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial); break;
-            default: grouped_wmma_f16_kernel<T, 128, COMBINE, RW><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial); break;
+            case 32: grouped_wmma_f16_kernel<T, 32, COMBINE, RW><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
+            case 64: grouped_wmma_f16_kernel<T, 64, COMBINE, RW><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
+            default: grouped_wmma_f16_kernel<T, 128, COMBINE, RW><<<grid, block, 0, stream>>>(x, w.q, w.scale, w.minv, wsi, A, N, w.K, y, partial, COMBINE); break;
         }
         return;
     }
@@ -599,14 +610,15 @@ void experts_combine_grouped(const char *fn, const void *h, const Q4DeviceView &
     check_no_overlap(fn, "y", y, M * N * es, "partial", partial, M * A * N * 4);
     check_no_overlap(fn, "partial", partial, M * A * N * 4, "h", h, M * A * w.K * es);
     const unsigned blocks = (unsigned)((M * N + kThreads - 1) / kThreads);
+    const bool pbf16 = math == MoeMath::WmmaF16;  // the F16 kernel writes BF16 partials (put_partial), the others FP32
     if (act == Act::F32) {
         launch_grouped<float, true, HB>(static_cast<const float *>(h), w, E, ws, M, A, nullptr, partial, math, stream);
         combine_reduce_kernel<float><<<blocks, kThreads, 0, stream>>>(partial, ids, coef, M, A, E, N,
-                                                                      static_cast<float *>(y));
+                                                                      static_cast<float *>(y), pbf16);
     } else {
         launch_grouped<uint16_t, true, HB>(static_cast<const uint16_t *>(h), w, E, ws, M, A, nullptr, partial, math, stream);
         combine_reduce_kernel<uint16_t><<<blocks, kThreads, 0, stream>>>(partial, ids, coef, M, A, E, N,
-                                                                         static_cast<uint16_t *>(y));
+                                                                         static_cast<uint16_t *>(y), pbf16);
     }
     STRIX_HIP_CHECK_LAUNCH(fn, " ", act_name(act), math == MoeMath::WmmaBf16 ? " wmma" : math == MoeMath::WmmaF16 ? " wmma-f16" : "", " M=", M, " A=", A, " E=",
                            E, " N=", N, " K=", w.K, " G=", w.G);

@@ -7,6 +7,7 @@
 // cancels its request.
 
 #include "serve/engine.hpp"
+#include "serve/grammar_cache.hpp"
 #include "serve/tokenizer.hpp"
 
 #include <atomic>
@@ -24,6 +25,9 @@ struct ServerConfig {
     int port = 5300;
     std::string model_id = "qwen3.8-flash-next";
     SamplingParams defaults;  // generation_config.json's
+    // Thinking for requests that don't say (no enable_thinking in any spelling, no reasoning_effort, no budget): false
+    // renders them without the think block (config `thinking`).
+    bool thinking_default = true;
     double keepalive_s = 10;  // SSE comment interval while nothing else is sent
     size_t max_body_bytes = 64u << 20;
 };
@@ -43,6 +47,7 @@ private:
     ServerConfig cfg_;
     int64_t started_;
     std::atomic<int64_t> next_id_{0};  // request ids for the log ("req <id> ...")
+    GrammarCache grammars_;            // compiled response formats (structured output), shared across requests
     std::unique_ptr<httplib::Server> svr_;
     void routes();
 };

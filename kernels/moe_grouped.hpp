@@ -54,7 +54,8 @@ void linear_q4_experts_gather_grouped(const void *x, const Q4DeviceView &w, int6
                                       size_t ws_bytes, int64_t M, int64_t A, void *y, Act act, MoeMath math,
                                       hipStream_t stream);
 
-// Combine over grouped routes. partial: M*A*N FP32 scratch (device). ids: the same ids (the reduction checks
+// Combine over grouped routes. partial: M*A*N FP32 scratch (device) - MoeMath::WmmaF16 stores its partials as BF16
+// in the first half of it (moe_grouped.hip, put_partial). ids: the same ids (the reduction checks
 // them per token); coef [M, A] F32. h 16-byte aligned; y must not overlap h or partial.
 void linear_q4_experts_combine_grouped(const void *h, const Q4DeviceView &w, int64_t E, const int32_t *ids,
                                        const float *coef, const void *ws, size_t ws_bytes, float *partial, int64_t M,

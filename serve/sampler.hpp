@@ -42,6 +42,20 @@ struct LogitRows {
     LogitRows row_of(int64_t r) const;                                  // one row, either kind
 };
 
+// Per-row allowed-token masks for a forward's logits rows (structured output, response_format):
+// bit (id % 32) of word (id / 32) of row r set = id allowed. A backend gives back only allowed ids - candidates from
+// the allowed ids alone (kernels/logits_topk's mask), full rows with every disallowed logit set to -inf.
+struct LogitMasks {
+    int64_t rows = 0, words = 0;  // words per row: >= ceil(logits row / 32)
+    std::vector<uint32_t> bits;   // [rows, words]
+    bool empty() const { return rows == 0; }
+    const uint32_t *row(int64_t r) const;  // checked
+    void check(int64_t want_rows, int64_t logits_row, const char *where) const;  // rows and width fit the forward
+};
+// Full rows: every logit whose id the row's mask disallows becomes -inf (candidate rows: refused - their backend
+// applies the mask before reducing).
+void apply_masks(LogitRows &rows, const LogitMasks &masks);
+
 class Sampler {
 public:
     static constexpr int64_t kCandidates = 20;  // what sample_candidates needs a row (kernels::kLogitCands)
@@ -55,7 +69,9 @@ public:
     bool takes_candidates() const;
     // sample() from a row's top candidates (v / id, m of them, sorted as in LogitRows; m >= kCandidates or every
     // valid id) and whether the row had a NaN: the same result, margin, errors and random draws as sample() on the
-    // whole row. Requires takes_candidates().
+    // whole row. Requires takes_candidates(). A masked row (structured output) may end in padding entries
+    // (-inf, INT32_MAX) when fewer ids are allowed than candidates: they carry no probability, as the -inf logits of
+    // the same row masked in full do.
     int32_t sample_candidates(const float *v, const int32_t *id, int64_t m, bool nan, float *out_margin = nullptr);
 
 private:
