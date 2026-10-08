@@ -133,6 +133,13 @@ public:
     const NgramRowSource &ngram_rows() const;
     bool has_mtp() const { return has_mtp_; }
     const MtpHead &mtp() const { return mtp_; }
+    // The MTP draft's own Q4 copy (group G: 32 / 64 / 128) of the LM head's first `rows` rows, made once at load: a Q8
+    // head is dequantized exactly and quantized as formats/q4 quantize_q4 (a Q4 head is used as loaded). Drafts then
+    // read about half the bytes per call (65,536 rows: 178 -> 94 MB). Only the draft uses it: the trunk's lm_head()
+    // never changes and every drafted token is still decided by the verify. A session drafts over it whenever it
+    // covers the session's mtp_vocab() rows. Call before any session drafts.
+    void make_draft_head_q4(int64_t rows, int64_t G = 64);
+    const QWeightView &draft_head_q4() const { return draft_head_q4_; }  // bits == 0 until made
 
 private:
     Qwen4ExpDims dims_;
@@ -142,7 +149,8 @@ private:
     std::vector<Layer> layers_;
     const uint16_t *embed_ = nullptr;
     Q8DeviceView embed_q8_{};
-    QWeightView lm_head_;
+    QWeightView lm_head_, draft_head_q4_;
+    std::unique_ptr<Q4Device> draft_q4_;
     bool truncated_ = false, shared_separate_ = false, has_mtp_ = false;
     MtpHead mtp_;
     Hc final_;

@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <thread>
 
 namespace strix {
 
@@ -185,6 +186,55 @@ Qwen4ExpModel::Qwen4ExpModel(const std::string &weights, const std::string &ngra
             l.shared_down = w_->qw(M + "mlp.shared_expert.down_proj.weight", {D.d, D.inter});
         }
     }
+}
+
+void Qwen4ExpModel::make_draft_head_q4(int64_t rows, int64_t G) {
+    const QWeightView &src = lm_head_;
+    STRIX_CHECK(rows >= 1 && rows <= src.N(), "Qwen4ExpModel::make_draft_head_q4: ", rows, " rows, expected 1..", src.N());
+    STRIX_CHECK(q4_group_size_supported(G), "Qwen4ExpModel::make_draft_head_q4: group ", G, ", expected 32, 64 or 128");
+    if (src.bits == 4) {  // already Q4: the draft reads the head as loaded
+        draft_head_q4_ = src;
+        draft_head_q4_.q4.N = rows;
+        return;
+    }
+    STRIX_CHECK(src.bits == 8, "Qwen4ExpModel::make_draft_head_q4: the LM head has ", src.bits, " bits, expected 8 (or 4)");
+    const Q8DeviceView &v = src.q8;
+    const int64_t K = v.K, gs = K / v.G;
+    // Row chunks over threads: read back the Q8 rows (row-major: a prefix is contiguous), dequantize exactly, quantize.
+    const int nt = (int)std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+    const int64_t per = (rows + nt - 1) / nt;
+    std::vector<Q4Weight> part((size_t)nt);
+    std::vector<std::string> err((size_t)nt);
+    std::vector<std::thread> th;
+    for (int t = 0; t < nt; ++t) {
+        const int64_t r0 = std::min(rows, (int64_t)t * per), r1 = std::min(rows, r0 + per);
+        if (r1 <= r0) continue;
+        th.emplace_back([&, t, r0, r1] {
+            try {
+                Q8Weight w;
+                w.N = r1 - r0, w.K = K, w.G = v.G;
+                w.q.resize((size_t)(w.N * K));
+                w.scale.resize((size_t)(w.N * gs));
+                w.minv.resize(w.scale.size());
+                STRIX_HIP_CHECK(hipMemcpy(w.q.data(), v.q + r0 * K, w.q.size(), hipMemcpyDeviceToHost), "draft q4: codes");
+                STRIX_HIP_CHECK(hipMemcpy(w.scale.data(), v.scale + r0 * gs, w.scale.size() * 2, hipMemcpyDeviceToHost),
+                                "draft q4: scales");
+                STRIX_HIP_CHECK(hipMemcpy(w.minv.data(), v.minv + r0 * gs, w.minv.size() * 2, hipMemcpyDeviceToHost),
+                                "draft q4: mins");
+                const std::vector<float> f = dequantize_q8(w);
+                part[(size_t)t] = quantize_q4(f.data(), w.N, K, G);
+            } catch (const std::exception &e) {
+                err[(size_t)t] = e.what();
+            }
+        });
+    }
+    for (std::thread &x : th) x.join();
+    for (const std::string &e : err) STRIX_CHECK(e.empty(), "Qwen4ExpModel::make_draft_head_q4: ", e);
+    Q4Weight all;
+    for (const Q4Weight &q : part)
+        if (q.N) append_rows_q4(all, q, "Qwen4ExpModel::make_draft_head_q4");
+    draft_q4_ = std::make_unique<Q4Device>(Q4Device::upload(all, "lm_head.draft_q4"));
+    draft_head_q4_ = qweight(draft_q4_->view());
 }
 
 const Qwen4ExpModel::Layer &Qwen4ExpModel::layer(int64_t i) const {
@@ -1445,9 +1495,11 @@ void Qwen4ExpSession::run_mtp(int32_t token_id, int64_t step) {
         kernels::hc_inject(mtp_x_.get(), w_in_.get(), y_.get(), T, D.H, D.d, act, stream_);
     }
 
-    // The head's own collapse, then the shared LM head's first mtp_vocab_ rows (row-major: a prefix view).
+    // The head's own collapse, then the shared LM head's first mtp_vocab_ rows (row-major: a prefix view) - or the
+    // model's Q4 draft copy of them when it covers mtp_vocab_ (Qwen4ExpModel::make_draft_head_q4).
     hc_mix(mtp.hc_mixer, false);
-    QWeightView head = m_.lm_head();
+    const QWeightView &q4 = m_.draft_head_q4();
+    QWeightView head = q4.bits != 0 && mtp_vocab_ <= q4.N() ? q4 : m_.lm_head();
     switch (head.bits) {
         case 8: head.q8.N = mtp_vocab_; break;
         case 6: head.q6.N = mtp_vocab_; break;
