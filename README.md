@@ -66,9 +66,10 @@ Add them to your bootloader's kernel command line (on Fedora: `sudo grubby --upd
 reboot. `cat /sys/class/drm/card*/device/mem_info_gtt_total` should then report ~124 GiB.
 
 **2. Install the toolchain.** strixite builds with AMD's TheRock ROCm nightly for gfx1151, tested with
-`therock-dist-linux-gfx1151-10.1.0a20260822` (HIP 7.16) extracted to `~/tools/therock-tarball/install`. You also need
-CMake 3.28+, Ninja and a GCC C++ standard library (I use Linuxbrew's gcc-15 on Fedora 43, which the build finds
-on its own; Fedora's `gcc-c++` package should work as well).
+`therock-dist-linux-gfx1151-10.1.0a20260822` (HIP 7.16). Extract it anywhere; the build looks in
+`~/tools/therock-tarball/install` unless you say otherwise (step 3). You also need CMake 3.28+, Ninja and a GCC C++
+standard library - your distribution's `g++` / `gcc-c++` package (GCC 13 to 16 work; I use Linuxbrew's gcc-15 on
+Fedora 43, which the build finds on its own).
 
 **3. Build.**
 
@@ -76,6 +77,11 @@ on its own; Fedora's `gcc-c++` package should work as well).
 git clone https://github.com/shawnshekari/strixite && cd strixite
 cmake --preset strix && cmake --build --preset strix
 ```
+
+If TheRock is somewhere else, say where on the first line: `cmake --preset strix -DSTRIX_ROCM_ROOT=/path/to/install`
+(or `export STRIX_ROCM_ROOT=/path/to/install`). To build against a GCC other than the one clang picks, add
+`-DSTRIX_GCC_INSTALL_DIR=/usr/lib/gcc/x86_64-pc-linux-gnu/15` (the directory `g++-15 -print-libgcc-file-name` prints a
+file in). The build directory remembers its first configure: after changing either, `rm -rf build/strix` first.
 
 **4. Download the weights** (~115 GiB) and check them - or, if you already have the original Qwen3.8-Flash-Next
 checkpoint, [make them yourself in ~15 minutes](docs/tools.md#already-have-the-original-model-make-the-weights-yourself):
@@ -85,11 +91,18 @@ hf download wemoh/Qwen3.8-Flash-Next-strixw --local-dir ~/models/strix-infer
 (cd ~/models/strix-infer && sha256sum -c sha256.txt)
 ```
 
+The server looks for the weights, tokenizer and n-gram table in `~/models/strix-infer`. Downloaded somewhere else?
+Set `STRIX_MODELS_DIR` to that directory (e.g. `export STRIX_MODELS_DIR=/data/models/strixw`), and every default path
+follows it - including the prompt cache's directory.
+
 **5. Run the server.** It loads in ~30 s and serves an OpenAI-compatible API on port 5300:
 
 ```sh
 build/strix/strix_server --config deploy/strix-server.conf
 ```
+
+`--config` matters: without it the server uses its built-in defaults (a 256k context instead of 512k, among others).
+Change a setting in the file, or override it on the command line: `--capacity 262144` sets the context in tokens.
 
 **6. Try it:**
 
