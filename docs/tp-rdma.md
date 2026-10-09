@@ -50,15 +50,13 @@ one single-machine default: the MTP draft policy (see [MTP draft policy](#mtp-dr
 
 ## MTP draft policy
 
-The fork's defaults for MTP, in `strix_server` and `tp_ar`, are:
-- margin 1.5 and up to 7 drafts (upstream: 2.0 and 5)
-- the Q4 draft head: drafts score a Q4 copy of the draft vocabulary's LM head rows, made once at load from the Q8
-  head, which halves the bytes a draft call reads
+`strix_server` and `tp_ar` use upstream's MTP defaults: margin 2.0, up to 5 drafts, and the Q4 draft head (drafts score
+a Q4 copy of the draft vocabulary's LM head rows, made once at load; upstream since strixite PR #2). `tp_ar` takes
+`--mtp-margin`, `--mtp-draft` and `--mtp-draft-q4 on|off` for comparisons, and `--mtp-sweep` for a grid of them.
+`strix_bench` drafts over the Q8 rows unless `--mtp-draft-q4 on`, so its `--hash-run` stays comparable across builds.
 
-The verify still decides every token, so greedy output can move only at near-ties, as with any change of MTP policy.
-At TP4 the new policy measured 99.1 / 111.7 / 103.2 -> 107.2 / 115.4 / 102.5 MTP t/s at 4k / 64k / 400k (the 400k
-difference is within run noise). `--mtp-margin 2 --mtp-draft 5 --mtp-draft-q4 off` restores upstream's policy.
-`strix_bench` keeps upstream's policy, so its `--hash-run` stays comparable across builds.
+The four-node numbers above were measured before the fork moved to upstream's defaults, with margin 1.5 and up to 7
+drafts (the history table's first row); they will be re-measured.
 
 ## Hardware it was measured on
 

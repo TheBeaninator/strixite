@@ -384,7 +384,7 @@ int main(int argc, char **argv) {
         Qwen4ExpSession &ses = be ? be->session() : *own;
         if (ses_mtp) ses.set_mtp_vocab(mtp_vocab);
         // The Q4 draft head (rank 0 / world 1 only: executors never draft)
-        const bool draft_q4 = onoff_arg(a.get("mtp-draft-q4", "off"), "tp_ar --mtp-draft-q4");
+        const bool draft_q4 = onoff_arg(a.get("mtp-draft-q4", "on"), "tp_ar --mtp-draft-q4");  // as served
         const bool free_q4 = a.num("mtp-free-q4", 0) != 0;
         // control for free_q4: the same free-running decode with the Q8 head under another policy (MARGINxDRAFTS):
         // how far any change of the drafts moves the verify-decided tokens
