@@ -4,7 +4,7 @@
 // (formats/q4.hpp's nibble order), then - for Q5 (formats/q5.hpp) - K/8 bytes of the codes' 5th bit. HB = the high
 // bits per code: 0 (Q4; the high-bit code compiles away) or 1 (Q5). Q5 rows need K % 128 == 0 (16-byte aligned).
 
-#include <hip/hip_runtime.h>
+#include "common/hip_runtime.hpp"
 
 #include <cstdint>
 

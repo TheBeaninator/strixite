@@ -16,7 +16,7 @@
 // each candidate's place = the candidates better than it - no sequential picking); levels repeat it on the lists:
 // 2 launches for 248,077 logits (31 workgroups, then 1). Details in logits_topk.hip.
 
-#include <hip/hip_runtime.h>
+#include "common/hip_runtime.hpp"
 
 #include <cstddef>
 #include <cstdint>

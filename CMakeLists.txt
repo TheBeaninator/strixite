@@ -1,21 +1,58 @@
 cmake_minimum_required(VERSION 3.28)
 
-# --- host C++ stdlib -----------------------------------------------------------
-# therock-tarball's clang ships no usable host libstdc++/libc++ (its bundled
-# libc++ is device-target only, no x86_64 __config_site), so it relies on a
-# GCC install's. On Ubuntu the system g++-13/14 is found unaided. Fedora 43
-# without gcc-c++/libstdc++-devel can use Linuxbrew's gcc-15, which clang
-# doesn't find on its own - so point at it when it's there. Must be set before project(): that runs CMake's
-# compiler ABI check, which already links a trivial C++ program.
-set(STRIX_BREW_GCC_ROOT "/home/linuxbrew/.linuxbrew" CACHE PATH "Linuxbrew prefix providing gcc-15's C++ stdlib")
-set(STRIX_BREW_CXX_INCLUDE "${STRIX_BREW_GCC_ROOT}/include/c++/15")
-if(EXISTS "${STRIX_BREW_CXX_INCLUDE}/vector")
-    set(CMAKE_CXX_FLAGS "-isystem${STRIX_BREW_CXX_INCLUDE} -isystem${STRIX_BREW_CXX_INCLUDE}/x86_64-pc-linux-gnu")
-    set(CMAKE_EXE_LINKER_FLAGS "-L${STRIX_BREW_GCC_ROOT}/lib/gcc/15")
+# --- toolchain -----------------------------------------------------------------
+# Everything here runs before project(): that runs CMake's compiler ABI check, which already compiles and links a
+# trivial C++ program with the compiler and flags chosen below.
+#
+# STRIX_ROCM_ROOT: the TheRock ROCm install. Its clang compiles host and device alike. Set it with
+# -DSTRIX_ROCM_ROOT=PATH or the STRIX_ROCM_ROOT environment variable; the default is ~/tools/therock-tarball/install.
+# The compiler follows from it (lib/llvm/bin/clang++) unless CMAKE_CXX_COMPILER is given.
+if(NOT "$ENV{STRIX_ROCM_ROOT}" STREQUAL "")
+    set(strix_rocm_default "$ENV{STRIX_ROCM_ROOT}")
+    set(strix_rocm_from "the STRIX_ROCM_ROOT environment variable")
+else()
+    set(strix_rocm_default "$ENV{HOME}/tools/therock-tarball/install")
+    set(strix_rocm_from "the default")
+endif()
+set(STRIX_ROCM_ROOT "${strix_rocm_default}" CACHE PATH "TheRock ROCm install (its clang builds everything)")
+if(NOT EXISTS "${STRIX_ROCM_ROOT}/include/hip/hip_runtime.h")
+    message(FATAL_ERROR "STRIX_ROCM_ROOT=${STRIX_ROCM_ROOT} (from ${strix_rocm_from} or the cache) has no "
+                        "include/hip/hip_runtime.h - expected an extracted TheRock tarball there. Point at yours with "
+                        "-DSTRIX_ROCM_ROOT=PATH or the STRIX_ROCM_ROOT environment variable.")
+endif()
+if(NOT DEFINED CACHE{CMAKE_CXX_COMPILER})
+    set(CMAKE_CXX_COMPILER "${STRIX_ROCM_ROOT}/lib/llvm/bin/clang++")
+    if(NOT EXISTS "${CMAKE_CXX_COMPILER}")
+        message(FATAL_ERROR "STRIX_ROCM_ROOT=${STRIX_ROCM_ROOT} has no lib/llvm/bin/clang++ - not a TheRock tarball layout")
+    endif()
 endif()
 
-# The ROCm clang compiles host and device alike; it is selected by the preset
-# (CMAKE_CXX_COMPILER) before project() so the ABI check runs on the right one.
+# Host C++ stdlib: TheRock's clang ships no usable host libstdc++/libc++ (its bundled libc++ is device-target only, no
+# x86_64 __config_site), so it uses a GCC install's. clang picks the newest one it finds, and the clang may be older
+# than that GCC's headers (the check after project() says so up front).
+#   STRIX_GCC_INSTALL_DIR: the GCC install to use instead (clang --gcc-install-dir), e.g.
+#     /usr/lib/gcc/x86_64-pc-linux-gnu/14 - the directory holding that GCC's crtbegin.o.
+#   Otherwise, on Fedora 43 without gcc-c++/libstdc++-devel: Linuxbrew's gcc-15, which clang doesn't find on its own.
+# $CXXFLAGS is kept: a normal CMAKE_CXX_FLAGS set here shadows the cache entry project() fills from it.
+set(STRIX_GCC_INSTALL_DIR "" CACHE PATH "GCC install whose C++ stdlib clang uses (--gcc-install-dir); empty = clang's choice")
+set(STRIX_BREW_GCC_ROOT "/home/linuxbrew/.linuxbrew" CACHE PATH "Linuxbrew prefix providing gcc-15's C++ stdlib")
+set(STRIX_BREW_CXX_INCLUDE "${STRIX_BREW_GCC_ROOT}/include/c++/15")
+if(STRIX_GCC_INSTALL_DIR)
+    if(NOT EXISTS "${STRIX_GCC_INSTALL_DIR}/crtbegin.o")
+        message(FATAL_ERROR "STRIX_GCC_INSTALL_DIR=${STRIX_GCC_INSTALL_DIR} has no crtbegin.o - expected a GCC "
+                            "install directory such as /usr/lib/gcc/x86_64-pc-linux-gnu/14 (g++-14 -print-libgcc-file-name "
+                            "prints a file in it)")
+    endif()
+    set(CMAKE_CXX_FLAGS "$ENV{CXXFLAGS} --gcc-install-dir=${STRIX_GCC_INSTALL_DIR}")
+    set(strix_stdlib_from "STRIX_GCC_INSTALL_DIR=${STRIX_GCC_INSTALL_DIR}")
+elseif(EXISTS "${STRIX_BREW_CXX_INCLUDE}/vector")
+    set(CMAKE_CXX_FLAGS "$ENV{CXXFLAGS} -isystem${STRIX_BREW_CXX_INCLUDE} -isystem${STRIX_BREW_CXX_INCLUDE}/x86_64-pc-linux-gnu")
+    set(CMAKE_EXE_LINKER_FLAGS "-L${STRIX_BREW_GCC_ROOT}/lib/gcc/15")
+    set(strix_stdlib_from "Linuxbrew gcc-15 at ${STRIX_BREW_GCC_ROOT}")
+else()
+    set(strix_stdlib_from "the GCC install clang found")
+endif()
+
 project(strix-infer LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -31,18 +68,42 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # shipping target; gfx1100 exists only as a local dev-loop build for
 # correctness checks (xtx-dev preset).
 set(STRIX_GPU_ARCH "gfx1151" CACHE STRING "Device code target (gfx1151 ships; gfx1100 = local dev only)")
-set(STRIX_ROCM_ROOT "$ENV{ROCM_PATH}" CACHE PATH "ROCm install (therock tarball)")
-if(NOT STRIX_ROCM_ROOT)
-    set(STRIX_ROCM_ROOT "$ENV{HOME}/tools/therock-tarball/install")
-endif()
-if(NOT EXISTS "${STRIX_ROCM_ROOT}/include/hip/hip_runtime.h")
-    message(FATAL_ERROR "STRIX_ROCM_ROOT=${STRIX_ROCM_ROOT} has no hip/hip_runtime.h")
-endif()
-if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR NOT CMAKE_CXX_COMPILER MATCHES "${STRIX_ROCM_ROOT}")
-    message(FATAL_ERROR "CMAKE_CXX_COMPILER must be the ROCm clang under ${STRIX_ROCM_ROOT} "
-                        "(got ${CMAKE_CXX_COMPILER}); use the strix preset from CMakePresets.json")
+string(FIND "${CMAKE_CXX_COMPILER}" "${STRIX_ROCM_ROOT}/" strix_compiler_at)
+if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR NOT strix_compiler_at EQUAL 0)
+    message(FATAL_ERROR "CMAKE_CXX_COMPILER must be the ROCm clang under STRIX_ROCM_ROOT=${STRIX_ROCM_ROOT} "
+                        "(got ${CMAKE_CXX_COMPILER}, ${CMAKE_CXX_COMPILER_ID}). If you changed STRIX_ROCM_ROOT, "
+                        "delete the build directory (${CMAKE_BINARY_DIR}): it keeps the compiler of its first configure.")
 endif()
 message(STATUS "ROCm at ${STRIX_ROCM_ROOT}")
+
+# The host C++ stdlib must parse with this clang the way host-only files use it - after HIP's headers (see "Host C++
+# stdlib" above and common/hip_runtime.hpp): fail here, with the remedy, rather than 20 files into the build.
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_INCLUDES "${CMAKE_SOURCE_DIR}" "${STRIX_ROCM_ROOT}/include")
+set(CMAKE_REQUIRED_DEFINITIONS -D__HIP_PLATFORM_AMD__)
+unset(STRIX_HOST_STDLIB_OK CACHE)   # re-checked every configure, so a fix (STRIX_GCC_INSTALL_DIR) is seen
+check_cxx_source_compiles("#include \"common/hip_runtime.hpp\"
+#include <chrono>
+#include <memory>
+#include <string>
+#include <thread>
+int main() { return 0; }" STRIX_HOST_STDLIB_OK)
+unset(CMAKE_REQUIRED_INCLUDES)
+unset(CMAKE_REQUIRED_DEFINITIONS)
+if(NOT STRIX_HOST_STDLIB_OK)
+    separate_arguments(strix_flags UNIX_COMMAND "${CMAKE_CXX_FLAGS}")
+    execute_process(COMMAND ${CMAKE_COMMAND} -E echo "#include <version>\n_GLIBCXX_RELEASE"
+                    COMMAND ${CMAKE_CXX_COMPILER} ${strix_flags} -std=c++20 -x c++ -E -P -
+                    OUTPUT_VARIABLE strix_glibcxx ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
+    string(REGEX MATCH "[0-9]+$" strix_glibcxx "${strix_glibcxx}")
+    message(FATAL_ERROR "The ROCm clang (${CMAKE_CXX_COMPILER}) can't compile the HIP headers followed by <chrono>, "
+                        "<memory>, <string>, <thread> from the host C++ stdlib it uses (${strix_stdlib_from}; "
+                        "libstdc++ release '${strix_glibcxx}'). GCC 13-16 are known to work; a newer one may not yet. "
+                        "Install an older GCC next to your system's and point at it, e.g. "
+                        "-DSTRIX_GCC_INSTALL_DIR=/usr/lib/gcc/x86_64-pc-linux-gnu/15 (the directory of "
+                        "`g++-15 -print-libgcc-file-name`). The compiler errors are in "
+                        "${CMAKE_BINARY_DIR}/CMakeFiles/CMakeConfigureLog.yaml.")
+endif()
 
 find_library(STRIX_HIP_LIB amdhip64 PATHS "${STRIX_ROCM_ROOT}/lib" NO_DEFAULT_PATH REQUIRED)
 

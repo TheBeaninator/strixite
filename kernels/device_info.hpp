@@ -4,7 +4,7 @@
 
 #include "common/hip_check.hpp"
 
-#include <hip/hip_runtime.h>
+#include "common/hip_runtime.hpp"
 
 namespace strix::kernels {
 

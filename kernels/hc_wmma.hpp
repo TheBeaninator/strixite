@@ -16,7 +16,7 @@
 #include "runtime/q4_device.hpp"
 #include "runtime/q8_device.hpp"
 
-#include <hip/hip_runtime.h>
+#include "common/hip_runtime.hpp"
 
 #include <cstddef>
 #include <cstdint>

@@ -6,7 +6,7 @@
 // wave as Q4), partial sums meet in LDS; M == 1 has its own instantiation.
 #include "kernels/norm.hpp"  // Act
 #include "runtime/q6_device.hpp"
-#include <hip/hip_runtime.h>
+#include "common/hip_runtime.hpp"
 #include <cstdint>
 namespace strix::kernels {
 // Requires: q 16-byte aligned; K % 64 == 0 (the format's: every row's planes stay 16-byte aligned); x 16-byte

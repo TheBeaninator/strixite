@@ -12,7 +12,7 @@
 // Lower-precision path: the inputs are BF16-rounded; only kernels behind
 // an explicit switch use it.
 
-#include <hip/hip_runtime.h>
+#include "common/hip_runtime.hpp"
 
 #include <cstdint>
 

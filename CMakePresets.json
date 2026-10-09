@@ -12,9 +12,7 @@
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/strix",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "STRIX_ROCM_ROOT": "$env{HOME}/tools/therock-tarball/install",
-        "CMAKE_CXX_COMPILER": "$env{HOME}/tools/therock-tarball/install/lib/llvm/bin/clang++"
+        "CMAKE_BUILD_TYPE": "Release"
       }
     },
     {

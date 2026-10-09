@@ -7,7 +7,7 @@
 
 #include "common/check.hpp"
 
-#include <hip/hip_runtime.h>
+#include "common/hip_runtime.hpp"
 
 #define STRIX_HIP_CHECK(expr, ...)                                                               \
     do {                                                                                         \

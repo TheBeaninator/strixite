@@ -9,7 +9,7 @@
 
 #include "kernels/embedding.hpp"
 
-#include <hip/hip_runtime.h>
+#include "common/hip_runtime.hpp"
 
 #include <cstdint>
 

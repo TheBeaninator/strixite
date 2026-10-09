@@ -4,7 +4,7 @@
 // q/k norm + RoPE in kernels/attention.hip, so both rotate identically
 // (transformers' arithmetic: kernels/rope.hpp).
 
-#include <hip/hip_runtime.h>
+#include "common/hip_runtime.hpp"
 
 #include <cstdint>
 

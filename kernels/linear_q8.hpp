@@ -5,7 +5,7 @@
 // chunk; 1-8 waves per output row (split-K), partial sums meet in LDS; M == 1 has its own instantiation.
 #include "kernels/norm.hpp"  // Act
 #include "runtime/q8_device.hpp"
-#include <hip/hip_runtime.h>
+#include "common/hip_runtime.hpp"
 #include <cstdint>
 namespace strix::kernels {
 // Requires: q 16-byte aligned (so K % 16 == 0 rows stay aligned: implied by K % G == 0); x 16-byte aligned;

@@ -11,7 +11,7 @@
 // In place is allowed (out == x): each element is read and written by the
 // same thread, and all reads of the row finish before any write.
 
-#include <hip/hip_runtime.h>
+#include "common/hip_runtime.hpp"
 
 #include <cstdint>
 
